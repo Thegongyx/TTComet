@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# 预训练权重 (大文件, 可重新下载)
+*.pt
+
+# 训练输出 (大文件)
+runs/
+
+# 归档
+old/
+
+# 脚本输出目录 (自动生成)
+random_frames/
+rejected_ball_frames/
+missing_ball_frames/
+inference_output/
+
+# 原始视频 (大文件)
+Videos/
+
+# 调试日志
+*.log
+
+# 规划文件 (内部)
+.omo/
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE
+.vscode/
+.idea/
