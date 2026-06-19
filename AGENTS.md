@@ -63,6 +63,7 @@ YOLO 视频帧提取、推理与模型微调工具集。从检测日志中抽帧
 - **Output dirs auto-created** by scripts — `random_frames/`, `runs/train_<name>/` 等
 - **ffmpeg required** for frame extraction / inference / highlight scripts
 - **Interactive fallback**: scripts prompt for missing CLI args instead of erroring
+- **临时文件统一放在 `tmp/` 目录**：所有脚本运行中产生的中间文件、缓存、临时输出等，均写入项目根目录下的 `tmp/`（自动创建），避免污染源码目录
 
 ## ANTI-PATTERNS (THIS PROJECT)
 - **NEVER write new Python files for one-off tasks** — pass args to existing scripts instead

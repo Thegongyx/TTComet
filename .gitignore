@@ -12,6 +12,9 @@ runs/
 # 归档
 old/
 
+# 临时文件
+tmp/
+
 # 脚本输出目录 (自动生成)
 random_frames/
 rejected_ball_frames/
