@@ -125,8 +125,8 @@ def parse_args():
     parser.add_argument("--output", "-o", type=str, default=_default_output())
     parser.add_argument("--device", type=str, default="0")
     parser.add_argument("--half", action="store_true", help="FP16 推理 (ROCm/CUDA 加速)")
-    parser.add_argument("--imgsz", type=int, default=960,
-                        help="推理分辨率, 默认 960")
+    parser.add_argument("--imgsz", type=int, default=640,
+                        help="推理分辨率, 默认 640")
     parser.add_argument("--conf", type=float, default=0.30)
     parser.add_argument("--iou",  type=float, default=0.45)
     parser.add_argument("--conf-ball",   type=float, default=0.30)

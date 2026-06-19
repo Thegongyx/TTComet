@@ -46,7 +46,9 @@ from pathlib import Path
 
 # [debug] 写入文件，避免被 ultralytics 输出系统吞掉
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
-_DEBUG_LOG = _PROJECT_ROOT / "_debug_bestclass.log"
+_TMP_DIR = _PROJECT_ROOT / "tmp"
+_TMP_DIR.mkdir(exist_ok=True)
+_DEBUG_LOG = _TMP_DIR / "_debug_bestclass.log"
 
 def _debug(*args):
     with open(_DEBUG_LOG, "a", encoding="utf-8") as f:
@@ -67,10 +69,10 @@ def parse_args():
 
     # 训练时长 / 数据
     parser.add_argument("--epochs", type=int, default=100)
-    parser.add_argument("--batch", type=int, default=4)
+    parser.add_argument("--batch", type=int, default=8)
     parser.add_argument("--imgsz", type=int, default=960,
                         help="训练分辨率（默认 960，小目标乒乓球更友好）")
-    parser.add_argument("--workers", type=int, default=4)
+    parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--cache", type=str, default="ram",
                         choices=["ram", "disk", "false"],
                         help="数据缓存策略（ram 最快但占内存；disk 折衷；false 不缓存）")
@@ -83,9 +85,9 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=0, help="随机种子（提升可复现性）")
 
     # 学习率 / 优化器
-    parser.add_argument("--lr0", type=float, default=0.005,
-                        help="初始学习率（finetune 默认 0.005；from-scratch 用 0.01）")
-    parser.add_argument("--lrf", type=float, default=0.01,
+    parser.add_argument("--lr0", type=float, default=0.05,
+                        help="初始学习率（finetune 默认 0.05；from-scratch 用 0.01）")
+    parser.add_argument("--lrf", type=float, default=0.001,
                         help="最终学习率因子（终值 = lr0 * lrf）")
     parser.add_argument("--optimizer", type=str, default="auto",
                         choices=["auto", "SGD", "AdamW", "Adam", "RMSProp"])
@@ -132,6 +134,10 @@ def parse_args():
                              "best_class_<id>_ap.pt (类别 mAP50-95 最高) 与 "
                              "best_class_<id>_map50.pt (类别 mAP50 最高)。"
                              "默认 -2=自动识别乒乓球类；设为 -1 关闭追踪")
+    # 类别损失加权 (v3.3: 自动识别乒乓球类, 其余类权重=1.0)
+    parser.add_argument("--class-weight", type=float, default=5.0,
+                        help="乒乓球分类损失权重倍率（自动识别数据集中'乒乓球'类；"
+                             "其余类权重=1.0；设为 1.0 则关闭加权）")
     return parser.parse_args()
 
 
@@ -648,6 +654,27 @@ def main():
         except ValueError:
             _track_class_id = 0
             print(f"ℹ️  数据集 names 中未找到'乒乓球'，--best-class 默认回退到 class 0")
+
+    # --class-weight: 自动加权乒乓球类 (v3.3)
+    if args.class_weight != 1.0 and _nc > 0:
+        # 在 names 中查找"乒乓球"
+        auto_ball_id = None
+        try:
+            auto_ball_id = _names.index("乒乓球")
+        except ValueError:
+            pass
+        # 如果 names 中没找到，尝试复用 --best-class 自动检测的结果
+        if auto_ball_id is None and _track_class_id is not None and _track_class_id >= 0:
+            auto_ball_id = _track_class_id
+        if auto_ball_id is not None:
+            class_weights = torch.ones(_nc, dtype=torch.float32)
+            class_weights[auto_ball_id] = args.class_weight
+            model.model.class_weights = class_weights
+            cname = _names[auto_ball_id] if auto_ball_id < len(_names) else "?"
+            print(f"⚖️  类别加权: cls={auto_ball_id} ({cname}) 权重 x{args.class_weight:.1f}  "
+                  f"(其余类 x1.0)")
+        else:
+            print(f"⚠️  --class-weight={args.class_weight} 但 names 中未找到'乒乓球'，跳过加权")
 
     print(f"数据集: {dataset_path}  | 类别数: {nc} - {names}")
 
