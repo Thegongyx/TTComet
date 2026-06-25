@@ -16,7 +16,7 @@ v6 (WSL/VAAPI) → v7 (Windows/AMF) 迁移修复:
     - 默认 --video / --model 路径改成 Windows 风格的占位符
   优化:
     - AMF 主路径用 -quality quality -rc cqp 获得最佳质量/体积平衡
-    - 软编 fallback 从 ultrafast/crf26 提升到 veryfast/crf23 (8060S CPU 不弱)
+    - 软编 fallback: veryfast/crf20
     - frame_writer join timeout 拉到 300s, 大视频不会被截断
     - 进程启动加 CREATE_NO_WINDOW 标志, 避免 Windows 下弹黑窗
   保留 v6 全部优化:
@@ -125,8 +125,8 @@ def parse_args():
     parser.add_argument("--output", "-o", type=str, default=_default_output())
     parser.add_argument("--device", type=str, default="0")
     parser.add_argument("--half", action="store_true", help="FP16 推理 (ROCm/CUDA 加速)")
-    parser.add_argument("--imgsz", type=int, default=640,
-                        help="推理分辨率, 默认 640")
+    parser.add_argument("--imgsz", type=int, default=960,
+                        help="推理分辨率, 默认 960")
     parser.add_argument("--conf", type=float, default=0.30)
     parser.add_argument("--iou",  type=float, default=0.45)
     parser.add_argument("--conf-ball",   type=float, default=0.30)
@@ -134,7 +134,7 @@ def parse_args():
     parser.add_argument("--conf-racket", type=float, default=None)
     parser.add_argument("--conf-table",  type=float, default=None)
     parser.add_argument("--conf-net",    type=float, default=None)
-    parser.add_argument("--batch-size", type=int, default=4,
+    parser.add_argument("--batch-size", type=int, default=8,
                         help="批大小, ROCm 建议 4-8; 尾批用零帧 padding 保持固定 shape")
     parser.add_argument("--remove-cfr", action="store_true",
                         help="VFR 转 CFR 后删除中间文件")
@@ -158,8 +158,13 @@ def parse_args():
     parser.add_argument("--amf-quality", type=str, default="quality",
                         choices=["speed", "balanced", "quality"],
                         help="AMF -quality 参数 (speed=最快, quality=最好)")
-    parser.add_argument("--amf-qp", type=int, default=24,
+    parser.add_argument("--amf-qp", type=int, default=20,
                         help="AMF CQP 量化参数 (越小越清晰, 18-28 常用)")
+    parser.add_argument("--end2end", action="store_true",
+                        help="YOLO26 走 NMS-free end2end 推理（更快，但 --iou 失效，单帧上限 max_det）。"
+                             "默认关闭=走 one-to-many+NMS，--iou 生效、召回更高，适合多目标计数")
+    parser.add_argument("--max-det", type=int, default=300,
+                        help="单帧最大检测数（NMS-free 模式硬上限 300；乒乓球场景目标少，默认 300 足够）")
     return parser.parse_args()
 
 
@@ -315,7 +320,7 @@ def convert_vfr_to_cfr(video_path, output_path, target_fps=None):
         "-vf", f"fps={target_fps}",
         "-vsync", "cfr",            # 旧名 (ffmpeg <= 7 兼容)
         "-fps_mode", "cfr",         # 新名 (ffmpeg 8.x 推荐)
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
         "-pix_fmt", "yuv420p",
         "-video_track_timescale", "90000",
     ]
@@ -386,12 +391,12 @@ class FFmpegWriter:
                 ]
             cmd = input_args + enc_args
         else:
-            # 软编 fallback: 8060S 的 CPU (Strix Halo) 完全跑得动 veryfast/crf23
+            # 软编 fallback: veryfast/crf20
             cmd = input_args + [
                 "-c:v", "libx264",
                 "-preset", "veryfast",
                 "-tune", "zerolatency",
-                "-crf", "23",
+                "-crf", "20",
                 "-pix_fmt", "yuv420p",
                 "-threads", "0",
                 "-movflags", "+faststart",
@@ -872,6 +877,8 @@ def main():
                     verbose=False, imgsz=IMGSZ, augment=False,
                     device=device, half=use_half,
                     stream=False,
+                    # end2end=args.end2end,   # 新增：与训练验证保持一致
+                    # max_det=args.max_det,   # 新增：避免 NMS-free 模式漏检
                 )
             if pad_n > 0:
                 results = results[:actual_n]

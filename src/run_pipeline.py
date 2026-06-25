@@ -258,6 +258,32 @@ def _process_one_video(args, python_cmd, has_ffmpeg, video_index=None, video_tot
             infer_cmd += ["--encoder", args.encoder]
         if args.remove_cfr:
             infer_cmd += ["--remove-cfr"]
+        if args.iou is not None:
+            infer_cmd += ["--iou", str(args.iou)]
+        if args.conf_ball is not None:
+            infer_cmd += ["--conf-ball", str(args.conf_ball)]
+        if args.conf_player is not None:
+            infer_cmd += ["--conf-player", str(args.conf_player)]
+        if args.conf_racket is not None:
+            infer_cmd += ["--conf-racket", str(args.conf_racket)]
+        if args.conf_table is not None:
+            infer_cmd += ["--conf-table", str(args.conf_table)]
+        if args.conf_net is not None:
+            infer_cmd += ["--conf-net", str(args.conf_net)]
+        if args.log_flush_interval is not None:
+            infer_cmd += ["--log-flush-interval", str(args.log_flush_interval)]
+        if args.writer_backend is not None:
+            infer_cmd += ["--writer-backend", args.writer_backend]
+        if args.no_polygon:
+            infer_cmd += ["--no-polygon"]
+        if args.empty_cache_every is not None:
+            infer_cmd += ["--empty-cache-every", str(args.empty_cache_every)]
+        if args.conf_margin is not None:
+            infer_cmd += ["--conf-margin", str(args.conf_margin)]
+        if args.amf_quality is not None:
+            infer_cmd += ["--amf-quality", args.amf_quality]
+        if args.amf_qp is not None:
+            infer_cmd += ["--amf-qp", str(args.amf_qp)]
 
         if not run_step(infer_cmd,
                          "Step 1/2: YOLO 推理 (inference_video.py)",
@@ -293,6 +319,22 @@ def _process_one_video(args, python_cmd, has_ffmpeg, video_index=None, video_tot
         hl_cmd += ["--no-audio"]
     if args.debug:
         hl_cmd += ["--debug"]
+    if args.min_rally_frames is not None:
+        hl_cmd += ["--min-rally-frames", str(args.min_rally_frames)]
+    if args.min_static_ball_count is not None:
+        hl_cmd += ["--min-static-ball-count", str(args.min_static_ball_count)]
+    if args.pre_buffer is not None:
+        hl_cmd += ["--pre-buffer", str(args.pre_buffer)]
+    if args.post_buffer is not None:
+        hl_cmd += ["--post-buffer", str(args.post_buffer)]
+    if args.merge_gap is not None:
+        hl_cmd += ["--merge-gap", str(args.merge_gap)]
+    if args.corridor_margin is not None:
+        hl_cmd += ["--corridor-margin", str(args.corridor_margin)]
+    if args.corridor_extend is not None:
+        hl_cmd += ["--corridor-extend", str(args.corridor_extend)]
+    if args.max_jump_ratio is not None:
+        hl_cmd += ["--max-jump-ratio", str(args.max_jump_ratio)]
 
     if not run_step(hl_cmd, "Step 2/2: 高光特效剪辑 (pingpong_highlight.py)"):
         print(f"\n❌{batch_tag} 流水线终止, 中间文件保留在: {work_dir}")
@@ -368,10 +410,38 @@ def main():
                         help="启用 FP16 推理加速")
     parser.add_argument("--conf", type=float, default=None,
                         help="检测置信度阈值 (默认 0.30)")
+    parser.add_argument("--iou", type=float, default=None,
+                        help="NMS IoU 阈值 (默认 0.45)")
+    parser.add_argument("--conf-ball", type=float, default=None,
+                        help="乒乓球独立置信度阈值")
+    parser.add_argument("--conf-player", type=float, default=None,
+                        help="球员独立置信度阈值")
+    parser.add_argument("--conf-racket", type=float, default=None,
+                        help="球拍独立置信度阈值")
+    parser.add_argument("--conf-table", type=float, default=None,
+                        help="球台独立置信度阈值")
+    parser.add_argument("--conf-net", type=float, default=None,
+                        help="球网独立置信度阈值")
     parser.add_argument("--out-width", type=int, default=None,
                         help="推理阶段输出的检测视频宽度 (默认 640)")
     parser.add_argument("--remove-cfr", action="store_true",
                         help="VFR→CFR 转换后删除中间文件")
+    parser.add_argument("--log-flush-interval", type=float, default=None,
+                        help="日志自动刷盘间隔秒数 (默认 0.5)")
+    parser.add_argument("--writer-backend", default=None,
+                        choices=["ffmpeg", "opencv"],
+                        help="视频写入后端 (默认 ffmpeg)")
+    parser.add_argument("--no-polygon", action="store_true",
+                        help="跳过 polygon 输出")
+    parser.add_argument("--empty-cache-every", type=int, default=None,
+                        help="每 N 批清一次 GPU 缓存 (默认 200)")
+    parser.add_argument("--conf-margin", type=float, default=None,
+                        help="传给模型的 conf 裕量 (默认 0.05)")
+    parser.add_argument("--amf-quality", default=None,
+                        choices=["speed", "balanced", "quality"],
+                        help="AMF -quality 参数 (默认 quality)")
+    parser.add_argument("--amf-qp", type=int, default=None,
+                        help="AMF CQP 量化参数 (默认 24)")
 
     # === 高光参数 (传给 pingpong_highlight.py) ===
     parser.add_argument("--output-height", type=int, default=None,
@@ -382,6 +452,22 @@ def main():
                         help="高光视频不保留原声")
     parser.add_argument("--debug", action="store_true",
                         help="输出调试信息 (球台几何/落点坐标等)")
+    parser.add_argument("--min-rally-frames", type=int, default=None,
+                        help="有效回合最小帧数 (默认按 fps 自动)")
+    parser.add_argument("--min-static-ball-count", type=int, default=None,
+                        help="静止球过滤最少检测数 (默认 10)")
+    parser.add_argument("--pre-buffer", type=float, default=None,
+                        help="每个回合前缓冲秒数 (默认 0.5)")
+    parser.add_argument("--post-buffer", type=float, default=None,
+                        help="每个回合后缓冲秒数 (默认 1.5)")
+    parser.add_argument("--merge-gap", type=float, default=None,
+                        help="相邻回合合并间隔秒数 (默认 2.0)")
+    parser.add_argument("--corridor-margin", type=float, default=None,
+                        help="长边走廊横向容差 (近端短边宽度比例, 默认 0.5)")
+    parser.add_argument("--corridor-extend", type=float, default=None,
+                        help="走廊纵向延伸倍数 (球台长度的倍数, 默认 1.2)")
+    parser.add_argument("--max-jump-ratio", type=float, default=None,
+                        help="轨迹追踪最大跳变比例 (相对图像对角线, 默认 0.05)")
 
     # === 流水线控制 ===
     parser.add_argument("--work-dir", default=None,
