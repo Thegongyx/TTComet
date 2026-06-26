@@ -1,27 +1,31 @@
 #!/usr/bin/env python3
 """
-pingpong_highlight.py  (优化版 v4 - 基于 v3 几何自愈)
+pingpong_highlight.py  (优化版 v4.2 - 在 v4.1 基础上把 track↔detection 关联改为匈牙利算法)
 =====================================================================
 乒乓球比赛 → 自动特效精华集锦
 
-v4 在 v3 基础上的优化 (行为/CLI 完全兼容):
-  ★ 性能
-     - 静止球过滤: O(n²) → 空间网格哈希, 长视频显著加速
-     - 主轨迹追踪: 活跃 track 维护 + 提前剪枝
-     - draw_comet_trail: 去掉危险的可变默认参数缓存, 改为按需缓冲
-  ★ 鲁棒性
-     - smooth_trail: 仅基于点序平滑, 端点保护, 避免插值抖动放大
-     - predict(): gap 越大外推越保守 (速度衰减), 防跳变
-     - detect_events: bounce 用窗口极值判定, 抗噪
-     - 资源清理: render() 用 try/finally 保证 cap/writer/pipe 释放
-  ★ 代码质量
-     - 移除死参数/死分支, 统一 clamp, 补充类型与注释
+v4.2 在 v4.1 基础上的改动 (默认行为可能略有差异, 但可通过 --match-algo greedy 复现):
+  ★ build_main_ball_track: 把原来的「按 active track 顺序逐个 argmin」贪心关联,
+    改为基于代价矩阵的匈牙利算法 (scipy.optimize.linear_sum_assignment) 全局最优分配,
+    仍沿用原有 tol = max_jump * (1 + 0.1*(gap-1)) 门限对每条配对做事后过滤.
+  ★ 新增 CLI: --match-algo {auto, hungarian, greedy}, 默认 auto:
+      - 有 scipy 时使用匈牙利 (全局最小总代价)
+      - 无 scipy 或显式 greedy 时使用原来的贪心实现 (与 v4.1 完全等价)
+  ★ 其他逻辑 (predict / score / 球网穿越加成 / IoU 空间共域过滤 / score_min) 全部保持不变.
 
-v3 关键能力全部保留:
+v4.1 在 v4 基础上的修复 (行为基本兼容):
+  ★ 移除死代码: 未使用的 scipy 导入、MiniTable.geo、side_edges 变量
+  ★ 去重: extract_table_geometry 中内联的球网相交判定改为复用 _net_bisects_quad
+  ★ 修复 _finalize_rally: 之前 is_valid 计算后被忽略, 现在真正生效
+  ★ 修复 _get_net_center_x: 之前永远返回 table_x (net_x 死变量), 已简化
+  ★ 修正若干 CLI 帮助文案与实际默认值不符
+
+v4 关键能力全部保留:
   1. 几何合理性校验 validate_and_refine_quad
   2. 基于真实尺寸+球网约束的重建 rebuild_quad_from_constraints
   3. 走廊最小尺寸兜底 + 软过滤自愈
   4. 时序鲁棒聚合 (RANSAC 式中位数 + MAD 剔除)
+  5. 静止球过滤(网格哈希)、主轨迹追踪剪枝、彗星拖尾缓存
 """
 
 import os
@@ -42,16 +46,17 @@ import cv2
 
 # ---- 可选依赖 ----
 try:
-    from scipy.optimize import least_squares  # noqa: F401 (保留以兼容外部期望)
-    _HAS_SCIPY = True
-except Exception:
-    _HAS_SCIPY = False
-
-try:
     from sklearn.cluster import DBSCAN
     _HAS_SKLEARN = True
 except Exception:
     _HAS_SKLEARN = False
+
+try:
+    from scipy.optimize import linear_sum_assignment as _linear_sum_assignment
+    _HAS_SCIPY_LSA = True
+except Exception:
+    _linear_sum_assignment = None
+    _HAS_SCIPY_LSA = False
 
 _IS_WINDOWS = (platform.system() == "Windows")
 _SUBPROC_FLAGS = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000) if _IS_WINDOWS else 0
@@ -86,7 +91,7 @@ def parse_args():
     p.add_argument("--min-rally-frames", type=int, default=None,
                    help="有效回合最小帧数 (默认按 fps 自动 = 0.6s)")
     p.add_argument("--min-static-ball-count", type=int, default=20,
-                   help="静止球过滤: 600帧窗口内最少静止检测数, 达到才剔除 (默认 10)")
+                   help="静止球过滤: 600帧窗口内最少静止检测数, 达到才剔除 (默认 20)")
     p.add_argument("--pre-buffer", type=float, default=0.5,
                    help="每个回合前缓冲秒数")
     p.add_argument("--post-buffer", type=float, default=1.5,
@@ -108,6 +113,10 @@ def parse_args():
                    help="输出编码器, auto=优先 AMD AMF 硬编")
     p.add_argument("--max-jump-ratio", type=float, default=0.1,
                    help="轨迹追踪最大跳变距离相对图像对角线的比例 (默认 0.1)")
+    p.add_argument("--match-algo", default="auto",
+                   choices=["auto", "hungarian", "greedy"],
+                   help="track↔detection 关联算法: auto=有 scipy 用匈牙利, "
+                        "hungarian=强制匈牙利 (需要 scipy), greedy=原 v4.1 贪心 (默认 auto)")
     p.add_argument("--debug", action="store_true",
                    help="输出调试信息")
     return p.parse_args()
@@ -303,6 +312,40 @@ def _edges_are_adjacent(i, j, n=4):
     return diff == 1 or diff == n - 1
 
 
+def _extend_line(p1, p2, length):
+    """沿 p1->p2 方向两端各延长 length。"""
+    dx = p2[0] - p1[0]
+    dy = p2[1] - p1[1]
+    norm = math.hypot(dx, dy)
+    if norm < 1e-6:
+        return p1, p2
+    ux, uy = dx / norm, dy / norm
+    return (p1[0] - ux * length, p1[1] - uy * length), \
+           (p2[0] + ux * length, p2[1] + uy * length)
+
+
+def _segments_intersect(p1, p2, q1, q2):
+    def cross(o, a, b):
+        return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+    d1 = cross(q1, q2, p1)
+    d2 = cross(q1, q2, p2)
+    d3 = cross(p1, p2, q1)
+    d4 = cross(p1, p2, q2)
+    return ((d1 > 0 and d2 < 0) or (d1 < 0 and d2 > 0)) and \
+           ((d3 > 0 and d4 < 0) or (d3 < 0 and d4 > 0))
+
+
+def _net_quad_intersections(quad, net_line, img_hw):
+    """返回球网延长线与四边形各边的相交索引列表。"""
+    if net_line is None:
+        return []
+    h, w = img_hw
+    edges = [(quad[i], quad[(i + 1) % 4]) for i in range(4)]
+    net_ext = _extend_line(net_line[0], net_line[1], length=max(w, h) * 4)
+    return [i for i, (a, b) in enumerate(edges)
+            if _segments_intersect(net_ext[0], net_ext[1], a, b)]
+
+
 def _net_bisects_quad(quad, net_line, img_hw):
     """
     检查球网线是否正确地将四边形切分为两半 (与两条对边相交)。
@@ -310,36 +353,9 @@ def _net_bisects_quad(quad, net_line, img_hw):
     """
     if net_line is None:
         return True, []  # 无球网时不阻断
-    h, w = img_hw
-    edges = [(quad[i], quad[(i + 1) % 4]) for i in range(4)]
-
-    def _extend_line(p1, p2, length):
-        dx = p2[0] - p1[0]
-        dy = p2[1] - p1[1]
-        norm = math.hypot(dx, dy)
-        if norm < 1e-6:
-            return p1, p2
-        ux, uy = dx / norm, dy / norm
-        return (p1[0] - ux * length, p1[1] - uy * length), \
-               (p2[0] + ux * length, p2[1] + uy * length)
-
-    def _segments_intersect(p1, p2, q1, q2):
-        def cross(o, a, b):
-            return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
-        d1 = cross(q1, q2, p1)
-        d2 = cross(q1, q2, p2)
-        d3 = cross(p1, p2, q1)
-        d4 = cross(p1, p2, q2)
-        return ((d1 > 0 and d2 < 0) or (d1 < 0 and d2 > 0)) and \
-               ((d3 > 0 and d4 < 0) or (d3 < 0 and d4 > 0))
-
-    net_ext = _extend_line(net_line[0], net_line[1], length=max(w, h) * 4)
-    intersect_mask = [_segments_intersect(net_ext[0], net_ext[1], a, b)
-                      for a, b in edges]
-    inter_idx = [i for i, v in enumerate(intersect_mask) if v]
+    inter_idx = _net_quad_intersections(quad, net_line, img_hw)
     if len(inter_idx) != 2:
         return False, inter_idx
-    # 检查两条相交边是否对边 (不相邻)
     if _edges_are_adjacent(inter_idx[0], inter_idx[1]):
         return False, inter_idx
     return True, inter_idx
@@ -434,14 +450,12 @@ def _median_net_line(line_list):
 def rebuild_quad_from_constraints(table_pts, net_line, img_hw, debug=False):
     """当检测四边形不可信时, 用球网线 + ITTF比例约束重建四角。
 
-    ★ 核心改进: 当有球网线时, 直接用球网线作为主约束:
+    ★ 核心: 当有球网线时, 直接用球网线作为主约束:
        - 球网方向 = 短边方向 (球网始终沿短边延伸)
        - 球网长度 = 短边长度 (球网跨越整个短边, 球网两端≈长边中点)
        - 长边方向 = 球网方向的垂直方向
        - 长边长度 = 短边长度 × ITTF比例 (可混合检测比例)
        - 四角 = 球网两端 ± 长边方向 × (长边长度/2)
-
-    这解决了 minAreaRect 在球台检测点聚集为窄条时给出过窄短边的问题。
     """
     if net_line is not None:
         net_start = np.array(net_line[0], dtype=np.float64)
@@ -451,17 +465,13 @@ def rebuild_quad_from_constraints(table_pts, net_line, img_hw, debug=False):
         if net_len < 10:
             return None
         net_dir = net_vec / net_len
-        # 长边方向 = 球网方向的垂直方向
         long_dir = np.array([-net_dir[1], net_dir[0]], dtype=np.float64)
-        # 确保 +long_dir 朝向近端 (y增大方向)
         if long_dir[1] < 0:
             long_dir = -long_dir
 
-        # 短边长度 = 球网长度 (球网跨越整个短边)
-        # 加 5% 余量, 因为球网检测可能略短于实际短边
+        # 短边长度 = 球网长度 (球网跨越整个短边), 加 5% 余量
         short_len = net_len * 1.05
 
-        # 长边长度: 优先用 ITTF 比例, 同时参考 minAreaRect 检测结果
         detected_ratio = None
         if table_pts is not None and len(table_pts) >= 4:
             pts = table_pts.astype(np.float32)
@@ -473,16 +483,12 @@ def rebuild_quad_from_constraints(table_pts, net_line, img_hw, debug=False):
                 detected_ratio = detected_long / (detected_short + 1e-6)
 
         if detected_ratio is not None and 1.2 < detected_ratio < 4.0:
-            # 检测比例合理时混合: 60% ITTF + 40% 检测
             blended_ratio = 0.6 * TABLE_RATIO + 0.4 * detected_ratio
         else:
-            # 检测比例不合理 (如>4说明短边过窄) 时纯用 ITTF
             blended_ratio = TABLE_RATIO
 
         long_len = short_len * blended_ratio
 
-        # 四角 = 球网两端 ± 长边方向 × (长边长度/2)
-        # 球网两端 = 两条长边的中点
         half_long = long_dir * (long_len * 0.5)
         far_left = net_start - half_long
         far_right = net_end - half_long
@@ -662,8 +668,7 @@ def extract_table_geometry(frames, img_hw, debug=False, persp_blend=0.5,
     quad, was_rebuilt = validate_and_refine_quad(
         quad, table_pts_agg, net_line, img_hw, debug=debug)
 
-    # ★ 检查球网是否正确切分球台 (与两条对边相交)
-    #    如果球网与相邻边相交, 说明四边形为菱形/非矩形, 需要重建
+    # ★ 检查球网是否正确切分球台 (与两条对边相交), 否则重建
     if net_line is not None and not was_rebuilt:
         bisects_ok, _ = _net_bisects_quad(quad, net_line, img_hw)
         if not bisects_ok:
@@ -681,9 +686,7 @@ def extract_table_geometry(frames, img_hw, debug=False, persp_blend=0.5,
                     else:
                         log("  ⚠️ 重建后球网仍与相邻边相交, 继续使用重建结果")
 
-    # ★ 检查短边长度是否与球网长度匹配
-    #    球网跨越整个短边, 所以短边长度应 ≥ 球网长度
-    #    如果短边远小于球网, 说明四边形过窄 (minAreaRect 在检测点聚集时的问题)
+    # ★ 检查短边长度是否与球网长度匹配 (球网跨越整个短边)
     if net_line is not None and not was_rebuilt:
         net_len = float(np.hypot(net_line[1][0] - net_line[0][0],
                                   net_line[1][1] - net_line[0][1]))
@@ -720,61 +723,31 @@ def extract_table_geometry(frames, img_hw, debug=False, persp_blend=0.5,
         angle_deg = math.degrees(math.acos(min(1.0, par)))
         edge_info.append((i, elen, angle_deg, a, b))
 
+    # ---- 确定端边 (near/far) ----
     found_end_edges = False
-    end_edges = None
     if net_line is not None:
-        def _extend_line(p1, p2, length):
-            dx = p2[0] - p1[0]
-            dy = p2[1] - p1[1]
-            norm = math.hypot(dx, dy)
-            if norm < 1e-6:
-                return p1, p2
-            ux, uy = dx / norm, dy / norm
-            return (p1[0] - ux * length, p1[1] - uy * length), \
-                   (p2[0] + ux * length, p2[1] + uy * length)
-
-        def _segments_intersect(p1, p2, q1, q2):
-            def cross(o, a, b):
-                return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
-            d1 = cross(q1, q2, p1)
-            d2 = cross(q1, q2, p2)
-            d3 = cross(p1, p2, q1)
-            d4 = cross(p1, p2, q2)
-            return ((d1 > 0 and d2 < 0) or (d1 < 0 and d2 > 0)) and \
-                   ((d3 > 0 and d4 < 0) or (d3 < 0 and d4 > 0))
-
-        net_ext = _extend_line(net_line[0], net_line[1], length=max(w, h) * 4)
-        intersect_mask = [_segments_intersect(net_ext[0], net_ext[1], a, b)
-                          for a, b in edges]
-        if sum(intersect_mask) == 2:
-            inter_idx = [i for i, v in enumerate(intersect_mask) if v]
-            # ★ 检查相交的两条边是否对边 (不相邻)
-            #    如果相邻, 说明四边形仍为菱形, 不使用球网切分结果
-            if not _edges_are_adjacent(inter_idx[0], inter_idx[1]):
-                found_end_edges = True
-                non_inter_idx = [i for i, v in enumerate(intersect_mask) if not v]
-                end_edge_list = [edge_info[i] for i in non_inter_idx]
-                side_edges = [edge_info[i] for i in inter_idx]
-                near_corner_idx = int(np.argmin([math.hypot(c[0], c[1] - h) for c in quad]))
-                near_corner = quad[near_corner_idx]
-                e0_a = np.array(end_edge_list[0][3])
-                e0_b = np.array(end_edge_list[0][4])
-                if (np.linalg.norm(near_corner - e0_a) < 2.0
-                        or np.linalg.norm(near_corner - e0_b) < 2.0):
-                    near_a, near_b = end_edge_list[0][3], end_edge_list[0][4]
-                    far_a, far_b = end_edge_list[1][3], end_edge_list[1][4]
-                else:
-                    near_a, near_b = end_edge_list[1][3], end_edge_list[1][4]
-                    far_a, far_b = end_edge_list[0][3], end_edge_list[0][4]
-                end_edges = end_edge_list
+        inter_idx = _net_quad_intersections(quad, net_line, img_hw)
+        if len(inter_idx) == 2 and not _edges_are_adjacent(inter_idx[0], inter_idx[1]):
+            found_end_edges = True
+            non_inter_idx = [i for i in range(4) if i not in inter_idx]
+            end_edge_list = [edge_info[i] for i in non_inter_idx]
+            near_corner_idx = int(np.argmin([math.hypot(c[0], c[1] - h) for c in quad]))
+            near_corner = quad[near_corner_idx]
+            e0_a = np.array(end_edge_list[0][3])
+            e0_b = np.array(end_edge_list[0][4])
+            if (np.linalg.norm(near_corner - e0_a) < 2.0
+                    or np.linalg.norm(near_corner - e0_b) < 2.0):
+                near_a, near_b = end_edge_list[0][3], end_edge_list[0][4]
+                far_a, far_b = end_edge_list[1][3], end_edge_list[1][4]
             else:
-                if debug:
-                    log("  ⚠️ 球网仍与相邻边相交, 回退到角度法判定端边")
+                near_a, near_b = end_edge_list[1][3], end_edge_list[1][4]
+                far_a, far_b = end_edge_list[0][3], end_edge_list[0][4]
+        elif debug:
+            log("  ⚠️ 球网仍与相邻边相交, 回退到角度法判定端边")
 
     if not found_end_edges:
         edge_info.sort(key=lambda x: x[2])
         end_edges = edge_info[:2]
-        side_edges = edge_info[2:]
         near_corner_idx = int(np.argmin([math.hypot(c[0], c[1] - h) for c in quad]))
         near_corner = quad[near_corner_idx]
         e0_a = np.array(end_edges[0][3])
@@ -938,7 +911,7 @@ def gather_ball_candidates(frames, fps):
 def filter_static_ball_candidates(ball_cands, fps, frame_w, frame_h,
                                   min_static_count=10, debug=False):
     """
-    ★ v4: 用空间网格哈希替代窗口内 O(n²) 两两比较。
+    用空间网格哈希替代窗口内 O(n²) 两两比较。
     同一 600 帧窗口内, 若某网格 cell (及其 8 邻域) 聚集了 >= min_static_count
     个空间高度集中的检测, 视为静止球予以剔除。
     """
@@ -949,7 +922,6 @@ def filter_static_ball_candidates(ball_cands, fps, frame_w, frame_h,
     static_threshold = max(img_diag * 0.0008, 2.0)
     cell = max(static_threshold, 1.0)
 
-    # 扁平化 + 按帧排序
     flat = []  # (fidx, di, cx, cy)
     for fidx, cands in ball_cands:
         for di, (cx, cy, _c, _b) in enumerate(cands):
@@ -964,19 +936,16 @@ def filter_static_ball_candidates(ball_cands, fps, frame_w, frame_h,
     while idx < n:
         anchor_f = flat[idx][0]
         win_end = anchor_f + window_frames
-        # 收集窗口
         win = []
         while idx < n and flat[idx][0] <= win_end:
             win.append(flat[idx])
             idx += 1
         if len(win) < min_static_count:
             continue
-        # 网格哈希
         grid = defaultdict(list)  # (gx,gy) -> [(fidx,di,cx,cy)]
         for rec in win:
             _f, _d, cx, cy = rec
             grid[(int(cx / cell), int(cy / cell))].append(rec)
-        # 对每个 cell, 聚合自身 + 邻域, 判定静止簇
         handled = set()
         for (gx, gy), bucket in grid.items():
             if (gx, gy) in handled:
@@ -987,7 +956,6 @@ def filter_static_ball_candidates(ball_cands, fps, frame_w, frame_h,
                     neigh.extend(grid.get((gx + dx, gy + dy), ()))
             if len(neigh) < min_static_count:
                 continue
-            # 以中位点为中心, 统计真正落在 static_threshold 内的点
             cxs = np.array([r[2] for r in neigh])
             cys = np.array([r[3] for r in neigh])
             mcx, mcy = float(np.median(cxs)), float(np.median(cys))
@@ -1126,13 +1094,30 @@ def cluster_ball_by_court(ball_cands, frame_w, frame_h, debug=False):
 
 
 def build_main_ball_track(ball_cands, fps, frame_w, frame_h, table_geo=None, debug=False,
-                          max_jump_ratio=0.05):
+                          max_jump_ratio=0.05, match_algo="auto"):
     """
-    ★ v4: 活跃 track 集合 + 提前剪枝; predict 在大 gap 时速度衰减外推。
+    活跃 track 集合 + 提前剪枝; predict 在大 gap 时速度衰减外推。
+
+    v4.2: track ↔ detection 关联支持匈牙利算法 (全局最优), 失败/缺失依赖时回退到贪心.
+        match_algo:
+          - "auto"      : 有 scipy.optimize.linear_sum_assignment 时使用匈牙利, 否则贪心
+          - "hungarian" : 强制匈牙利 (无 scipy 则警告并回退贪心)
+          - "greedy"    : 强制原 v4.1 贪心
     """
     max_jump = max_jump_ratio * math.hypot(frame_w, frame_h)
     max_gap_frames = max(1, int(fps * 0.5))
     tracks = []
+
+    # ---- 决定本次使用的关联算法 ----
+    algo = (match_algo or "auto").lower()
+    if algo == "hungarian" and not _HAS_SCIPY_LSA:
+        if debug:
+            log("  [match] 请求 hungarian 但未安装 scipy, 回退 greedy")
+        algo = "greedy"
+    if algo == "auto":
+        algo = "hungarian" if _HAS_SCIPY_LSA else "greedy"
+    if debug:
+        log(f"  [match] track↔detection 关联算法 = {algo}")
 
     def predict(track, fidx):
         pts = track["pts"]
@@ -1142,30 +1127,91 @@ def build_main_ball_track(ball_cands, fps, frame_w, frame_h, table_geo=None, deb
         df = max(1, f1 - f0)
         vx, vy = (x1 - x0) / df, (y1 - y0) / df
         dt = fidx - f1
-        # gap 越大, 速度外推越保守 (指数衰减), 抑制远距离误匹配
         decay = 0.85 ** max(0, dt - 1)
         return x1 + vx * dt * decay, y1 + vy * dt * decay
 
+    # 不可达哨兵: 必须远大于任何可能的 tol, 用于在代价矩阵中屏蔽超距配对.
+    # 距离上界约为 hypot(frame_w, frame_h), 取 1e9 远超此值.
+    _BIG = 1e9
+
     for fidx, cands in ball_cands:
         used = [False] * len(cands)
-        # 仅保留仍可能延续的活跃 track (按最后帧)
         active = [tr for tr in tracks
                   if 0 < (fidx - tr["pts"][-1][0]) <= max_gap_frames]
-        for tr in active:
-            gap = fidx - tr["pts"][-1][0]
-            px, py = predict(tr, fidx)
-            best_j, best_d = -1, 1e18
-            for j, (cx, cy, conf, b) in enumerate(cands):
-                if used[j]:
-                    continue
-                d = math.hypot(cx - px, cy - py)
-                if d < best_d:
-                    best_d, best_j = d, j
-            tol = max_jump * (1 + 0.1 * (gap - 1))
-            if best_j >= 0 and best_d < tol:
-                cx, cy, conf, b = cands[best_j]
-                tr["pts"].append((fidx, cx, cy, conf, b))
-                used[best_j] = True
+
+        if active and cands:
+            # 预先算好每个 active 的预测点和 gap-aware 容差, 两种算法共用
+            preds = []
+            tols = []
+            for tr in active:
+                gap = fidx - tr["pts"][-1][0]
+                preds.append(predict(tr, fidx))
+                tols.append(max_jump * (1 + 0.1 * (gap - 1)))
+
+            if algo == "hungarian":
+                # ---- 匈牙利: 构造 (n_active x n_cands) 代价矩阵, 超过 tol 的位置置为 _BIG ----
+                n_a, n_c = len(active), len(cands)
+                cost = np.full((n_a, n_c), _BIG, dtype=np.float64)
+                for i, (px, py) in enumerate(preds):
+                    ti = tols[i]
+                    for j, (cx, cy, _conf, _b) in enumerate(cands):
+                        d = math.hypot(cx - px, cy - py)
+                        if d < ti:
+                            cost[i, j] = d
+                # linear_sum_assignment 在矩形矩阵上也能工作: 返回 min(n_a, n_c) 对
+                try:
+                    row_ind, col_ind = _linear_sum_assignment(cost)
+                except Exception as e:
+                    if debug:
+                        log(f"  [match] linear_sum_assignment 失败 ({e}), 当帧回退 greedy")
+                    row_ind, col_ind = (), ()
+                    # 触发下方 greedy 分支
+                    algo_this_frame = "greedy"
+                else:
+                    algo_this_frame = "hungarian"
+
+                if algo_this_frame == "hungarian":
+                    for i, j in zip(row_ind, col_ind):
+                        # 过滤掉哨兵配对 (本就是超距的)
+                        if cost[i, j] >= _BIG:
+                            continue
+                        cx, cy, conf, b = cands[j]
+                        active[i]["pts"].append((fidx, cx, cy, conf, b))
+                        used[j] = True
+                else:
+                    # 退路: 与下面 greedy 分支同实现
+                    for i, tr in enumerate(active):
+                        px, py = preds[i]
+                        ti = tols[i]
+                        best_j, best_d = -1, 1e18
+                        for j, (cx, cy, _conf, _b) in enumerate(cands):
+                            if used[j]:
+                                continue
+                            d = math.hypot(cx - px, cy - py)
+                            if d < best_d:
+                                best_d, best_j = d, j
+                        if best_j >= 0 and best_d < ti:
+                            cx, cy, conf, b = cands[best_j]
+                            tr["pts"].append((fidx, cx, cy, conf, b))
+                            used[best_j] = True
+            else:
+                # ---- 贪心 (与 v4.1 完全等价): 每个 active 独立挑最近的未占用 detection ----
+                for i, tr in enumerate(active):
+                    px, py = preds[i]
+                    ti = tols[i]
+                    best_j, best_d = -1, 1e18
+                    for j, (cx, cy, _conf, _b) in enumerate(cands):
+                        if used[j]:
+                            continue
+                        d = math.hypot(cx - px, cy - py)
+                        if d < best_d:
+                            best_d, best_j = d, j
+                    if best_j >= 0 and best_d < ti:
+                        cx, cy, conf, b = cands[best_j]
+                        tr["pts"].append((fidx, cx, cy, conf, b))
+                        used[best_j] = True
+
+        # 未被任何 track 匹配上的 detection → 新开 track
         for j, (cx, cy, conf, b) in enumerate(cands):
             if not used[j]:
                 tracks.append({"pts": [(fidx, cx, cy, conf, b)]})
@@ -1314,10 +1360,13 @@ class RallyState(Enum):
 
 
 def _finalize_rally(rally_periods, current_rally, end_reason, rally_min_duration):
+    """仅当回合有效 (已跨网 且 时长 >= 最小时长) 时记录。
+    修复: 旧版计算 is_valid 后被忽略, 任何 >=0.5s 的回合都会被记录。
+    """
     rally_duration = current_rally["end"] - current_rally["start"]
     is_valid = (current_rally.get("crossed_net", False)
                 and rally_duration >= float(rally_min_duration))
-    if not is_valid and rally_duration < 0.5:
+    if not is_valid:
         return False
     rally_periods.append({
         "start_frame": current_rally["start_frame"],
@@ -1329,7 +1378,9 @@ def _finalize_rally(rally_periods, current_rally, end_reason, rally_min_duration
 
 
 def _get_net_center_x(raw_log_path):
-    net_x = None
+    """回退用: 取球网 (或球台) 包围盒中心 x。
+    修复: 旧版的 net_x 为死变量, 永远返回 table_x。
+    """
     table_x = None
     with open(raw_log_path, "r", encoding="utf-8") as f:
         for line in f:
@@ -1345,7 +1396,7 @@ def _get_net_center_x(raw_log_path):
                     return (d["bbox"][0] + d["bbox"][2]) / 2.0
                 if table_x is None and d.get("class") == "table" and len(d.get("bbox", [])) == 4:
                     table_x = (d["bbox"][0] + d["bbox"][2]) / 2.0
-    return net_x if net_x is not None else table_x
+    return table_x
 
 
 def _estimate_slow_speed_threshold(ball_lookup, fps):
@@ -1392,7 +1443,6 @@ def detect_rallies(filled_track, fps, total_frames, raw_log_path, table_geo=None
     ball_lookup = {f: ((x, y), not interp) for f, (x, y, interp) in filled_track.items()}
     sorted_frames = sorted(ball_lookup.keys())
     rallies = []
-    # ★ 优先使用球网线 (cross product) 判定过网, 回退到 net_center_x
     net_line = table_geo.get("net_line") if table_geo else None
     net_center_x = _get_net_center_x(raw_log_path) if net_line is None else None
     if net_line is None and net_center_x is None:
@@ -1439,9 +1489,7 @@ def detect_rallies(filled_track, fps, total_frames, raw_log_path, table_geo=None
     traj_buffer = deque(maxlen=max(PRE_ROLL_FRAMES * 3, int(fps * 6)))
 
     def _ball_side(x, y):
-        """★ 使用球网线 cross product 判定球在哪一侧。
-        球网线为任意角度时均正确 (不再仅用 x 坐标)。
-        """
+        """使用球网线 cross product 判定球在哪一侧 (任意角度均正确)。"""
         if net_line is not None:
             (nx1, ny1), (nx2, ny2) = net_line
             cross = (nx2 - nx1) * (y - ny1) - (ny2 - ny1) * (x - nx1)
@@ -1567,8 +1615,8 @@ def detect_rallies(filled_track, fps, total_frames, raw_log_path, table_geo=None
 
 def detect_events(filled_track, table_geo, fps):
     """
-    ★ v4: bounce 用窗口极值判定 (局部 y 最大值), 抗噪;
-    hit 仍用 vx 反向且幅度足够。
+    bounce 用窗口极值判定 (局部 y 最大值), 抗噪;
+    hit 用 vx 反向且幅度足够。
     """
     events = []
     if not filled_track:
@@ -1679,8 +1727,7 @@ def build_segments(rallies, fps, total_frames, args):
 #  7) 渲染
 # =====================================================================
 class MiniTable:
-    def __init__(self, frame_w, frame_h, table_geo):
-        self.geo = table_geo
+    def __init__(self, frame_w, frame_h):
         self.h = int(frame_h * 0.30)
         self.w = int(self.h / TABLE_RATIO)
         self.margin = int(frame_w * 0.015)
@@ -1790,7 +1837,7 @@ class ParticleSystem:
 
 
 class CometRenderer:
-    """彗星拖尾渲染器 (按分辨率缓存复用 overlay/alpha 缓冲, 避免可变默认参数)。"""
+    """彗星拖尾渲染器 (按分辨率缓存复用 overlay/alpha 缓冲)。"""
     def __init__(self):
         self._cache = {}
 
@@ -1846,6 +1893,7 @@ def smooth_trail(points):
     pts = np.array(points, dtype=np.float64)
     xs = np.convolve(pts[:, 0], _SMOOTH_KERNEL, mode="same")
     ys = np.convolve(pts[:, 1], _SMOOTH_KERNEL, mode="same")
+    # 端点保护: convolve 'same' 会在两端引入零填充偏移, 恢复原始端点
     xs[0], ys[0] = pts[0]
     xs[-1], ys[-1] = pts[-1]
     return list(zip(xs, ys))
@@ -1924,7 +1972,7 @@ def render(args, segments, rally_starts_by_seg, filled_track, events, table_geo,
         cap = cv2.VideoCapture(args.video)
         if not cap.isOpened():
             raise RuntimeError(f"无法打开视频: {args.video}")
-        mini = MiniTable(out_w, out_h, table_geo)
+        mini = MiniTable(out_w, out_h)
         particles = ParticleSystem()
         comet = CometRenderer()
         TRAIL_LEN = max(12, int(fps * 0.5))
@@ -2122,7 +2170,7 @@ def main():
     if not os.path.exists(args.raw_detections):
         log(f"❌ 检测日志不存在: {args.raw_detections}"); sys.exit(1)
     log("=" * 60)
-    log("🏓 PingPong Highlight Generator (v4 几何自愈 + 性能优化)")
+    log("🏓 PingPong Highlight Generator (v4.1 几何自愈 + 性能优化 + 逻辑修复)")
     log("=" * 60)
     cap = cv2.VideoCapture(args.video)
     if not cap.isOpened():
@@ -2160,7 +2208,7 @@ def main():
     ball_cands = cluster_ball_by_court(ball_cands, in_w, in_h, debug=args.debug)
     main_track = build_main_ball_track(
         ball_cands, fps, in_w, in_h, table_geo=table_geo, debug=args.debug,
-        max_jump_ratio=args.max_jump_ratio)
+        max_jump_ratio=args.max_jump_ratio, match_algo=args.match_algo)
     log(f"   主轨迹原始点数: {len(main_track)}")
 
     log("🧩 物理补帧 ...")
