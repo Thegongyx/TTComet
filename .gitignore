@@ -17,6 +17,8 @@ old/
 
 # 临时文件
 tmp/
+src_yls/tmp_ls_data/
+src_yls/config.json
 
 # 脚本输出目录 (自动生成)
 random_frames/
