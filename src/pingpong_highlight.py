@@ -1,8 +1,17 @@
 #!/usr/bin/env python3
 """
-pingpong_highlight.py  (优化版 v4.2 - 在 v4.1 基础上把 track↔detection 关联改为匈牙利算法)
+pingpong_highlight.py  (优化版 v4.3 - 修复 mini 球台边缘伪落点问题)
 =====================================================================
 乒乓球比赛 → 自动特效精华集锦
+
+v4.3 在 v4.2 基础上的改动 (修复 mini 球台边缘伪落点):
+  ★ detect_events._in_table: 从「走廊多边形」改为「球台四边形 quad」做点-多边形测试,
+    从源头过滤掉非台面反弹 (地板反弹、身体阻挡等), 避免出台球被误判为 bounce。
+  ★ detect_events 新增 _on_table_surface: 将 bounce 候选点经 img_to_table 映射到台面坐标,
+    检查是否在球台物理范围 [0,1525]×[0,2740] mm 内 (含 80mm 容差),
+    超出则拒绝 —— 进一步杜绝出台球产生伪落点。
+  ★ MiniTable.table_to_mini: 将越界容差从 15% (X≈228mm, Y≈411mm) 收紧到 50mm,
+    并保留 clamp 作为最后兜底, 确保即便有漏网越界 bounce 也不会被画到 mini 球台边缘。
 
 v4.2 在 v4.1 基础上的改动 (默认行为可能略有差异, 但可通过 --match-algo greedy 复现):
   ★ build_main_ball_track: 把原来的「按 active track 顺序逐个 argmin」贪心关联,
@@ -1641,12 +1650,33 @@ def detect_events(filled_track, table_geo, fps):
         v_mps = (d_mm / 1000.0) / dt
         return v_mps * 3.6
 
-    corridor = table_geo.get("corridor") if table_geo else None
+    # ---- v4.3 修复: 用球台四边形 quad 替代走廊 corridor ----
+    # 走廊比球台大 3~4 倍, 会导致出台球的地板反弹被误判为台面 bounce。
+    # 改用 quad (球台本体四角) 做点-多边形测试, 从源头过滤非台面反弹。
+    quad = table_geo.get("quad") if table_geo else None
 
     def _in_table(x, y):
-        if corridor is None:
+        if quad is None:
             return True
-        return _point_in_corridor((x, y), corridor)
+        return _point_in_corridor((x, y), quad)
+
+    # ---- v4.3 修复: 台面高度合理性检查 ----
+    # 将 bounce 候选点经 img_to_table 映射到台面坐标 (mm),
+    # 检查是否在球台物理范围 [0,1525]×[0,2740] 内 (含容差)。
+    # 出台球 (地板反弹、身体阻挡等) 映射后必然超出此范围, 从而被拒绝。
+    _TX_MAX = TABLE_WID_M * 1000   # 1525 mm
+    _TY_MAX = TABLE_LEN_M * 1000   # 2740 mm
+    _SURFACE_TOL = 80              # 80mm 容差 (球半径 ~20mm + 检测抖动)
+
+    def _on_table_surface(x, y):
+        if table_geo is None:
+            return True
+        txy = img_to_table(table_geo, (x, y))
+        if txy is None:
+            return False
+        tx, ty = txy
+        return (-_SURFACE_TOL <= tx <= _TX_MAX + _SURFACE_TOL and
+                -_SURFACE_TOL <= ty <= _TY_MAX + _SURFACE_TOL)
 
     last_bounce_frame = -10 ** 9
     bounce_cooldown_frames = max(1, int(round(fps * 0.1)))
@@ -1663,7 +1693,9 @@ def detect_events(filled_track, table_geo, fps):
         vy_prev = y - y_p
         vy_next = y_n - y
         if is_local_y_max and vy_prev > 0.1 and vy_next < -0.1:
-            if f - last_bounce_frame >= bounce_cooldown_frames and _in_table(x, y):
+            if (f - last_bounce_frame >= bounce_cooldown_frames
+                    and _in_table(x, y)
+                    and _on_table_surface(x, y)):
                 ev_type = "bounce"
                 last_bounce_frame = f
 
@@ -1743,9 +1775,13 @@ class MiniTable:
         if txy is None:
             return None
         X, Y = txy
-        margin = 0.15
-        if not (-self._x_max * margin <= X <= self._x_max * (1 + margin)
-                and -self._y_max * margin <= Y <= self._y_max * (1 + margin)):
+        # ---- v4.3 修复: 收紧越界容差 ----
+        # 原来用 15% margin (X≈228mm, Y≈411mm), 出台球经 H 反变换后
+        # 落在此范围内会被 clamp 到 mini 球台边缘, 产生伪落点。
+        # 现收紧到 50mm (球半径 + 少量抖动), 超出则直接丢弃。
+        _tol = 50  # mm
+        if not (-_tol <= X <= self._x_max + _tol
+                and -_tol <= Y <= self._y_max + _tol):
             return None
         X = _clamp(X, 0.0, self._x_max)
         Y = _clamp(Y, 0.0, self._y_max)
@@ -1876,13 +1912,13 @@ class CometRenderer:
             blended = roi_f.astype(np.float32) * (1.0 - a3) + roi_o.astype(np.float32) * a3
             roi_f[:] = np.clip(blended + 0.5, 0, 255).astype(np.uint8)
         cx, cy = int(trail_pts[-1][0]), int(trail_pts[-1][1])
-        r = 4
+        r = 2
         yy0, yy1 = max(0, cy - r), min(h, cy + r + 1)
         xx0, xx1 = max(0, cx - r), min(w, cx + r + 1)
         if yy0 < yy1 and xx0 < xx1:
             ball_roi = frame[yy0:yy1, xx0:xx1].copy()
             cv2.circle(frame, (cx, cy), r, (255, 255, 255), -1, cv2.LINE_AA)
-            alpha = 0.5
+            alpha = 0.10
             cv2.addWeighted(frame[yy0:yy1, xx0:xx1], alpha, ball_roi, 1.0 - alpha, 0,
                             frame[yy0:yy1, xx0:xx1])
 
