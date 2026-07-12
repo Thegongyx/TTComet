@@ -9,6 +9,9 @@ __pycache__/
 # 但 models/ 目录结构需要追踪
 !models/
 
+# npy 缓存 (大文件, 由外部工具生成)
+*.npy
+
 # 训练输出 (大文件)
 runs/
 
