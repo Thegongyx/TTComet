@@ -9,6 +9,9 @@ __pycache__/
 # 但 models/ 目录结构需要追踪
 !models/
 
+# 训练数据 (大文件, 超过 gitee 推送限制)
+train_data/
+
 # 训练输出 (大文件)
 runs/
 

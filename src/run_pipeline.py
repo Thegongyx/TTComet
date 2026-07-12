@@ -520,6 +520,12 @@ def main():
             print(f"  [{i}] {Path(vp).name}")
         print()
 
+        # Step A: 写入视频列表文件用于批量推理
+        os.makedirs("tmp", exist_ok=True)
+        with open("tmp/video_list.txt", "w", encoding="utf-8") as f:
+            for vp in videos:
+                f.write(vp + "\n")
+
         # 确定输出目录
         if args.output_dir:
             os.makedirs(args.output_dir, exist_ok=True)
@@ -527,14 +533,72 @@ def main():
         # 保存原始 raw_detections (用于每个视频重置)
         original_raw_detections = args.raw_detections
 
+        # Step B: 构建批量推理命令 (仅执行一次, 模型加载一次)
+        batch_infer_cmd = python_cmd + [str(INFERENCE_SCRIPT),
+            "--video-list-file", "tmp/video_list.txt",
+            "--output", "inference_output"]
+
+        # 批量推理参数 (同 _process_one_video 中的推理参数)
+        if args.model:
+            batch_infer_cmd += ["--model", args.model]
+        if args.batch_size is not None:
+            batch_infer_cmd += ["--batch-size", str(args.batch_size)]
+        if args.imgsz is not None:
+            batch_infer_cmd += ["--imgsz", str(args.imgsz)]
+        if args.device is not None:
+            batch_infer_cmd += ["--device", args.device]
+        if args.half:
+            batch_infer_cmd += ["--half"]
+        if args.conf is not None:
+            batch_infer_cmd += ["--conf", str(args.conf)]
+        if args.out_width is not None:
+            batch_infer_cmd += ["--out-width", str(args.out_width)]
+        if args.encoder is not None:
+            batch_infer_cmd += ["--encoder", args.encoder]
+        if args.remove_cfr:
+            batch_infer_cmd += ["--remove-cfr"]
+        if args.iou is not None:
+            batch_infer_cmd += ["--iou", str(args.iou)]
+        if args.conf_ball is not None:
+            batch_infer_cmd += ["--conf-ball", str(args.conf_ball)]
+        if args.conf_player is not None:
+            batch_infer_cmd += ["--conf-player", str(args.conf_player)]
+        if args.conf_racket is not None:
+            batch_infer_cmd += ["--conf-racket", str(args.conf_racket)]
+        if args.conf_table is not None:
+            batch_infer_cmd += ["--conf-table", str(args.conf_table)]
+        if args.conf_net is not None:
+            batch_infer_cmd += ["--conf-net", str(args.conf_net)]
+        if args.log_flush_interval is not None:
+            batch_infer_cmd += ["--log-flush-interval", str(args.log_flush_interval)]
+        if args.writer_backend is not None:
+            batch_infer_cmd += ["--writer-backend", args.writer_backend]
+        if args.no_polygon:
+            batch_infer_cmd += ["--no-polygon"]
+        if args.empty_cache_every is not None:
+            batch_infer_cmd += ["--empty-cache-every", str(args.empty_cache_every)]
+        if args.conf_margin is not None:
+            batch_infer_cmd += ["--conf-margin", str(args.conf_margin)]
+        if args.amf_quality is not None:
+            batch_infer_cmd += ["--amf-quality", args.amf_quality]
+        if args.amf_qp is not None:
+            batch_infer_cmd += ["--amf-qp", str(args.amf_qp)]
+
+        # 执行批量推理
+        if not run_step(batch_infer_cmd,
+                         "Step 1/2: YOLO 推理 (批处理 via --video-list-file)",
+                         note=f"模型仅加载一次, 共 {len(videos)} 个视频..."):
+            print("⚠️ 批量推理部分失败, 将基于已有 jsonl 继续处理...")
+
         succeeded = 0
         failed_videos = []
         t_batch_start = time.time()
 
+        # Step C: 逐视频高光处理 (跳过推理, 已在批处理中完成)
         for i, vp in enumerate(videos, 1):
             video_name = Path(vp).name
             print(f"\n{'#' * 70}")
-            print(f"#  [{i}/{len(videos)}] 开始处理: {video_name}")
+            print(f"#  [{i}/{len(videos)}] 高光处理: {video_name}")
             print(f"{'#' * 70}")
 
             # 为当前视频设置参数
@@ -548,18 +612,30 @@ def main():
             else:
                 args.output = None  # 使用默认路径
 
-            try:
-                if _process_one_video(args, python_cmd, has_ffmpeg,
-                                      video_index=i, video_total=len(videos)):
-                    succeeded += 1
-                else:
-                    failed_videos.append(video_name)
-                    print(f"\n  ⚠️  [{i}/{len(videos)}] {video_name} 处理失败, 继续下一个...")
-            except KeyboardInterrupt:
-                elapsed_min = (time.time() - t_batch_start) / 60.0
-                print(f"\n\n⚠️ 用户中断! 已处理 {i - 1}/{len(videos)} 个视频, "
-                      f"成功 {succeeded} 个, ⏱️ 已耗时: {elapsed_min:.1f} min")
-                sys.exit(1)
+            # 跳过推理 (已在批处理中完成)
+            args.skip_inference = True
+
+            # 检查 JSONL 是否存在
+            stem = Path(vp).stem
+            work_dir = os.path.join(os.getcwd(), "inference_output", f"pipeline_{stem}")
+            raw_detections_path = os.path.join(work_dir, "raw_detections.jsonl")
+
+            if os.path.exists(raw_detections_path):
+                try:
+                    if _process_one_video(args, python_cmd, has_ffmpeg,
+                                          video_index=i, video_total=len(videos)):
+                        succeeded += 1
+                    else:
+                        failed_videos.append(video_name)
+                        print(f"\n  ⚠️  [{i}/{len(videos)}] {video_name} 处理失败, 继续下一个...")
+                except KeyboardInterrupt:
+                    elapsed_min = (time.time() - t_batch_start) / 60.0
+                    print(f"\n\n⚠️ 用户中断! 已处理 {i - 1}/{len(videos)} 个视频, "
+                          f"成功 {succeeded} 个, ⏱️ 已耗时: {elapsed_min:.1f} min")
+                    sys.exit(1)
+            else:
+                print(f"⚠️ 跳过高光: {raw_detections_path} 不存在")
+                failed_videos.append(video_name)
 
         # ================================================================
         #  批量汇总

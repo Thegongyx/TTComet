@@ -31,6 +31,7 @@ v6 (WSL/VAAPI) → v7 (Windows/AMF) 迁移修复:
 # ---------------------------------------------------------------------------
 import os
 import sys
+import time
 import platform
 
 _IS_WINDOWS = (platform.system() == "Windows")
@@ -60,6 +61,7 @@ import threading
 from queue import Queue
 from datetime import datetime
 from collections import defaultdict
+from dataclasses import dataclass
 
 # Windows 子进程不弹黑窗
 _SUBPROC_FLAGS = 0
@@ -121,6 +123,8 @@ def _default_output():
 def parse_args():
     parser = argparse.ArgumentParser(description="PingPong Video Inference v7 (Windows/AMF)")
     parser.add_argument("--video", "-v", type=str, default=_default_video())
+    parser.add_argument("--video-list-file", type=str, default=None,
+                        help="批处理模式: UTF-8 文本文件, 每行一个视频绝对路径")
     parser.add_argument("--model", "-m", type=str, default=_default_model())
     parser.add_argument("--output", "-o", type=str, default=_default_output())
     parser.add_argument("--device", type=str, default="0")
@@ -674,10 +678,35 @@ def process_single_result(
     return out_frame, log_line
 
 
-# ==================== 主流程 ====================
-def main():
-    args = parse_args()
+# ==================== 推理上下文（一次性加载结果）====================
+@dataclass
+class InferenceContext:
+    """存放模型加载、类别映射、配置初始化等一次性计算结果。"""
+    model: 'YOLO'
+    device: str
+    use_half: bool
+    CLASS_CONFIG: dict
+    CLASS_NAMES: dict
+    COLORS: dict
+    CONF_THRESHOLDS: dict
+    BALL_CLASS_ID: int | None
+    TABLE_CLASS_ID: int | None
+    NET_CLASS_ID: int | None
+    POLYGON_NEEDED_CLASS_IDS: set
+    want_polygons: bool
+    OUTPUT_DIR: str
+    LOG_FILENAME: str
+    BATCH_SIZE: int
+    IMGSZ: int
+    args: argparse.Namespace
+    mask_proc: 'MaskProcessor'
+    pad_frame_zero: 'np.ndarray'
+    min_conf_for_predict: float
 
+
+def load_model_and_config(args):
+    """加载模型、建立类别映射、初始化所有配置，返回 InferenceContext。"""
+    # ---- 输出目录 ----
     if args.output.endswith(".json"):
         OUTPUT_DIR = os.path.dirname(args.output) or "."
         LOG_FILENAME = os.path.basename(args.output)
@@ -686,7 +715,6 @@ def main():
         LOG_FILENAME = "detection_log.json"
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-    VIDEO_PATH = args.video
     MODEL_PATH = args.model
     BATCH_SIZE = args.batch_size
     IMGSZ      = args.imgsz
@@ -706,11 +734,9 @@ def main():
         use_half = False
 
     if device != "cpu":
-        # ROCm 不支持 TF32, 设置无害; cuDNN benchmark 在 ROCm 下也能选走最优 kernel
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.benchmark = True
 
-    # 打印 GPU 信息便于确认是 Radeon 8060S
     if device != "cpu":
         try:
             dev_idx = int(device) if device.isdigit() else 0
@@ -767,207 +793,286 @@ def main():
         print(f"ℹ️ Polygon 仅对类别 {sorted(POLYGON_NEEDED_CLASS_IDS)} 提取, "
               f"跳过其他类别以节省 CPU")
 
-    # ---- VFR 处理 ----
-    print(f"\n📹 Video: {VIDEO_PATH}")
-    if is_variable_frame_rate(VIDEO_PATH):
-        print("⚠️ Variable Frame Rate (VFR) detected!")
-        cfr_video_path = os.path.join(OUTPUT_DIR, "video_cfr.mp4")
-        video_input_path = convert_vfr_to_cfr(VIDEO_PATH, cfr_video_path)
-    else:
-        print("✅ Constant Frame Rate (CFR) confirmed.")
-        video_input_path = VIDEO_PATH
-
-    cap = cv2.VideoCapture(video_input_path)
-    if not cap.isOpened():
-        raise RuntimeError(f"无法打开视频: {video_input_path}")
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    width  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-
-    out_width  = args.out_width
-    out_height = max(2, int(round(height * out_width / width)))
-    if out_height % 2 != 0:
-        out_height += 1
-
-    output_video_path = os.path.join(OUTPUT_DIR, "pingpong_detection.mp4")
-    if args.writer_backend == "ffmpeg" and shutil.which("ffmpeg"):
-        out_video = FFmpegWriter(output_video_path, out_width, out_height, fps,
-                                 prefer=args.encoder,
-                                 amf_quality=args.amf_quality,
-                                 amf_qp=args.amf_qp)
-        if out_video.encoder:
-            print(f"🎬 FFmpeg pipe writer ({out_video.encoder}, "
-                  f"quality={args.amf_quality}, qp={args.amf_qp}) "
-                  f"@ {out_width}x{out_height} fps={fps}")
-        else:
-            print(f"🎬 FFmpeg pipe writer (libx264 software fallback) "
-                  f"@ {out_width}x{out_height} fps={fps}")
-    else:
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        out_video = cv2.VideoWriter(output_video_path, fourcc, fps,
-                                    (out_width, out_height))
-        print(f"🎬 OpenCV writer @ {out_width}x{out_height} fps={fps}")
-
-    # ---- 状态 ----
-    state = {
-        "total_class_counts": {cls_id: 0 for cls_id in CLASS_CONFIG},
-        "class_frame_counts": defaultdict(list),
-        "empty_frames":       0,
-        "out_width":          out_width,
-        "out_height":         out_height,
-    }
     mask_proc = MaskProcessor()
-
-    # ---- 流水线 ----
-    read_queue  = Queue(maxsize=max(8, BATCH_SIZE * 4))
-    write_queue = Queue(maxsize=240)
-    raw_log_path = os.path.join(OUTPUT_DIR, "raw_detections.jsonl")
-    raw_log_f = open(raw_log_path, "w", encoding="utf-8")
-    log_queue = Queue(maxsize=4000)
-    reader_stop = threading.Event()
-
-    t_reader = threading.Thread(target=frame_reader,
-                                args=(cap, read_queue, BATCH_SIZE, reader_stop),
-                                daemon=True)
-    t_writer = threading.Thread(target=frame_writer,
-                                args=(out_video, write_queue), daemon=True)
-    t_logger = threading.Thread(target=log_writer,
-                                args=(raw_log_f, log_queue, args.log_flush_interval),
-                                daemon=True)
-    t_reader.start(); t_writer.start(); t_logger.start()
-
-    if total_frames > 0:
-        print(f"\n🚀 开始推理: {total_frames:,} 帧, batch={BATCH_SIZE}, "
-              f"half={use_half}, imgsz={IMGSZ}")
-    else:
-        print(f"\n🚀 开始推理 (总帧数未知), batch={BATCH_SIZE}, "
-              f"half={use_half}, imgsz={IMGSZ}")
-    frame_idx = 0
-    start_time = datetime.now()
-    last_log_time = start_time
-    last_log_idx  = 0
-    ewma_fps = None
-    batch_count = 0
-
-    # 预分配 padding 用的零帧 —— 小于 imgsz 不影响 letterbox, 使用 imgsz×imgsz 节省传输
     pad_frame_zero = np.zeros((IMGSZ, IMGSZ, 3), dtype=np.uint8)
-
-    # 传给 GPU 端 NMS 的 conf: 取最小阈值减 margin, 避免边缘类别被提前刪除
     min_conf_for_predict = max(0.01,
                                min(CONF_THRESHOLDS.values()) - float(args.conf_margin))
 
+    return InferenceContext(
+        model=model,
+        device=device,
+        use_half=use_half,
+        CLASS_CONFIG=CLASS_CONFIG,
+        CLASS_NAMES=CLASS_NAMES,
+        COLORS=COLORS,
+        CONF_THRESHOLDS=CONF_THRESHOLDS,
+        BALL_CLASS_ID=BALL_CLASS_ID,
+        TABLE_CLASS_ID=TABLE_CLASS_ID,
+        NET_CLASS_ID=NET_CLASS_ID,
+        POLYGON_NEEDED_CLASS_IDS=POLYGON_NEEDED_CLASS_IDS,
+        want_polygons=want_polygons,
+        OUTPUT_DIR=OUTPUT_DIR,
+        LOG_FILENAME=LOG_FILENAME,
+        BATCH_SIZE=BATCH_SIZE,
+        IMGSZ=IMGSZ,
+        args=args,
+        mask_proc=mask_proc,
+        pad_frame_zero=pad_frame_zero,
+        min_conf_for_predict=min_conf_for_predict,
+    )
+
+
+# ==================== process_one_video ====================
+def process_one_video(video_path, args, ctx, output_dir=None):
+    """处理单个视频的推理流程：VFR→CFR、推理循环、输出清理。"""
     try:
-        while True:
-            batch_item = read_queue.get()
-            if batch_item is None:
-                break
+        output_dir_or_ctx = output_dir if output_dir is not None else ctx.OUTPUT_DIR
 
-            frames_in_batch = [item[1] for item in batch_item]
-            actual_n = len(frames_in_batch)
-            pad_n = 0
-            if 0 < actual_n < BATCH_SIZE:
-                pad_n = BATCH_SIZE - actual_n
-                frames_in_batch = frames_in_batch + [pad_frame_zero] * pad_n
+        # ---- VFR 处理 ----
+        print(f"\n📹 Video: {video_path}")
+        if is_variable_frame_rate(video_path):
+            print("⚠️ Variable Frame Rate (VFR) detected!")
+            cfr_video_path = os.path.join(output_dir_or_ctx, "video_cfr.mp4")
+            video_input_path = convert_vfr_to_cfr(video_path, cfr_video_path)
+        else:
+            print("✅ Constant Frame Rate (CFR) confirmed.")
+            video_input_path = video_path
 
-            with torch.inference_mode():
-                results = model.predict(
-                    frames_in_batch,
-                    conf=min_conf_for_predict, iou=args.iou,
-                    verbose=False, imgsz=IMGSZ, augment=False,
-                    device=device, half=use_half,
-                    stream=False,
-                    # end2end=args.end2end,   # 新增：与训练验证保持一致
-                    # max_det=args.max_det,   # 新增：避免 NMS-free 模式漏检
-                )
-            if pad_n > 0:
-                results = results[:actual_n]
+        cap = cv2.VideoCapture(video_input_path)
+        if not cap.isOpened():
+            raise RuntimeError(f"无法打开视频: {video_input_path}")
+        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        width  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-            for result, (orig_idx, frame_raw) in zip(results, batch_item):
-                frame_idx = orig_idx
-                out_frame, log_line = process_single_result(
-                    result, frame_raw, frame_idx, fps,
-                    CLASS_CONFIG, CONF_THRESHOLDS, CLASS_NAMES, COLORS,
-                    BALL_CLASS_ID, TABLE_CLASS_ID, NET_CLASS_ID,
-                    POLYGON_NEEDED_CLASS_IDS,
-                    mask_proc, state, want_polygons
-                )
-                write_queue.put(out_frame)
-                log_queue.put(log_line)
+        out_width  = args.out_width
+        out_height = max(2, int(round(height * out_width / width)))
+        if out_height % 2 != 0:
+            out_height += 1
 
-            batch_count += 1
-            if args.empty_cache_every > 0 and device != "cpu" \
-               and batch_count % args.empty_cache_every == 0:
-                try:
+        output_video_path = os.path.join(output_dir_or_ctx, "pingpong_detection.mp4")
+        if args.writer_backend == "ffmpeg" and shutil.which("ffmpeg"):
+            out_video = FFmpegWriter(output_video_path, out_width, out_height, fps,
+                                     prefer=args.encoder,
+                                     amf_quality=args.amf_quality,
+                                     amf_qp=args.amf_qp)
+            if out_video.encoder:
+                print(f"🎬 FFmpeg pipe writer ({out_video.encoder}, "
+                      f"quality={args.amf_quality}, qp={args.amf_qp}) "
+                      f"@ {out_width}x{out_height} fps={fps}")
+            else:
+                print(f"🎬 FFmpeg pipe writer (libx264 software fallback) "
+                      f"@ {out_width}x{out_height} fps={fps}")
+        else:
+            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+            out_video = cv2.VideoWriter(output_video_path, fourcc, fps,
+                                        (out_width, out_height))
+            print(f"🎬 OpenCV writer @ {out_width}x{out_height} fps={fps}")
+
+        # ---- 状态 ----
+        state = {
+            "total_class_counts": {cls_id: 0 for cls_id in ctx.CLASS_CONFIG},
+            "class_frame_counts": defaultdict(list),
+            "empty_frames":       0,
+            "out_width":          out_width,
+            "out_height":         out_height,
+        }
+        # ---- 流水线 ----
+        read_queue  = Queue(maxsize=max(8, ctx.BATCH_SIZE * 4))
+        write_queue = Queue(maxsize=240)
+        raw_log_path = os.path.join(output_dir_or_ctx, "raw_detections.jsonl")
+        raw_log_f = open(raw_log_path, "w", encoding="utf-8")
+        log_queue = Queue(maxsize=4000)
+        reader_stop = threading.Event()
+
+        t_reader = threading.Thread(target=frame_reader,
+                                    args=(cap, read_queue, ctx.BATCH_SIZE, reader_stop),
+                                    daemon=True)
+        t_writer = threading.Thread(target=frame_writer,
+                                    args=(out_video, write_queue), daemon=True)
+        t_logger = threading.Thread(target=log_writer,
+                                    args=(raw_log_f, log_queue, args.log_flush_interval),
+                                    daemon=True)
+        t_reader.start(); t_writer.start(); t_logger.start()
+
+        if total_frames > 0:
+            print(f"\n🚀 开始推理: {total_frames:,} 帧, batch={ctx.BATCH_SIZE}, "
+                  f"half={ctx.use_half}, imgsz={ctx.IMGSZ}")
+        else:
+            print(f"\n🚀 开始推理 (总帧数未知), batch={ctx.BATCH_SIZE}, "
+                  f"half={ctx.use_half}, imgsz={ctx.IMGSZ}")
+        frame_idx = 0
+        start_time = datetime.now()
+        last_log_time = start_time
+        last_log_idx  = 0
+        ewma_fps = None
+        batch_count = 0
+
+        # 预分配 padding 用的零帧 —— 小于 imgsz 不影响 letterbox, 使用 imgsz×imgsz 节省传输
+        # （pad_frame_zero 已在 load_model_and_config 中分配）
+
+        # 传给 GPU 端 NMS 的 conf: 取最小阈值减 margin, 避免边缘类别被提前刪除
+        # （min_conf_for_predict 已在 load_model_and_config 中计算）
+
+        try:
+            while True:
+                batch_item = read_queue.get()
+                if batch_item is None:
+                    break
+
+                frames_in_batch = [item[1] for item in batch_item]
+                actual_n = len(frames_in_batch)
+                pad_n = 0
+                if 0 < actual_n < ctx.BATCH_SIZE:
+                    pad_n = ctx.BATCH_SIZE - actual_n
+                    frames_in_batch = frames_in_batch + [ctx.pad_frame_zero] * pad_n
+
+                with torch.inference_mode():
+                    results = ctx.model.predict(
+                        frames_in_batch,
+                        conf=ctx.min_conf_for_predict, iou=args.iou,
+                        verbose=False, imgsz=ctx.IMGSZ, augment=False,
+                        device=ctx.device, half=ctx.use_half,
+                        stream=False,
+                        # end2end=args.end2end,   # 新增：与训练验证保持一致
+                        # max_det=args.max_det,   # 新增：避免 NMS-free 模式漏检
+                    )
+                if pad_n > 0:
+                    results = results[:actual_n]
+
+                for result, (orig_idx, frame_raw) in zip(results, batch_item):
+                    frame_idx = orig_idx
+                    out_frame, log_line = process_single_result(
+                        result, frame_raw, frame_idx, fps,
+                        ctx.CLASS_CONFIG, ctx.CONF_THRESHOLDS, ctx.CLASS_NAMES, ctx.COLORS,
+                        ctx.BALL_CLASS_ID, ctx.TABLE_CLASS_ID, ctx.NET_CLASS_ID,
+                        ctx.POLYGON_NEEDED_CLASS_IDS,
+                        ctx.mask_proc, state, ctx.want_polygons
+                    )
+                    write_queue.put(out_frame)
+                    log_queue.put(log_line)
+
+                batch_count += 1
+                if args.empty_cache_every > 0 and ctx.device != "cpu" \
+                   and batch_count % args.empty_cache_every == 0:
+                    try:
+                        torch.cuda.empty_cache()
+                    except Exception:
+                        pass
+
+                # ---- 进度条 (每 ~2s 刷新, 含可视化进度条 + EWMA fps + 检测统计) ----
+                now = datetime.now()
+                if (now - last_log_time).total_seconds() >= 2.0 and frame_idx > 0:
+                    dt = (now - last_log_time).total_seconds()
+                    instant_fps = (frame_idx - last_log_idx) / max(dt, 1e-6)
+                    ewma_fps = instant_fps if ewma_fps is None \
+                               else 0.7 * ewma_fps + 0.3 * instant_fps
+                    total_dets_now = sum(state["total_class_counts"].values())
+
+                    if total_frames > 0:
+                        pct = frame_idx / total_frames * 100
+                        bar_len = 30
+                        filled = int(bar_len * frame_idx / total_frames)
+                        bar = "█" * filled + "░" * (bar_len - filled)
+                        eta = (total_frames - frame_idx) / max(ewma_fps, 1e-6)
+                        print(f"  [{bar}] {pct:5.1f}%  "
+                              f"帧 {frame_idx:,}/{total_frames:,}  "
+                              f"{instant_fps:.1f} fps | ETA {eta:.0f}s  "
+                              f"| 检出: {total_dets_now}", flush=True)
+                    else:
+                        elapsed_total = (now - start_time).total_seconds()
+                        print(f"  帧 {frame_idx:,}  "
+                              f"{instant_fps:.1f} fps (EWMA {ewma_fps:.1f})  "
+                              f"已耗时 {elapsed_total:.0f}s  "
+                              f"| 检出: {total_dets_now}", flush=True)
+
+                    last_log_time = now
+                    last_log_idx  = frame_idx
+        finally:
+            # 通知子线程退出
+            reader_stop.set()
+            write_queue.put(None)
+            log_queue.put(None)
+            try: t_reader.join(timeout=5)
+            except Exception: pass
+            try: t_writer.join(timeout=300)   # 大视频 ffmpeg flush 可能久
+            except Exception: pass
+            try: t_logger.join(timeout=10)
+            except Exception: pass
+            # 必须在 t_logger 退出后才 close (避免在 logger 还在写时被关)
+            try: raw_log_f.close()
+            except Exception: pass
+            try: cap.release()
+            except Exception: pass
+            try: out_video.release()
+            except Exception: pass
+
+        if video_input_path != video_path and os.path.exists(video_input_path) \
+           and args.remove_cfr:
+            try: os.remove(video_input_path)
+            except Exception: pass
+
+        elapsed = (datetime.now() - start_time).total_seconds()
+        avg_fps = frame_idx / max(elapsed, 1e-6)
+        print(f"\n⏱️  Total: {elapsed:.1f}s | Avg: {avg_fps:.2f} fps")
+
+        total_detections = sum(state["total_class_counts"].values())
+        print(f"🔍 检测统计: 总检测数={total_detections}")
+        for cls_id, count in state["total_class_counts"].items():
+            if count > 0:
+                print(f"    {ctx.CLASS_NAMES[cls_id]}: {count}")
+
+        print(f"✅ Inference Complete! Output: {output_dir_or_ctx}")
+        print(f"📄 raw_detections.jsonl: {raw_log_path}")
+        print(f"🎬 pingpong_detection.mp4: {output_video_path}")
+
+        return True, raw_log_path
+    except Exception as e:
+        print(f"❌ process_one_video error: {e}")
+        import traceback
+        traceback.print_exc()
+        return False, None
+
+
+# ==================== 主流程 ====================
+def main():
+    args = parse_args()
+    t0 = time.time()
+    ctx = load_model_and_config(args)
+    dt = time.time() - t0
+    print(f"[BENCHMARK] model_loaded id={id(ctx.model)} time={dt:.1f}s")
+
+    if args.video_list_file:
+        # ---- 列表模式 ----
+        with open(args.video_list_file, "r", encoding="utf-8") as f:
+            video_list = [line.strip() for line in f if line.strip()]
+        if not video_list:
+            print("❌ video-list-file 为空")
+            sys.exit(1)
+        failed = []
+        for vp in video_list:
+            stem = os.path.splitext(os.path.basename(vp))[0]
+            out_dir = os.path.join(ctx.OUTPUT_DIR, f"pipeline_{stem}")
+            os.makedirs(out_dir, exist_ok=True)
+            try:
+                ok, log_path = process_one_video(vp, args, ctx, output_dir=out_dir)
+                if not ok:
+                    failed.append(vp)
+            except Exception as e:
+                print(f"⚠️ 视频 {vp} 推理失败: {e}")
+                failed.append(vp)
+            finally:
+                if ctx.device != "cpu":
                     torch.cuda.empty_cache()
-                except Exception:
-                    pass
-
-            # ---- 进度条 (每 ~2s 刷新, 含可视化进度条 + EWMA fps + 检测统计) ----
-            now = datetime.now()
-            if (now - last_log_time).total_seconds() >= 2.0 and frame_idx > 0:
-                dt = (now - last_log_time).total_seconds()
-                instant_fps = (frame_idx - last_log_idx) / max(dt, 1e-6)
-                ewma_fps = instant_fps if ewma_fps is None \
-                           else 0.7 * ewma_fps + 0.3 * instant_fps
-                total_dets_now = sum(state["total_class_counts"].values())
-
-                if total_frames > 0:
-                    pct = frame_idx / total_frames * 100
-                    bar_len = 30
-                    filled = int(bar_len * frame_idx / total_frames)
-                    bar = "█" * filled + "░" * (bar_len - filled)
-                    eta = (total_frames - frame_idx) / max(ewma_fps, 1e-6)
-                    print(f"  [{bar}] {pct:5.1f}%  "
-                          f"帧 {frame_idx:,}/{total_frames:,}  "
-                          f"{instant_fps:.1f} fps | ETA {eta:.0f}s  "
-                          f"| 检出: {total_dets_now}", flush=True)
-                else:
-                    elapsed_total = (now - start_time).total_seconds()
-                    print(f"  帧 {frame_idx:,}  "
-                          f"{instant_fps:.1f} fps (EWMA {ewma_fps:.1f})  "
-                          f"已耗时 {elapsed_total:.0f}s  "
-                          f"| 检出: {total_dets_now}", flush=True)
-
-                last_log_time = now
-                last_log_idx  = frame_idx
-    finally:
-        # 通知子线程退出
-        reader_stop.set()
-        write_queue.put(None)
-        log_queue.put(None)
-        try: t_reader.join(timeout=5)
-        except Exception: pass
-        try: t_writer.join(timeout=300)   # 大视频 ffmpeg flush 可能久
-        except Exception: pass
-        try: t_logger.join(timeout=10)
-        except Exception: pass
-        # 必须在 t_logger 退出后才 close (避免在 logger 还在写时被关)
-        try: raw_log_f.close()
-        except Exception: pass
-        try: cap.release()
-        except Exception: pass
-        try: out_video.release()
-        except Exception: pass
-
-    if video_input_path != VIDEO_PATH and os.path.exists(video_input_path) \
-       and args.remove_cfr:
-        try: os.remove(video_input_path)
-        except Exception: pass
-
-    elapsed = (datetime.now() - start_time).total_seconds()
-    avg_fps = frame_idx / max(elapsed, 1e-6)
-    print(f"\n⏱️  Total: {elapsed:.1f}s | Avg: {avg_fps:.2f} fps")
-
-    total_detections = sum(state["total_class_counts"].values())
-    print(f"🔍 检测统计: 总检测数={total_detections}")
-    for cls_id, count in state["total_class_counts"].items():
-        if count > 0:
-            print(f"    {CLASS_NAMES[cls_id]}: {count}")
-
-    print(f"✅ Inference Complete! Output: {OUTPUT_DIR}")
-    print(f"📄 raw_detections.jsonl: {raw_log_path}")
-    print(f"🎬 pingpong_detection.mp4: {output_video_path}")
+        if failed:
+            print(f"⚠️ 以下 {len(failed)} 个视频推理失败:")
+            for f in failed:
+                print(f"  - {f}")
+            sys.exit(1)
+    else:
+        # ---- 单视频模式（完全保持原样）----
+        process_one_video(args.video, args, ctx)
 
 
 if __name__ == "__main__":

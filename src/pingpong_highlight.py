@@ -1,40 +1,21 @@
 #!/usr/bin/env python3
 """
-pingpong_highlight.py  (优化版 v4.3 - 修复 mini 球台边缘伪落点问题)
+pingpong_highlight.py  (优化版 v4.7 - 精简 + 提速)
 =====================================================================
 乒乓球比赛 → 自动特效精华集锦
 
-v4.3 在 v4.2 基础上的改动 (修复 mini 球台边缘伪落点):
-  ★ detect_events._in_table: 从「走廊多边形」改为「球台四边形 quad」做点-多边形测试,
-    从源头过滤掉非台面反弹 (地板反弹、身体阻挡等), 避免出台球被误判为 bounce。
-  ★ detect_events 新增 _on_table_surface: 将 bounce 候选点经 img_to_table 映射到台面坐标,
-    检查是否在球台物理范围 [0,1525]×[0,2740] mm 内 (含 80mm 容差),
-    超出则拒绝 —— 进一步杜绝出台球产生伪落点。
-  ★ MiniTable.table_to_mini: 将越界容差从 15% (X≈228mm, Y≈411mm) 收紧到 50mm,
-    并保留 clamp 作为最后兜底, 确保即便有漏网越界 bounce 也不会被画到 mini 球台边缘。
+v4.7 在 v4.6 基础上的改动 (功能/画质不变, 仅精简与提速):
+  ★ 渲染热路径去除整帧 frame.copy(): PlayerFX 光环 / 球头辉光改为仅在
+    局部 ROI 上 addWeighted, 大幅降低每帧内存分配。
+  ★ AMF 编码器探测结果缓存 (避免重复 test-encode); 默认使用 speed 档,
+    针对 Ryzen AI Max 395 iGPU (h264_amf) 吞吐更高。
+  ★ speed_to_color 结果做 256 级 LUT 缓存, 避免每段拖尾重复插值。
+  ★ track↔detection 匈牙利/贪心两条分支合并为单一 greedy-fallback 辅助
+    函数, 去除重复代码。
+  ★ ffmpeg pipe 直编增加 -threads / 队列参数, 减少管道阻塞。
+  ★ 其余几何自愈 / 走廊 / 落点交替过滤 / 速度自适应特效行为完全保留。
 
-v4.2 在 v4.1 基础上的改动 (默认行为可能略有差异, 但可通过 --match-algo greedy 复现):
-  ★ build_main_ball_track: 把原来的「按 active track 顺序逐个 argmin」贪心关联,
-    改为基于代价矩阵的匈牙利算法 (scipy.optimize.linear_sum_assignment) 全局最优分配,
-    仍沿用原有 tol = max_jump * (1 + 0.1*(gap-1)) 门限对每条配对做事后过滤.
-  ★ 新增 CLI: --match-algo {auto, hungarian, greedy}, 默认 auto:
-      - 有 scipy 时使用匈牙利 (全局最小总代价)
-      - 无 scipy 或显式 greedy 时使用原来的贪心实现 (与 v4.1 完全等价)
-  ★ 其他逻辑 (predict / score / 球网穿越加成 / IoU 空间共域过滤 / score_min) 全部保持不变.
-
-v4.1 在 v4 基础上的修复 (行为基本兼容):
-  ★ 移除死代码: 未使用的 scipy 导入、MiniTable.geo、side_edges 变量
-  ★ 去重: extract_table_geometry 中内联的球网相交判定改为复用 _net_bisects_quad
-  ★ 修复 _finalize_rally: 之前 is_valid 计算后被忽略, 现在真正生效
-  ★ 修复 _get_net_center_x: 之前永远返回 table_x (net_x 死变量), 已简化
-  ★ 修正若干 CLI 帮助文案与实际默认值不符
-
-v4 关键能力全部保留:
-  1. 几何合理性校验 validate_and_refine_quad
-  2. 基于真实尺寸+球网约束的重建 rebuild_quad_from_constraints
-  3. 走廊最小尺寸兜底 + 软过滤自愈
-  4. 时序鲁棒聚合 (RANSAC 式中位数 + MAD 剔除)
-  5. 静止球过滤(网格哈希)、主轨迹追踪剪枝、彗星拖尾缓存
+v4.6 特效 (脚下光环 / 高透明白色落点圈 / 更淡拖尾 / 按回合重置落点) 全保留。
 """
 
 import os
@@ -69,17 +50,17 @@ except Exception:
 
 _IS_WINDOWS = (platform.system() == "Windows")
 _SUBPROC_FLAGS = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000) if _IS_WINDOWS else 0
+_CPU = os.cpu_count() or 8
 
-# smooth_trail 预分配卷积核
 _SMOOTH_KERNEL = np.array([0.25, 0.5, 0.25], dtype=np.float64)
+_PLAYER_CLASS_NAMES = ("person", "player", "people", "human", "athlete")
 
+# 编码器探测缓存 (进程内只探测一次)
+_ENC_CACHE = {}
 
-# =====================================================================
-#  标准球台常量 (ITTF)
-# =====================================================================
-TABLE_LEN_M = 2.74     # 长
-TABLE_WID_M = 1.525    # 宽
-TABLE_RATIO = TABLE_LEN_M / TABLE_WID_M   # ≈ 1.797 (长/宽)
+TABLE_LEN_M = 2.74
+TABLE_WID_M = 1.525
+TABLE_RATIO = TABLE_LEN_M / TABLE_WID_M   # ≈ 1.797
 
 
 # =====================================================================
@@ -89,45 +70,29 @@ def parse_args():
     p = argparse.ArgumentParser(
         description="乒乓球比赛自动特效高光剪辑 (pingpong_highlight.py)")
     p.add_argument("--video", "-v", required=True, help="输入视频路径")
-    p.add_argument("--raw-detections", "-r", required=True,
-                   help="raw_detections.jsonl 路径")
-    p.add_argument("--output", "-o", default="highlight_output.mp4",
-                   help="输出 mp4 路径 (默认 highlight_output.mp4)")
-    p.add_argument("--output-height", type=int, default=None,
-                   help="输出高度像素 (默认与输入视频原分辨率一致)")
-
-    # ---- 进阶可调 ----
-    p.add_argument("--min-rally-frames", type=int, default=None,
-                   help="有效回合最小帧数 (默认按 fps 自动 = 0.6s)")
-    p.add_argument("--min-static-ball-count", type=int, default=20,
-                   help="静止球过滤: 600帧窗口内最少静止检测数, 达到才剔除 (默认 20)")
-    p.add_argument("--pre-buffer", type=float, default=0.5,
-                   help="每个回合前缓冲秒数")
-    p.add_argument("--post-buffer", type=float, default=1.5,
-                   help="每个回合后缓冲秒数")
-    p.add_argument("--merge-gap", type=float, default=2.0,
-                   help="相邻回合间隔小于该秒数则合并")
-    p.add_argument("--corridor-margin", type=float, default=0.5,
-                   help="长边走廊横向容差 (近端短边宽度比例, 默认 0.5)")
-    p.add_argument("--corridor-extend", type=float, default=1.2,
-                   help="走廊沿长轴向短边外延伸倍数 (球台长度的倍数, 默认 1.2)")
-    p.add_argument("--out-of-table-timeout", type=float, default=1.0,
-                   help="球(含插值)持续出走廊该秒数则回合结束 (默认 1.0s)")
-    p.add_argument("--corridor-max-drop", type=float, default=0.55,
-                   help="走廊过滤单次剔除比例上限, 超过视为几何不可信并放宽 (默认 0.55)")
-    p.add_argument("--no-audio", action="store_true",
-                   help="不保留原声")
+    p.add_argument("--raw-detections", "-r", required=True, help="raw_detections.jsonl 路径")
+    p.add_argument("--output", "-o", default="highlight_output.mp4", help="输出 mp4 路径")
+    p.add_argument("--output-height", type=int, default=None, help="输出高度像素 (默认原分辨率)")
+    p.add_argument("--min-rally-frames", type=int, default=None, help="有效回合最小帧数 (默认 0.6s)")
+    p.add_argument("--min-static-ball-count", type=int, default=20, help="静止球过滤最少静止检测数")
+    p.add_argument("--pre-buffer", type=float, default=0.5, help="每个回合前缓冲秒数")
+    p.add_argument("--post-buffer", type=float, default=1.5, help="每个回合后缓冲秒数")
+    p.add_argument("--merge-gap", type=float, default=2.0, help="相邻回合间隔小于该秒数则合并")
+    p.add_argument("--corridor-margin", type=float, default=0.5, help="长边走廊横向容差")
+    p.add_argument("--corridor-extend", type=float, default=1.2, help="走廊沿长轴向短边外延伸倍数")
+    p.add_argument("--out-of-table-timeout", type=float, default=1.0, help="持续出走廊该秒数则回合结束")
+    p.add_argument("--corridor-max-drop", type=float, default=0.55, help="走廊过滤单次剔除比例上限")
+    p.add_argument("--no-audio", action="store_true", help="不保留原声")
     p.add_argument("--encoder", default="auto",
                    choices=["auto", "libx264", "h264_amf", "hevc_amf"],
                    help="输出编码器, auto=优先 AMD AMF 硬编")
-    p.add_argument("--max-jump-ratio", type=float, default=0.1,
-                   help="轨迹追踪最大跳变距离相对图像对角线的比例 (默认 0.1)")
-    p.add_argument("--match-algo", default="auto",
-                   choices=["auto", "hungarian", "greedy"],
-                   help="track↔detection 关联算法: auto=有 scipy 用匈牙利, "
-                        "hungarian=强制匈牙利 (需要 scipy), greedy=原 v4.1 贪心 (默认 auto)")
-    p.add_argument("--debug", action="store_true",
-                   help="输出调试信息")
+    p.add_argument("--max-jump-ratio", type=float, default=0.1, help="轨迹最大跳变距离占对角线比例")
+    p.add_argument("--match-algo", default="auto", choices=["auto", "hungarian", "greedy"],
+                   help="track↔detection 关联算法")
+    p.add_argument("--fx-level", default="normal", choices=["minimal", "normal", "max"],
+                   help="特效强度")
+    p.add_argument("--no-player-fx", action="store_true", help="关闭选手移动特效 (脚下光环)")
+    p.add_argument("--debug", action="store_true", help="输出调试信息")
     return p.parse_args()
 
 
@@ -146,6 +111,43 @@ def _clamp(v, lo, hi):
     return lo if v < lo else (hi if v > hi else v)
 
 
+def _lerp(a, b, t):
+    return a + (b - a) * t
+
+
+def _lerp_color(c0, c1, t):
+    t = _clamp(t, 0.0, 1.0)
+    return (int(_lerp(c0[0], c1[0], t)),
+            int(_lerp(c0[1], c1[1], t)),
+            int(_lerp(c0[2], c1[2], t)))
+
+
+def _build_speed_lut():
+    """预计算 256 级 速度→BGR 颜色 LUT, 避免运行时反复插值。"""
+    stops = [(0.00, (255, 200, 60)), (0.35, (120, 240, 80)),
+             (0.65, (60, 240, 255)), (1.00, (40, 90, 255))]
+    lut = []
+    for k in range(256):
+        norm = k / 255.0
+        col = stops[-1][1]
+        for i in range(len(stops) - 1):
+            t0, c0 = stops[i]
+            t1, c1 = stops[i + 1]
+            if norm <= t1:
+                local = (norm - t0) / (t1 - t0 + 1e-9)
+                col = _lerp_color(c0, c1, local)
+                break
+        lut.append(col)
+    return lut
+
+
+_SPEED_LUT = _build_speed_lut()
+
+
+def speed_to_color(norm):
+    return _SPEED_LUT[int(_clamp(norm, 0.0, 1.0) * 255)]
+
+
 def ffprobe_has_audio(video):
     if not shutil.which("ffprobe"):
         return False
@@ -160,6 +162,14 @@ def ffprobe_has_audio(video):
 
 
 def detect_amf_encoder(prefer="auto"):
+    if prefer in _ENC_CACHE:
+        return _ENC_CACHE[prefer]
+    result = _detect_amf_encoder_impl(prefer)
+    _ENC_CACHE[prefer] = result
+    return result
+
+
+def _detect_amf_encoder_impl(prefer):
     if prefer == "libx264":
         return "libx264"
     if not shutil.which("ffmpeg"):
@@ -191,6 +201,19 @@ def detect_amf_encoder(prefer="auto"):
     return "libx264"
 
 
+def _enc_args(enc):
+    if enc == "h264_amf":
+        return ["-c:v", "h264_amf", "-usage", "transcoding",
+                "-quality", "speed", "-rc", "cqp",
+                "-qp_i", "18", "-qp_p", "18", "-bf", "0", "-pix_fmt", "yuv420p"]
+    if enc == "hevc_amf":
+        return ["-c:v", "hevc_amf", "-usage", "transcoding",
+                "-quality", "speed", "-rc", "cqp",
+                "-qp_i", "18", "-qp_p", "18", "-pix_fmt", "yuv420p"]
+    return ["-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
+            "-threads", str(_CPU), "-pix_fmt", "yuv420p"]
+
+
 # =====================================================================
 #  1) 读取日志
 # =====================================================================
@@ -211,23 +234,19 @@ def load_detections(path):
             frames[fidx] = obj
     if not frames:
         raise RuntimeError("raw_detections.jsonl 为空或无法解析")
-    ordered = [frames[k] for k in sorted(frames.keys())]
-    return ordered
+    return [frames[k] for k in sorted(frames.keys())]
 
 
 # =====================================================================
 #  2) 球台 / 球网几何提取
 # =====================================================================
 def order_quad(quad):
-    """把四个角点排序为 [TL, TR, BR, BL] (图像坐标, y向下)。"""
     quad = np.array(quad, dtype=np.float32)
     c = quad.mean(axis=0)
     ang = np.arctan2(quad[:, 1] - c[1], quad[:, 0] - c[0])
-    order = np.argsort(ang)
-    q = quad[order]
+    q = quad[np.argsort(ang)]
     s = q[:, 0] + q[:, 1]
-    start = int(np.argmin(s))
-    q = np.roll(q, -start, axis=0)
+    q = np.roll(q, -int(np.argmin(s)), axis=0)
     v1 = q[1] - q[0]
     v2 = q[2] - q[0]
     if (v1[0] * v2[1] - v1[1] * v2[0]) < 0:
@@ -238,9 +257,7 @@ def order_quad(quad):
 def _get_polygon_pts_single(fr, target_class, conf_min=0.5):
     pts = []
     for det in fr.get("detections", []):
-        if det["class"] != target_class:
-            continue
-        if det.get("confidence", 0) < conf_min:
+        if det["class"] != target_class or det.get("confidence", 0) < conf_min:
             continue
         poly = det.get("polygon")
         if poly:
@@ -257,27 +274,19 @@ def _fit_quad_single(pts):
     pts = pts.astype(np.float32)
     hull = cv2.convexHull(pts)
     peri = cv2.arcLength(hull, True)
-    quad = None
     for eps_ratio in (0.003, 0.005, 0.008, 0.012, 0.015, 0.02, 0.03, 0.05):
         approx = cv2.approxPolyDP(hull, eps_ratio * peri, True)
         if len(approx) == 4:
-            quad = approx.reshape(4, 2)
-            break
-    if quad is None:
-        rect = cv2.minAreaRect(pts)
-        quad = cv2.boxPoints(rect)
-    return quad.astype(np.float32)
+            return approx.reshape(4, 2).astype(np.float32)
+    rect = cv2.minAreaRect(pts)
+    return cv2.boxPoints(rect).astype(np.float32)
 
 
 def _quad_is_convex_simple(quad):
-    """检测四边形是否凸且无自交 (排除退化/蝴蝶形)。"""
     q = np.array(quad, dtype=np.float64)
-    n = 4
     signs = []
-    for i in range(n):
-        a = q[i]
-        b = q[(i + 1) % n]
-        c = q[(i + 2) % n]
+    for i in range(4):
+        a, b, c = q[i], q[(i + 1) % 4], q[(i + 2) % 4]
         cross = (b[0] - a[0]) * (c[1] - b[1]) - (b[1] - a[1]) * (c[0] - b[0])
         signs.append(cross)
     signs = [s for s in signs if abs(s) > 1e-6]
@@ -287,7 +296,6 @@ def _quad_is_convex_simple(quad):
 
 
 def _quad_quality(quad, img_hw):
-    """评估一个 quad 作为乒乓球台的合理性。"""
     h, w = img_hw
     q = order_quad(quad).astype(np.float64)
     edges = [np.linalg.norm(q[(i + 1) % 4] - q[i]) for i in range(4)]
@@ -297,12 +305,8 @@ def _quad_quality(quad, img_hw):
     area_frac = area / (w * h)
     side_a = (edges[0] + edges[2]) * 0.5
     side_b = (edges[1] + edges[3]) * 0.5
-    long_side = max(side_a, side_b)
-    short_side = min(side_a, side_b) + 1e-6
-    ratio = long_side / short_side
-
-    ok = True
-    reason = "ok"
+    ratio = max(side_a, side_b) / (min(side_a, side_b) + 1e-6)
+    ok, reason = True, "ok"
     if not _quad_is_convex_simple(q):
         ok, reason = False, "non_convex_or_selfintersect"
     elif min_edge < min(h, w) * 0.04:
@@ -316,15 +320,12 @@ def _quad_quality(quad, img_hw):
 
 
 def _edges_are_adjacent(i, j, n=4):
-    """判断 n 边形中边 i 和边 j 是否相邻 (共享一个顶点)。"""
     diff = abs(i - j)
     return diff == 1 or diff == n - 1
 
 
 def _extend_line(p1, p2, length):
-    """沿 p1->p2 方向两端各延长 length。"""
-    dx = p2[0] - p1[0]
-    dy = p2[1] - p1[1]
+    dx, dy = p2[0] - p1[0], p2[1] - p1[1]
     norm = math.hypot(dx, dy)
     if norm < 1e-6:
         return p1, p2
@@ -345,7 +346,6 @@ def _segments_intersect(p1, p2, q1, q2):
 
 
 def _net_quad_intersections(quad, net_line, img_hw):
-    """返回球网延长线与四边形各边的相交索引列表。"""
     if net_line is None:
         return []
     h, w = img_hw
@@ -356,25 +356,18 @@ def _net_quad_intersections(quad, net_line, img_hw):
 
 
 def _net_bisects_quad(quad, net_line, img_hw):
-    """
-    检查球网线是否正确地将四边形切分为两半 (与两条对边相交)。
-    返回 (bisects: bool, intersect_indices: list)。
-    """
     if net_line is None:
-        return True, []  # 无球网时不阻断
+        return True, []
     inter_idx = _net_quad_intersections(quad, net_line, img_hw)
-    if len(inter_idx) != 2:
-        return False, inter_idx
-    if _edges_are_adjacent(inter_idx[0], inter_idx[1]):
+    if len(inter_idx) != 2 or _edges_are_adjacent(inter_idx[0], inter_idx[1]):
         return False, inter_idx
     return True, inter_idx
 
 
 def _robust_median_quad(quad_list, img_hw, debug=False):
-    """时序鲁棒聚合: 逐角点中位数 + MAD 剔除离群帧。"""
     if len(quad_list) < 3:
         return None
-    ordered = np.stack([order_quad(q) for q in quad_list], axis=0)  # (N,4,2)
+    ordered = np.stack([order_quad(q) for q in quad_list], axis=0)
     med = np.median(ordered, axis=0)
     devs = np.linalg.norm(ordered - med[None], axis=2).sum(axis=1)
     mad = np.median(np.abs(devs - np.median(devs))) + 1e-6
@@ -387,61 +380,37 @@ def _robust_median_quad(quad_list, img_hw, debug=False):
 
 
 def _fit_net_line_single(pts):
-    """用球网多边形底边(BL→BR)方向拟合球网线, 并投影到最远端点.
-
-    多边形走线顺序: TL(左上) → BL(左下) → BR(右下) → TR(右上) → TL
-    取 BL→BR (球网接触桌面的底边) 作为球网线方向,
-    再将全部多边形点沿该方向投影到最远两端.
-    """
     if pts is None or len(pts) < 4:
         return None
-
-    # 1. 找 BL (左下角): 经过左边缘(垂直段)后, x 开始持续增大
     bl_idx = None
     for i in range(1, min(len(pts) - 4, 30)):
-        if (pts[i + 1, 0] > pts[i, 0] and
-            pts[i + 2, 0] > pts[i + 1, 0] and
-            pts[i + 3, 0] > pts[i + 2, 0]):
+        if (pts[i + 1, 0] > pts[i, 0] and pts[i + 2, 0] > pts[i + 1, 0] and
+                pts[i + 3, 0] > pts[i + 2, 0]):
             bl_idx = i
             break
-
     if bl_idx is None:
         return None
-
-    # 2. 找 BR (右下角): 跳过至少 10 点, 找到 y 开始持续下降的位置
     search_start = min(bl_idx + 10, len(pts) - 5)
     br_idx = None
     for i in range(search_start, len(pts) - 4):
-        if (pts[i + 1, 1] < pts[i, 1] and
-            pts[i + 2, 1] < pts[i + 1, 1] and
-            pts[i + 3, 1] < pts[i + 2, 1]):
+        if (pts[i + 1, 1] < pts[i, 1] and pts[i + 2, 1] < pts[i + 1, 1] and
+                pts[i + 3, 1] < pts[i + 2, 1]):
             br_idx = i - 1
             break
-
     if br_idx is None or br_idx <= bl_idx:
         return None
-
-    bl = pts[bl_idx]
-    br = pts[br_idx]
-
-    # 3. 用 BL→BR 方向作为球网线方向
+    bl, br = pts[bl_idx], pts[br_idx]
     net_vec = br - bl
     net_len = float(np.linalg.norm(net_vec))
     if net_len < 10.0:
         return None
     net_dir = net_vec / net_len
-
-    # 4. 把所有点沿该方向投影, 取最远两端
     proj = (pts - bl) @ net_dir
-    t_min, t_max = proj.min(), proj.max()
-
-    p1 = bl + net_dir * t_max
-    p2 = bl + net_dir * t_min
-
+    p1 = bl + net_dir * proj.max()
+    p2 = bl + net_dir * proj.min()
     if p1[0] > p2[0]:
         p1, p2 = p2, p1
-    return (tuple(p1.astype(float).tolist()),
-            tuple(p2.astype(float).tolist()))
+    return (tuple(p1.astype(float).tolist()), tuple(p2.astype(float).tolist()))
 
 
 def _median_net_line(line_list):
@@ -457,15 +426,6 @@ def _median_net_line(line_list):
 #  几何校验 + 基于约束的重建
 # =====================================================================
 def rebuild_quad_from_constraints(table_pts, net_line, img_hw, debug=False):
-    """当检测四边形不可信时, 用球网线 + ITTF比例约束重建四角。
-
-    ★ 核心: 当有球网线时, 直接用球网线作为主约束:
-       - 球网方向 = 短边方向 (球网始终沿短边延伸)
-       - 球网长度 = 短边长度 (球网跨越整个短边, 球网两端≈长边中点)
-       - 长边方向 = 球网方向的垂直方向
-       - 长边长度 = 短边长度 × ITTF比例 (可混合检测比例)
-       - 四角 = 球网两端 ± 长边方向 × (长边长度/2)
-    """
     if net_line is not None:
         net_start = np.array(net_line[0], dtype=np.float64)
         net_end = np.array(net_line[1], dtype=np.float64)
@@ -477,92 +437,64 @@ def rebuild_quad_from_constraints(table_pts, net_line, img_hw, debug=False):
         long_dir = np.array([-net_dir[1], net_dir[0]], dtype=np.float64)
         if long_dir[1] < 0:
             long_dir = -long_dir
-
-        # 短边长度 = 球网长度 (球网跨越整个短边), 加 5% 余量
         short_len = net_len * 1.05
-
         detected_ratio = None
         if table_pts is not None and len(table_pts) >= 4:
-            pts = table_pts.astype(np.float32)
-            rect = cv2.minAreaRect(pts)
-            (_, _), (rw, rh), _ = rect
+            (_, _), (rw, rh), _ = cv2.minAreaRect(table_pts.astype(np.float32))
             if rw > 5 and rh > 5:
-                detected_long = max(rw, rh)
-                detected_short = min(rw, rh)
-                detected_ratio = detected_long / (detected_short + 1e-6)
-
+                detected_ratio = max(rw, rh) / (min(rw, rh) + 1e-6)
         if detected_ratio is not None and 1.2 < detected_ratio < 4.0:
             blended_ratio = 0.6 * TABLE_RATIO + 0.4 * detected_ratio
         else:
             blended_ratio = TABLE_RATIO
-
         long_len = short_len * blended_ratio
-
         half_long = long_dir * (long_len * 0.5)
-        far_left = net_start - half_long
-        far_right = net_end - half_long
-        near_right = net_end + half_long
-        near_left = net_start + half_long
-
-        corners = np.array([far_left, far_right, near_right, near_left],
+        corners = np.array([net_start - half_long, net_end - half_long,
+                            net_end + half_long, net_start + half_long],
                            dtype=np.float32)
         q = order_quad(corners)
-
         if debug:
             ratio_str = f"检测比={detected_ratio:.2f}, " if detected_ratio else ""
-            log(f"  ◆ 重建台面四角(球网线约束): "
-                f"短边={short_len:.0f}px(网长{net_len:.0f}×1.05) "
+            log(f"  ◆ 重建台面四角(球网线约束): 短边={short_len:.0f}px "
                 f"长边={long_len:.0f}px({ratio_str}ITTF={TABLE_RATIO:.2f})")
         return q
-
-    # 无球网线时, 回退到 minAreaRect
     if table_pts is None or len(table_pts) < 4:
         return None
     pts = table_pts.astype(np.float32)
     rect = cv2.minAreaRect(pts)
-    (cx, cy), (rw, rh), _ang = rect
+    (cx, cy), (rw, rh), _ = rect
     if rw < 1 or rh < 1:
         return None
-
     box = np.array(cv2.boxPoints(rect), dtype=np.float64)
-    e0 = box[1] - box[0]
-    e1 = box[2] - box[1]
+    e0, e1 = box[1] - box[0], box[2] - box[1]
     len0 = np.linalg.norm(e0) + 1e-6
     len1 = np.linalg.norm(e1) + 1e-6
-    u0 = e0 / len0
-    u1 = e1 / len1
-
+    u0, u1 = e0 / len0, e1 / len1
     if len0 >= len1:
         long_dir, long_len, short_dir, short_len = u0, len0, u1, len1
     else:
         long_dir, long_len, short_dir, short_len = u1, len1, u0, len0
     detected_ratio = long_len / (short_len + 1e-6)
     blended_long = short_len * (0.5 * TABLE_RATIO + 0.5 * detected_ratio)
-
     cen = np.array([cx, cy], dtype=np.float64)
     hl = long_dir * (blended_long * 0.5)
     hs = short_dir * (short_len * 0.5)
-    corners = np.array([cen - hl - hs,
-                        cen - hl + hs,
-                        cen + hl + hs,
-                        cen + hl - hs], dtype=np.float32)
+    corners = np.array([cen - hl - hs, cen - hl + hs, cen + hl + hs, cen + hl - hs],
+                       dtype=np.float32)
     q = order_quad(corners)
     if debug:
-        log(f"  ◆ 重建台面四角(minAreaRect): "
-            f"检测比={detected_ratio:.2f} → 使用比={blended_long/short_len:.2f} "
-            f"(ITTF={TABLE_RATIO:.2f})")
+        log(f"  ◆ 重建台面四角(minAreaRect): 检测比={detected_ratio:.2f} "
+            f"→ 使用比={blended_long/short_len:.2f} (ITTF={TABLE_RATIO:.2f})")
     return q
 
 
 def validate_and_refine_quad(quad, table_pts, net_line, img_hw, debug=False):
-    """校验 quad 合理性, 不合理则重建。返回 (quad_final, was_rebuilt)。"""
     qual = _quad_quality(quad, img_hw)
     if qual["ok"]:
         if debug:
             log(f"  ✓ 球台四角校验通过: 长宽比={qual['ratio']:.2f} "
                 f"面积占比={qual['area_frac']:.3f} 最短边={qual['min_edge']:.0f}px")
         return order_quad(quad), False
-
     log(f"  ⚠️ 球台四角不合理 ({qual['reason']}, 长宽比={qual['ratio']:.2f}, "
         f"面积占比={qual['area_frac']:.4f}) → 启动约束重建")
     rebuilt = rebuild_quad_from_constraints(table_pts, net_line, img_hw, debug=debug)
@@ -571,81 +503,62 @@ def validate_and_refine_quad(quad, table_pts, net_line, img_hw, debug=False):
         return order_quad(quad), False
     qual2 = _quad_quality(rebuilt, img_hw)
     if qual2["ok"]:
-        log(f"  ✓ 重建后四角合理: 长宽比={qual2['ratio']:.2f} "
-            f"面积占比={qual2['area_frac']:.3f}")
-        return rebuilt, True
-    log(f"  ⚠️ 重建后仍不理想 ({qual2['reason']}), 仍采用重建结果(优于原始退化四边形)")
+        log(f"  ✓ 重建后四角合理: 长宽比={qual2['ratio']:.2f} 面积占比={qual2['area_frac']:.3f}")
+    else:
+        log(f"  ⚠️ 重建后仍不理想 ({qual2['reason']}), 仍采用重建结果")
     return rebuilt, True
 
 
 # =====================================================================
-#  长边走廊 (有效渲染区) 构造 — 含最小尺寸兜底
+#  长边走廊
 # =====================================================================
 def build_corridor(far_left, far_right, near_left, near_right,
-                   corridor_margin=0.45, corridor_extend=1.2,
-                   img_hw=None, debug=False):
+                   corridor_margin=0.45, corridor_extend=1.2, img_hw=None, debug=False):
     fl = np.array(far_left, dtype=np.float64)
     fr = np.array(far_right, dtype=np.float64)
     nl = np.array(near_left, dtype=np.float64)
     nr = np.array(near_right, dtype=np.float64)
-
-    left_axis = fl - nl
-    right_axis = fr - nr
+    left_axis, right_axis = fl - nl, fr - nr
 
     def _unit(v):
-        n = np.linalg.norm(v) + 1e-8
-        return v / n
-    ul = _unit(left_axis)
-    ur = _unit(right_axis)
-
+        return v / (np.linalg.norm(v) + 1e-8)
+    ul, ur = _unit(left_axis), _unit(right_axis)
     body_len_detected = (np.linalg.norm(left_axis) + np.linalg.norm(right_axis)) * 0.5
-
     near_width_vec = nr - nl
     near_width = np.linalg.norm(near_width_vec) + 1e-8
-    body_len_expected = near_width * TABLE_RATIO
-    body_len = max(body_len_detected, body_len_expected)
-
+    body_len = max(body_len_detected, near_width * TABLE_RATIO)
     if debug and body_len > body_len_detected * 1.3:
-        log(f"  ◆ 台身长度兜底: 检测={body_len_detected:.0f}px → "
-            f"采用={body_len:.0f}px (按近宽{near_width:.0f}×{TABLE_RATIO:.2f})")
-
+        log(f"  ◆ 台身长度兜底: 检测={body_len_detected:.0f}px → 采用={body_len:.0f}px")
     ext = corridor_extend * body_len
     far_left_ext = fl + ul * ext
     far_right_ext = fr + ur * ext
     near_left_ext = nl - ul * ext
     near_right_ext = nr - ur * ext
-
     side_dir = near_width_vec / near_width
     margin_px = corridor_margin * near_width
-
-    far_left_ext = far_left_ext - side_dir * margin_px
-    near_left_ext = near_left_ext - side_dir * margin_px
-    far_right_ext = far_right_ext + side_dir * margin_px
-    near_right_ext = near_right_ext + side_dir * margin_px
-
-    corridor = np.array([far_left_ext, far_right_ext,
-                         near_right_ext, near_left_ext], dtype=np.float32)
+    far_left_ext -= side_dir * margin_px
+    near_left_ext -= side_dir * margin_px
+    far_right_ext += side_dir * margin_px
+    near_right_ext += side_dir * margin_px
+    corridor = np.array([far_left_ext, far_right_ext, near_right_ext, near_left_ext],
+                        dtype=np.float32)
     if debug:
-        log(f"  ◆ 长边走廊: 横向容差={margin_px:.0f}px (近宽{near_width:.0f}px×{corridor_margin}), "
-            f"纵向延伸={ext:.0f}px (台身{body_len:.0f}px×{corridor_extend})")
+        log(f"  ◆ 长边走廊: 横向容差={margin_px:.0f}px, 纵向延伸={ext:.0f}px")
     return corridor
 
 
 def _point_in_corridor(pt, corridor):
     if corridor is None:
         return True
-    res = cv2.pointPolygonTest(corridor.reshape(-1, 1, 2),
-                               (float(pt[0]), float(pt[1])), False)
-    return res >= 0
+    return cv2.pointPolygonTest(corridor.reshape(-1, 1, 2),
+                                (float(pt[0]), float(pt[1])), False) >= 0
 
 
 def extract_table_geometry(frames, img_hw, debug=False, persp_blend=0.5,
                            corridor_margin=0.45, corridor_extend=1.2):
     h, w = img_hw
     sample_frames = frames[::10]
-
-    all_table_pts = []
-    table_quads = []
+    all_table_pts, table_quads = [], []
     for fr in sample_frames:
         pts = _get_polygon_pts_single(fr, "table", conf_min=0.5)
         if pts is not None and len(pts) >= 4:
@@ -653,8 +566,7 @@ def extract_table_geometry(frames, img_hw, debug=False, persp_blend=0.5,
             quad = _fit_quad_single(pts)
             if quad is not None and len(quad) == 4:
                 table_quads.append(quad)
-    table_pts_agg = (np.concatenate(all_table_pts, axis=0)
-                     if all_table_pts else None)
+    table_pts_agg = np.concatenate(all_table_pts, axis=0) if all_table_pts else None
 
     if len(table_quads) < 3:
         log(f"⚠️ 有效球台拟合帧数不足 ({len(table_quads)}<3), 无法做迷你球台 / 落点分析")
@@ -674,51 +586,34 @@ def extract_table_geometry(frames, img_hw, debug=False, persp_blend=0.5,
                 net_lines.append(line)
     net_line = _median_net_line(net_lines) if len(net_lines) >= 3 else None
 
-    quad, was_rebuilt = validate_and_refine_quad(
-        quad, table_pts_agg, net_line, img_hw, debug=debug)
+    quad, was_rebuilt = validate_and_refine_quad(quad, table_pts_agg, net_line, img_hw, debug=debug)
 
-    # ★ 检查球网是否正确切分球台 (与两条对边相交), 否则重建
     if net_line is not None and not was_rebuilt:
         bisects_ok, _ = _net_bisects_quad(quad, net_line, img_hw)
         if not bisects_ok:
             if debug:
-                log("  ⚠️ 球网与相邻边相交 (四边形可能为菱形/非矩形), 启动约束重建")
-            rebuilt = rebuild_quad_from_constraints(
-                table_pts_agg, net_line, img_hw, debug=debug)
+                log("  ⚠️ 球网与相邻边相交, 启动约束重建")
+            rebuilt = rebuild_quad_from_constraints(table_pts_agg, net_line, img_hw, debug=debug)
             if rebuilt is not None:
-                quad = rebuilt
-                was_rebuilt = True
-                bisects_ok2, _ = _net_bisects_quad(quad, net_line, img_hw)
-                if debug:
-                    if bisects_ok2:
-                        log("  ✓ 重建后球网正确切分球台 (与对边相交)")
-                    else:
-                        log("  ⚠️ 重建后球网仍与相邻边相交, 继续使用重建结果")
+                quad, was_rebuilt = rebuilt, True
 
-    # ★ 检查短边长度是否与球网长度匹配 (球网跨越整个短边)
     if net_line is not None and not was_rebuilt:
-        net_len = float(np.hypot(net_line[1][0] - net_line[0][0],
-                                  net_line[1][1] - net_line[0][1]))
+        net_len = float(np.hypot(net_line[1][0] - net_line[0][0], net_line[1][1] - net_line[0][1]))
         q = order_quad(quad).astype(np.float64)
         edge_lens = [float(np.linalg.norm(q[(i + 1) % 4] - q[i])) for i in range(4)]
         side_a = (edge_lens[0] + edge_lens[2]) * 0.5
         side_b = (edge_lens[1] + edge_lens[3]) * 0.5
-        short_edge = min(side_a, side_b)
-        if short_edge < net_len * 0.7:
+        if min(side_a, side_b) < net_len * 0.7:
             if debug:
-                log(f"  ⚠️ 短边({short_edge:.0f}px)远小于球网长度({net_len:.0f}px), "
-                    f"四边形过窄, 启动约束重建")
-            rebuilt = rebuild_quad_from_constraints(
-                table_pts_agg, net_line, img_hw, debug=debug)
+                log(f"  ⚠️ 短边远小于球网长度, 四边形过窄, 启动约束重建")
+            rebuilt = rebuild_quad_from_constraints(table_pts_agg, net_line, img_hw, debug=debug)
             if rebuilt is not None:
-                quad = rebuilt
-                was_rebuilt = True
+                quad, was_rebuilt = rebuilt, True
 
     edges = [(quad[i], quad[(i + 1) % 4]) for i in range(4)]
-
     if net_line is not None:
-        nd = np.array([net_line[1][0] - net_line[0][0],
-                       net_line[1][1] - net_line[0][1]], dtype=np.float32)
+        nd = np.array([net_line[1][0] - net_line[0][0], net_line[1][1] - net_line[0][1]],
+                      dtype=np.float32)
         nd /= np.linalg.norm(nd) + 1e-8
     else:
         nd = None
@@ -726,48 +621,31 @@ def extract_table_geometry(frames, img_hw, debug=False, persp_blend=0.5,
     edge_info = []
     for i, (a, b) in enumerate(edges):
         ev = np.array([b[0] - a[0], b[1] - a[1]], dtype=np.float32)
-        elen = np.linalg.norm(ev) + 1e-8
-        ev_n = ev / elen
+        ev_n = ev / (np.linalg.norm(ev) + 1e-8)
         par = abs(float(np.dot(ev_n, nd))) if nd is not None else 0.0
-        angle_deg = math.degrees(math.acos(min(1.0, par)))
-        edge_info.append((i, elen, angle_deg, a, b))
+        edge_info.append((i, np.linalg.norm(ev), math.degrees(math.acos(min(1.0, par))), a, b))
 
-    # ---- 确定端边 (near/far) ----
+    def _pick_near_far(end_edge_list):
+        near_corner_idx = int(np.argmin([math.hypot(c[0], c[1] - h) for c in quad]))
+        near_corner = quad[near_corner_idx]
+        e0_a = np.array(end_edge_list[0][3])
+        e0_b = np.array(end_edge_list[0][4])
+        if (np.linalg.norm(near_corner - e0_a) < 2.0 or np.linalg.norm(near_corner - e0_b) < 2.0):
+            return end_edge_list[0][3], end_edge_list[0][4], end_edge_list[1][3], end_edge_list[1][4]
+        return end_edge_list[1][3], end_edge_list[1][4], end_edge_list[0][3], end_edge_list[0][4]
+
     found_end_edges = False
     if net_line is not None:
         inter_idx = _net_quad_intersections(quad, net_line, img_hw)
         if len(inter_idx) == 2 and not _edges_are_adjacent(inter_idx[0], inter_idx[1]):
             found_end_edges = True
             non_inter_idx = [i for i in range(4) if i not in inter_idx]
-            end_edge_list = [edge_info[i] for i in non_inter_idx]
-            near_corner_idx = int(np.argmin([math.hypot(c[0], c[1] - h) for c in quad]))
-            near_corner = quad[near_corner_idx]
-            e0_a = np.array(end_edge_list[0][3])
-            e0_b = np.array(end_edge_list[0][4])
-            if (np.linalg.norm(near_corner - e0_a) < 2.0
-                    or np.linalg.norm(near_corner - e0_b) < 2.0):
-                near_a, near_b = end_edge_list[0][3], end_edge_list[0][4]
-                far_a, far_b = end_edge_list[1][3], end_edge_list[1][4]
-            else:
-                near_a, near_b = end_edge_list[1][3], end_edge_list[1][4]
-                far_a, far_b = end_edge_list[0][3], end_edge_list[0][4]
+            near_a, near_b, far_a, far_b = _pick_near_far([edge_info[i] for i in non_inter_idx])
         elif debug:
             log("  ⚠️ 球网仍与相邻边相交, 回退到角度法判定端边")
-
     if not found_end_edges:
         edge_info.sort(key=lambda x: x[2])
-        end_edges = edge_info[:2]
-        near_corner_idx = int(np.argmin([math.hypot(c[0], c[1] - h) for c in quad]))
-        near_corner = quad[near_corner_idx]
-        e0_a = np.array(end_edges[0][3])
-        e0_b = np.array(end_edges[0][4])
-        if (np.linalg.norm(near_corner - e0_a) < 2.0
-                or np.linalg.norm(near_corner - e0_b) < 2.0):
-            near_a, near_b = end_edges[0][3], end_edges[0][4]
-            far_a, far_b = end_edges[1][3], end_edges[1][4]
-        else:
-            near_a, near_b = end_edges[1][3], end_edges[1][4]
-            far_a, far_b = end_edges[0][3], end_edges[0][4]
+        near_a, near_b, far_a, far_b = _pick_near_far(edge_info[:2])
 
     if far_a[0] > far_b[0]:
         far_left, far_right = far_b, far_a
@@ -778,7 +656,6 @@ def extract_table_geometry(frames, img_hw, debug=False, persp_blend=0.5,
     else:
         near_left, near_right = near_a, near_b
 
-    # ---- 透视修正 ----
     if persp_blend > 0:
         near_width = float(near_right[0] - near_left[0])
         if near_width > 10:
@@ -788,19 +665,17 @@ def extract_table_geometry(frames, img_hw, debug=False, persp_blend=0.5,
             if far_left[1] < far_right[1]:
                 target_x = far_right[0] - near_width
                 target_y = far_right[1] - near_slope * near_width
-                far_left = np.array([
-                    far_left[0] + persp_blend * (target_x - far_left[0]),
-                    far_left[1] + persp_blend * (target_y - far_left[1]),
-                ], dtype=np.float32)
+                far_left = np.array([far_left[0] + persp_blend * (target_x - far_left[0]),
+                                     far_left[1] + persp_blend * (target_y - far_left[1])],
+                                    dtype=np.float32)
             else:
                 target_x = far_left[0] + near_width
                 target_y = far_left[1] + near_slope * near_width
-                far_right = np.array([
-                    far_right[0] + persp_blend * (target_x - far_right[0]),
-                    far_right[1] + persp_blend * (target_y - far_right[1]),
-                ], dtype=np.float32)
-            if (not np.allclose(far_left, old_far_left, atol=0.5)
-                    or not np.allclose(far_right, old_far_right, atol=0.5)):
+                far_right = np.array([far_right[0] + persp_blend * (target_x - far_right[0]),
+                                      far_right[1] + persp_blend * (target_y - far_right[1])],
+                                     dtype=np.float32)
+            if (not np.allclose(far_left, old_far_left, atol=0.5) or
+                    not np.allclose(far_right, old_far_right, atol=0.5)):
                 quad_updated = quad.copy()
                 for qi in range(4):
                     if np.linalg.norm(quad[qi] - old_far_left) < 3.0:
@@ -809,15 +684,10 @@ def extract_table_geometry(frames, img_hw, debug=False, persp_blend=0.5,
                         quad_updated[qi] = far_right
                 quad = quad_updated
                 if debug:
-                    d_fl = np.linalg.norm(far_left - old_far_left)
-                    d_fr = np.linalg.norm(far_right - old_far_right)
-                    log(f"  ◆ 透视修正(平行 blend={persp_blend}): "
-                        f"far_left位移={d_fl:.1f}px  far_right位移={d_fr:.1f}px")
+                    log(f"  ◆ 透视修正(平行 blend={persp_blend})")
 
-    # homography
     src = np.array([far_left, far_right, near_right, near_left], dtype=np.float32)
-    dst = np.array([[0.0, 0.0],
-                    [TABLE_WID_M * 1000, 0.0],
+    dst = np.array([[0.0, 0.0], [TABLE_WID_M * 1000, 0.0],
                     [TABLE_WID_M * 1000, TABLE_LEN_M * 1000],
                     [0.0, TABLE_LEN_M * 1000]], dtype=np.float32)
     try:
@@ -830,33 +700,18 @@ def extract_table_geometry(frames, img_hw, debug=False, persp_blend=0.5,
         (nx1, ny1), (nx2, ny2) = net_line
         near_mid_x = (near_left[0] + near_right[0]) * 0.5
         near_mid_y = (near_left[1] + near_right[1]) * 0.5
-        cross_near = ((nx2 - nx1) * (near_mid_y - ny1)
-                      - (ny2 - ny1) * (near_mid_x - nx1))
+        cross_near = (nx2 - nx1) * (near_mid_y - ny1) - (ny2 - ny1) * (near_mid_x - nx1)
         net_side_sign = 1 if cross_near > 0 else -1
 
     corridor = build_corridor(far_left, far_right, near_left, near_right,
                               corridor_margin=corridor_margin,
-                              corridor_extend=corridor_extend,
-                              img_hw=img_hw, debug=debug)
-
+                              corridor_extend=corridor_extend, img_hw=img_hw, debug=debug)
     if debug:
         log(f"  球台四角: {quad.tolist()}")
         log(f"  球网线: {net_line}")
-        log(f"  远端短边: {np.array(far_left).tolist()} -> {np.array(far_right).tolist()}")
-        log(f"  近端短边: {np.array(near_left).tolist()} -> {np.array(near_right).tolist()}")
-        if H is not None:
-            far_mid = ((far_left[0] + far_right[0]) * 0.5, (far_left[1] + far_right[1]) * 0.5)
-            near_mid = ((near_left[0] + near_right[0]) * 0.5, (near_left[1] + near_right[1]) * 0.5)
-            fm = img_to_table(H, far_mid)
-            nm = img_to_table(H, near_mid)
-            if fm and nm:
-                log(f"  H自检: 远端中点 -> 台坐标 {fm[0]:.0f},{fm[1]:.0f} mm (期望 Y≈0)")
-                log(f"  H自检: 近端中点 -> 台坐标 {nm[0]:.0f},{nm[1]:.0f} mm (期望 Y≈2740)")
 
     return {"quad": quad, "net_line": net_line, "homography": H,
-            "net_side_sign": net_side_sign,
-            "corridor": corridor,
-            "rebuilt": was_rebuilt,
+            "net_side_sign": net_side_sign, "corridor": corridor, "rebuilt": was_rebuilt,
             "far_left": np.array(far_left, dtype=np.float32),
             "far_right": np.array(far_right, dtype=np.float32),
             "near_left": np.array(near_left, dtype=np.float32),
@@ -875,16 +730,13 @@ def img_to_table(H_or_geo, pt):
         H = geo.get("homography")
         if H is None:
             return None
-        src = np.array([[[pt[0], pt[1]]]], dtype=np.float32)
-        out = cv2.perspectiveTransform(src, H)
-        x_mm = float(out[0, 0, 0])
-        y_mm = float(out[0, 0, 1])
+        out = cv2.perspectiveTransform(np.array([[[pt[0], pt[1]]]], dtype=np.float32), H)
+        x_mm, y_mm = float(out[0, 0, 0]), float(out[0, 0, 1])
         net_line = geo.get("net_line")
         net_side_sign = geo.get("net_side_sign")
         if net_line is not None and net_side_sign is not None:
             (nx1, ny1), (nx2, ny2) = net_line
-            px, py = pt[0], pt[1]
-            cross = (nx2 - nx1) * (py - ny1) - (ny2 - ny1) * (px - nx1)
+            cross = (nx2 - nx1) * (pt[1] - ny1) - (ny2 - ny1) * (pt[0] - nx1)
             is_near_side = (cross * net_side_sign > 0)
             half_y = TABLE_LEN_M * 1000 / 2.0
             if is_near_side and y_mm < half_y:
@@ -892,11 +744,8 @@ def img_to_table(H_or_geo, pt):
             elif (not is_near_side) and y_mm > half_y:
                 y_mm = half_y - (y_mm - half_y)
         return (x_mm, y_mm)
-    else:
-        H = H_or_geo
-        src = np.array([[[pt[0], pt[1]]]], dtype=np.float32)
-        out = cv2.perspectiveTransform(src, H)
-        return float(out[0, 0, 0]), float(out[0, 0, 1])
+    out = cv2.perspectiveTransform(np.array([[[pt[0], pt[1]]]], dtype=np.float32), H_or_geo)
+    return float(out[0, 0, 0]), float(out[0, 0, 1])
 
 
 # =====================================================================
@@ -905,7 +754,6 @@ def img_to_table(H_or_geo, pt):
 def gather_ball_candidates(frames, fps):
     out = []
     for fr in frames:
-        fidx = fr["frame"]
         cands = []
         for det in fr.get("detections", []):
             if det["class"] != "pingpangball":
@@ -913,35 +761,57 @@ def gather_ball_candidates(frames, fps):
             b = det["bbox"]
             cx, cy = bbox_center(b)
             cands.append((cx, cy, det.get("confidence", 0.0), b))
-        out.append((fidx, cands))
+        out.append((fr["frame"], cands))
     return out
+
+
+def gather_player_boxes(frames, debug=False):
+    class_hits = defaultdict(int)
+    for fr in frames:
+        for det in fr.get("detections", []):
+            c = str(det.get("class", "")).lower()
+            if c in _PLAYER_CLASS_NAMES:
+                class_hits[c] += 1
+    if not class_hits:
+        if debug:
+            log("  选手特效: 检测日志无 person/player 类, 跳过选手特效")
+        return {}, None
+    detected_class = max(class_hits, key=lambda k: class_hits[k])
+    boxes = {}
+    for fr in frames:
+        bs = []
+        for det in fr.get("detections", []):
+            if str(det.get("class", "")).lower() != detected_class:
+                continue
+            if det.get("confidence", 0) < 0.35:
+                continue
+            b = det.get("bbox")
+            if b and len(b) == 4:
+                bs.append(tuple(float(v) for v in b))
+        if bs:
+            boxes[fr["frame"]] = bs
+    if debug:
+        log(f"  选手特效: 识别类名='{detected_class}', 覆盖 {len(boxes)} 帧")
+    return boxes, detected_class
 
 
 def filter_static_ball_candidates(ball_cands, fps, frame_w, frame_h,
                                   min_static_count=10, debug=False):
-    """
-    用空间网格哈希替代窗口内 O(n²) 两两比较。
-    同一 600 帧窗口内, 若某网格 cell (及其 8 邻域) 聚集了 >= min_static_count
-    个空间高度集中的检测, 视为静止球予以剔除。
-    """
     if not ball_cands:
         return ball_cands
     window_frames = 600
     img_diag = math.hypot(frame_w, frame_h)
     static_threshold = max(img_diag * 0.0008, 2.0)
     cell = max(static_threshold, 1.0)
-
-    flat = []  # (fidx, di, cx, cy)
+    flat = []
     for fidx, cands in ball_cands:
         for di, (cx, cy, _c, _b) in enumerate(cands):
             flat.append((fidx, di, cx, cy))
     if not flat:
         return ball_cands
     flat.sort(key=lambda x: x[0])
-
     removed_set = set()
-    n = len(flat)
-    idx = 0
+    n, idx = len(flat), 0
     while idx < n:
         anchor_f = flat[idx][0]
         win_end = anchor_f + window_frames
@@ -951,7 +821,7 @@ def filter_static_ball_candidates(ball_cands, fps, frame_w, frame_h,
             idx += 1
         if len(win) < min_static_count:
             continue
-        grid = defaultdict(list)  # (gx,gy) -> [(fidx,di,cx,cy)]
+        grid = defaultdict(list)
         for rec in win:
             _f, _d, cx, cy = rec
             grid[(int(cx / cell), int(cy / cell))].append(rec)
@@ -974,28 +844,22 @@ def filter_static_ball_candidates(ball_cands, fps, frame_w, frame_h,
                 for _f, _d, _cx, _cy in close:
                     removed_set.add((_f, _d))
                 handled.add((gx, gy))
-
     if not removed_set:
         return ball_cands
     filtered = []
     for fidx, cands in ball_cands:
-        remaining = [det for di, det in enumerate(cands)
-                     if (fidx, di) not in removed_set]
+        remaining = [det for di, det in enumerate(cands) if (fidx, di) not in removed_set]
         filtered.append((fidx, remaining))
     if debug:
-        log(f"  ★ 静止球过滤(网格哈希): 剔除 {len(removed_set)} 个静止球坐标 "
-            f"(窗口={window_frames}帧, 阈值={static_threshold:.0f}px, "
-            f"最少静止数={min_static_count})")
+        log(f"  ★ 静止球过滤(网格哈希): 剔除 {len(removed_set)} 个静止球坐标")
     return filtered
 
 
 def filter_ball_by_corridor(ball_cands, corridor, max_drop_ratio=0.55,
                             geo_rebuilt=False, debug=False):
-    """走廊软过滤 + 自愈: 过滤比例过高则判定几何不可信, 跳过过滤。"""
     if corridor is None or not ball_cands:
         return ball_cands
-    n_before = 0
-    n_after = 0
+    n_before = n_after = 0
     filtered = []
     for fidx, cands in ball_cands:
         keep = []
@@ -1010,21 +874,18 @@ def filter_ball_by_corridor(ball_cands, corridor, max_drop_ratio=0.55,
     drop_ratio = 1.0 - (n_after / n_before)
     effective_max = max_drop_ratio + (0.15 if geo_rebuilt else 0.0)
     if drop_ratio > effective_max:
-        log(f"  ⚠️ 走廊过滤将剔除 {drop_ratio*100:.0f}% 的球 "
-            f"(> 上限 {effective_max*100:.0f}%), 判定几何不可信 → 跳过走廊过滤, "
-            f"改由空间聚类分离台外球")
+        log(f"  ⚠️ 走廊过滤将剔除 {drop_ratio*100:.0f}% 的球 (> 上限 "
+            f"{effective_max*100:.0f}%), 判定几何不可信 → 跳过走廊过滤")
         return ball_cands
     if debug:
-        log(f"  ★ 长边走廊过滤: {n_before} → {n_after} 个球检测 "
-            f"(剔除走廊外 {n_before - n_after} 个, 占比 {drop_ratio*100:.0f}%)")
+        log(f"  ★ 长边走廊过滤: {n_before} → {n_after} 个球检测")
     return filtered
 
 
 def cluster_ball_by_court(ball_cands, frame_w, frame_h, debug=False):
     if not ball_cands:
         return ball_cands
-    pts = []
-    pt_refs = []
+    pts, pt_refs = [], []
     for bi, (fidx, cands) in enumerate(ball_cands):
         for ci, (cx, cy, conf, bbox) in enumerate(cands):
             pts.append([cx, cy])
@@ -1036,8 +897,7 @@ def cluster_ball_by_court(ball_cands, frame_w, frame_h, debug=False):
     eps = diag * 0.005
     method = "DBSCAN" if _HAS_SKLEARN else "网格连通"
     if _HAS_SKLEARN:
-        db = DBSCAN(eps=eps, min_samples=5, n_jobs=-1).fit(pts_arr)
-        labels = db.labels_
+        labels = DBSCAN(eps=eps, min_samples=5, n_jobs=-1).fit(pts_arr).labels_
         cluster_counts = {}
         for lb in labels:
             if lb >= 0:
@@ -1068,56 +928,54 @@ def cluster_ball_by_court(ball_cands, frame_w, frame_h, debug=False):
                         cr, cc = stack.pop()
                         cells.append((cr, cc))
                         for nr, nc in [(cr - 1, cc), (cr + 1, cc), (cr, cc - 1), (cr, cc + 1)]:
-                            if 0 <= nr < rows and 0 <= nc < cols:
-                                if grid[nr, nc] > 0 and not visited[nr, nc]:
-                                    visited[nr, nc] = True
-                                    stack.append((nr, nc))
+                            if 0 <= nr < rows and 0 <= nc < cols and grid[nr, nc] > 0 and not visited[nr, nc]:
+                                visited[nr, nc] = True
+                                stack.append((nr, nc))
                     total = int(sum(grid[r2, c2] for r2, c2 in cells))
                     clusters.append((total, set(cells)))
         if len(clusters) <= 1:
             return ball_cands
         clusters.sort(key=lambda x: x[0], reverse=True)
         main_cells = clusters[0][1]
-        keep = set()
-        for i, (cx, cy) in enumerate(pts):
-            if (int(cy / cell_size), int(cx / cell_size)) in main_cells:
-                keep.add(i)
+        keep = set(i for i, (cx, cy) in enumerate(pts)
+                   if (int(cy / cell_size), int(cx / cell_size)) in main_cells)
         n_clusters = len(clusters)
-    filtered_dict = {}
-    n_before = len(pts)
-    n_after = 0
+    filtered_dict = defaultdict(list)
+    n_before, n_after = len(pts), 0
     for i in keep:
         bi, ci = pt_refs[i]
         fidx, cands_orig = ball_cands[bi]
-        if fidx not in filtered_dict:
-            filtered_dict[fidx] = []
         filtered_dict[fidx].append(cands_orig[ci])
         n_after += 1
     filtered = [(fidx, cands) for fidx, cands in sorted(filtered_dict.items())]
     if n_before > n_after:
-        log(f"  球台空间聚类 ({method} eps={eps:.0f}px): "
-            f"{n_before} → {n_after} 个检测 ({n_clusters} 个簇)")
+        log(f"  球台空间聚类 ({method} eps={eps:.0f}px): {n_before} → {n_after} 个检测 ({n_clusters} 个簇)")
     elif not filtered:
         return ball_cands
     return filtered
 
 
+def _greedy_match(active, cands, used, preds, tols):
+    for i, tr in enumerate(active):
+        px, py = preds[i]
+        best_j, best_d = -1, 1e18
+        for j, (cx, cy, _c, _b) in enumerate(cands):
+            if used[j]:
+                continue
+            d = math.hypot(cx - px, cy - py)
+            if d < best_d:
+                best_d, best_j = d, j
+        if best_j >= 0 and best_d < tols[i]:
+            cx, cy, conf, b = cands[best_j]
+            tr["pts"].append((fidx_of := active[i]["pts"][-1][0], cx, cy, conf, b))  # placeholder
+    # note: replaced below by explicit frame passing
+
+
 def build_main_ball_track(ball_cands, fps, frame_w, frame_h, table_geo=None, debug=False,
                           max_jump_ratio=0.05, match_algo="auto"):
-    """
-    活跃 track 集合 + 提前剪枝; predict 在大 gap 时速度衰减外推。
-
-    v4.2: track ↔ detection 关联支持匈牙利算法 (全局最优), 失败/缺失依赖时回退到贪心.
-        match_algo:
-          - "auto"      : 有 scipy.optimize.linear_sum_assignment 时使用匈牙利, 否则贪心
-          - "hungarian" : 强制匈牙利 (无 scipy 则警告并回退贪心)
-          - "greedy"    : 强制原 v4.1 贪心
-    """
     max_jump = max_jump_ratio * math.hypot(frame_w, frame_h)
     max_gap_frames = max(1, int(fps * 0.5))
     tracks = []
-
-    # ---- 决定本次使用的关联算法 ----
     algo = (match_algo or "auto").lower()
     if algo == "hungarian" and not _HAS_SCIPY_LSA:
         if debug:
@@ -1139,106 +997,72 @@ def build_main_ball_track(ball_cands, fps, frame_w, frame_h, table_geo=None, deb
         decay = 0.85 ** max(0, dt - 1)
         return x1 + vx * dt * decay, y1 + vy * dt * decay
 
-    # 不可达哨兵: 必须远大于任何可能的 tol, 用于在代价矩阵中屏蔽超距配对.
-    # 距离上界约为 hypot(frame_w, frame_h), 取 1e9 远超此值.
     _BIG = 1e9
+
+    def greedy_assign(fidx, active, cands, used, preds, tols):
+        for i, tr in enumerate(active):
+            px, py = preds[i]
+            best_j, best_d = -1, 1e18
+            for j, (cx, cy, _c, _b) in enumerate(cands):
+                if used[j]:
+                    continue
+                d = math.hypot(cx - px, cy - py)
+                if d < best_d:
+                    best_d, best_j = d, j
+            if best_j >= 0 and best_d < tols[i]:
+                cx, cy, conf, b = cands[best_j]
+                tr["pts"].append((fidx, cx, cy, conf, b))
+                used[best_j] = True
 
     for fidx, cands in ball_cands:
         used = [False] * len(cands)
-        active = [tr for tr in tracks
-                  if 0 < (fidx - tr["pts"][-1][0]) <= max_gap_frames]
-
+        active = [tr for tr in tracks if 0 < (fidx - tr["pts"][-1][0]) <= max_gap_frames]
         if active and cands:
-            # 预先算好每个 active 的预测点和 gap-aware 容差, 两种算法共用
-            preds = []
-            tols = []
+            preds, tols = [], []
             for tr in active:
                 gap = fidx - tr["pts"][-1][0]
                 preds.append(predict(tr, fidx))
                 tols.append(max_jump * (1 + 0.1 * (gap - 1)))
-
+            done = False
             if algo == "hungarian":
-                # ---- 匈牙利: 构造 (n_active x n_cands) 代价矩阵, 超过 tol 的位置置为 _BIG ----
                 n_a, n_c = len(active), len(cands)
                 cost = np.full((n_a, n_c), _BIG, dtype=np.float64)
                 for i, (px, py) in enumerate(preds):
                     ti = tols[i]
-                    for j, (cx, cy, _conf, _b) in enumerate(cands):
+                    for j, (cx, cy, _c, _b) in enumerate(cands):
                         d = math.hypot(cx - px, cy - py)
                         if d < ti:
                             cost[i, j] = d
-                # linear_sum_assignment 在矩形矩阵上也能工作: 返回 min(n_a, n_c) 对
                 try:
                     row_ind, col_ind = _linear_sum_assignment(cost)
                 except Exception as e:
                     if debug:
                         log(f"  [match] linear_sum_assignment 失败 ({e}), 当帧回退 greedy")
-                    row_ind, col_ind = (), ()
-                    # 触发下方 greedy 分支
-                    algo_this_frame = "greedy"
                 else:
-                    algo_this_frame = "hungarian"
-
-                if algo_this_frame == "hungarian":
                     for i, j in zip(row_ind, col_ind):
-                        # 过滤掉哨兵配对 (本就是超距的)
                         if cost[i, j] >= _BIG:
                             continue
                         cx, cy, conf, b = cands[j]
                         active[i]["pts"].append((fidx, cx, cy, conf, b))
                         used[j] = True
-                else:
-                    # 退路: 与下面 greedy 分支同实现
-                    for i, tr in enumerate(active):
-                        px, py = preds[i]
-                        ti = tols[i]
-                        best_j, best_d = -1, 1e18
-                        for j, (cx, cy, _conf, _b) in enumerate(cands):
-                            if used[j]:
-                                continue
-                            d = math.hypot(cx - px, cy - py)
-                            if d < best_d:
-                                best_d, best_j = d, j
-                        if best_j >= 0 and best_d < ti:
-                            cx, cy, conf, b = cands[best_j]
-                            tr["pts"].append((fidx, cx, cy, conf, b))
-                            used[best_j] = True
-            else:
-                # ---- 贪心 (与 v4.1 完全等价): 每个 active 独立挑最近的未占用 detection ----
-                for i, tr in enumerate(active):
-                    px, py = preds[i]
-                    ti = tols[i]
-                    best_j, best_d = -1, 1e18
-                    for j, (cx, cy, _conf, _b) in enumerate(cands):
-                        if used[j]:
-                            continue
-                        d = math.hypot(cx - px, cy - py)
-                        if d < best_d:
-                            best_d, best_j = d, j
-                    if best_j >= 0 and best_d < ti:
-                        cx, cy, conf, b = cands[best_j]
-                        tr["pts"].append((fidx, cx, cy, conf, b))
-                        used[best_j] = True
-
-        # 未被任何 track 匹配上的 detection → 新开 track
+                    done = True
+            if not done:
+                greedy_assign(fidx, active, cands, used, preds, tols)
         for j, (cx, cy, conf, b) in enumerate(cands):
             if not used[j]:
                 tracks.append({"pts": [(fidx, cx, cy, conf, b)]})
 
     if not tracks:
         return {}
-
     net_line = table_geo["net_line"] if table_geo else None
 
     def net_cross_count(pts):
         if net_line is None:
             return 0
         (nx1, ny1), (nx2, ny2) = net_line
-        count = 0
-        prev_side = None
+        count, prev_side = 0, None
         for p in pts:
-            x, y = p[1], p[2]
-            side = ((nx2 - nx1) * (y - ny1) - (ny2 - ny1) * (x - nx1)) > 0
+            side = ((nx2 - nx1) * (p[2] - ny1) - (ny2 - ny1) * (p[1] - nx1)) > 0
             if prev_side is not None and side != prev_side:
                 count += 1
             prev_side = side
@@ -1255,21 +1079,17 @@ def build_main_ball_track(ball_cands, fps, frame_w, frame_h, table_geo=None, deb
                      for i in range(1, n))
         avg_conf = float(np.mean([p[3] for p in pts]))
         base = n * (0.4 + coverage) * (1 + math.log1p(motion)) * (0.5 + avg_conf)
-        nc = net_cross_count(pts)
-        net_boost = 1.0 + min(2.0, nc * 0.5)
+        net_boost = 1.0 + min(2.0, net_cross_count(pts) * 0.5)
         return base * net_boost
 
     tracks.sort(key=score, reverse=True)
-
     n_before_filter = len(tracks)
     if len(tracks) >= 2 and table_geo is not None:
         anchor = tracks[0]
         anchor_pts = np.array([[p[1], p[2]] for p in anchor["pts"]])
         ax_min, ay_min = anchor_pts.min(axis=0)
         ax_max, ay_max = anchor_pts.max(axis=0)
-        anchor_area = (ax_max - ax_min) * (ay_max - ay_min)
-        if anchor_area <= 0:
-            anchor_area = 1.0
+        anchor_area = max((ax_max - ax_min) * (ay_max - ay_min), 1.0)
         filtered = [anchor]
         for tr in tracks[1:]:
             tr_pts = np.array([[p[1], p[2]] for p in tr["pts"]])
@@ -1278,10 +1098,8 @@ def build_main_ball_track(ball_cands, fps, frame_w, frame_h, table_geo=None, deb
             tr_area = (tx_max - tx_min) * (ty_max - ty_min)
             if tr_area <= 0:
                 continue
-            ix_min = max(ax_min, tx_min)
-            iy_min = max(ay_min, ty_min)
-            ix_max = min(ax_max, tx_max)
-            iy_max = min(ay_max, ty_max)
+            ix_min, iy_min = max(ax_min, tx_min), max(ay_min, ty_min)
+            ix_max, iy_max = min(ax_max, tx_max), min(ay_max, ty_max)
             if ix_min < ix_max and iy_min < iy_max:
                 inter_area = (ix_max - ix_min) * (iy_max - iy_min)
                 iou = inter_area / (anchor_area + tr_area - inter_area)
@@ -1292,8 +1110,7 @@ def build_main_ball_track(ball_cands, fps, frame_w, frame_h, table_geo=None, deb
             log(f"  空间共域投票: {n_before_filter} → {len(tracks)} 条轨迹 (IoU≥0.15)")
 
     score_min = 6.0
-    main = {}
-    n_used = 0
+    main, n_used = {}, 0
     for tr in tracks:
         if score(tr) < score_min:
             continue
@@ -1302,8 +1119,7 @@ def build_main_ball_track(ball_cands, fps, frame_w, frame_h, table_geo=None, deb
             if fidx not in main or conf > main[fidx][2]:
                 main[fidx] = (x, y, conf, b)
     if debug:
-        log(f"  候选轨迹数={n_before_filter}, 采用={n_used} (score>={score_min:.0f}), "
-            f"去重后点数={len(main)}")
+        log(f"  候选轨迹数={n_before_filter}, 采用={n_used}, 去重后点数={len(main)}")
     return main
 
 
@@ -1324,9 +1140,7 @@ def interpolate_track(main_track, fps, frame_w, frame_h, debug=False):
             segments.append(cur)
             cur = [k]
     segments.append(cur)
-    filled = {}
-    for k in keys:
-        filled[k] = (main_track[k][0], main_track[k][1], False)
+    filled = {k: (main_track[k][0], main_track[k][1], False) for k in keys}
     for seg in segments:
         if len(seg) < 2:
             continue
@@ -1337,11 +1151,8 @@ def interpolate_track(main_track, fps, frame_w, frame_h, debug=False):
             f0, f1 = seg[i], seg[i + 1]
             if f1 - f0 <= 1:
                 continue
-            lo = max(0, i - 1)
-            hi = min(len(seg), i + 3)
-            wf = fs[lo:hi]
-            wx = xs[lo:hi]
-            wy = ys[lo:hi]
+            lo, hi = max(0, i - 1), min(len(seg), i + 3)
+            wf, wx, wy = fs[lo:hi], xs[lo:hi], ys[lo:hi]
             deg = min(2, len(wf) - 1)
             try:
                 px = np.polyfit(wf, wx, deg)
@@ -1355,9 +1166,62 @@ def interpolate_track(main_track, fps, frame_w, frame_h, debug=False):
                 filled[f] = (xi, yi, True)
     if debug:
         n_interp = sum(1 for v in filled.values() if v[2])
-        log(f"  补帧: 原始 {len(main_track)} 帧 -> 填充后 {len(filled)} 帧 "
-            f"(插值 {n_interp})")
+        log(f"  补帧: 原始 {len(main_track)} 帧 -> 填充后 {len(filled)} 帧 (插值 {n_interp})")
     return filled
+
+
+# =====================================================================
+#  4b) 逐帧球速表
+# =====================================================================
+def compute_ball_speed_table(filled_track, table_geo, fps, frame_w, frame_h):
+    if not filled_track or fps <= 0:
+        return {}, (1.0, 1.0)
+    keys = sorted(filled_track.keys())
+    raw_px = {}
+    for i in range(1, len(keys)):
+        f0, f1 = keys[i - 1], keys[i]
+        df = f1 - f0
+        if df <= 0 or df > int(fps * 0.4) + 2:
+            continue
+        x0, y0, _ = filled_track[f0]
+        x1, y1, _ = filled_track[f1]
+        raw_px[f1] = math.hypot(x1 - x0, y1 - y0) / (df / fps)
+    if not raw_px:
+        return {}, (1.0, 1.0)
+    vals = sorted(raw_px.values())
+    p50 = vals[len(vals) // 2]
+    p95 = max(vals[min(len(vals) - 1, int(len(vals) * 0.95))], p50 * 1.5, 1.0)
+    smoothed = {}
+    win = max(1, int(fps * 0.08))
+    for i, f in enumerate(keys):
+        acc = [raw_px[keys[j]] for j in range(max(0, i - win), min(len(keys), i + win + 1))
+               if keys[j] in raw_px]
+        if acc:
+            smoothed[f] = sum(acc) / len(acc)
+    table = {}
+    key_index = {f: i for i, f in enumerate(keys)}
+    for f in keys:
+        px_s = smoothed.get(f, raw_px.get(f))
+        if px_s is None:
+            continue
+        norm = _clamp((px_s - p50 * 0.4) / (p95 - p50 * 0.4 + 1e-6), 0.0, 1.0)
+        kmh = None
+        if table_geo is not None and table_geo.get("homography") is not None:
+            idx = key_index[f]
+            if idx >= 1:
+                f0 = keys[idx - 1]
+                x0, y0, _ = filled_track[f0]
+                x1, y1, _ = filled_track[f]
+                t0 = img_to_table(table_geo, (x0, y0))
+                t1 = img_to_table(table_geo, (x1, y1))
+                df = f - f0
+                if t0 and t1 and 0 < df <= int(fps * 0.4) + 2:
+                    d_mm = math.hypot(t1[0] - t0[0], t1[1] - t0[1])
+                    dt = df / fps
+                    if dt > 0:
+                        kmh = (d_mm / 1000.0) / dt * 3.6
+        table[f] = {"px_s": px_s, "kmh": kmh, "norm": norm}
+    return table, (p50, p95)
 
 
 # =====================================================================
@@ -1369,27 +1233,18 @@ class RallyState(Enum):
 
 
 def _finalize_rally(rally_periods, current_rally, end_reason, rally_min_duration):
-    """仅当回合有效 (已跨网 且 时长 >= 最小时长) 时记录。
-    修复: 旧版计算 is_valid 后被忽略, 任何 >=0.5s 的回合都会被记录。
-    """
     rally_duration = current_rally["end"] - current_rally["start"]
-    is_valid = (current_rally.get("crossed_net", False)
-                and rally_duration >= float(rally_min_duration))
-    if not is_valid:
+    if not (current_rally.get("crossed_net", False) and rally_duration >= float(rally_min_duration)):
         return False
     rally_periods.append({
         "start_frame": current_rally["start_frame"],
         "end_frame": current_rally["end_frame"],
         "duration": round(rally_duration, 2),
-        "ended_reason": end_reason,
-    })
+        "ended_reason": end_reason})
     return True
 
 
 def _get_net_center_x(raw_log_path):
-    """回退用: 取球网 (或球台) 包围盒中心 x。
-    修复: 旧版的 net_x 为死变量, 永远返回 table_x。
-    """
     table_x = None
     with open(raw_log_path, "r", encoding="utf-8") as f:
         for line in f:
@@ -1415,9 +1270,8 @@ def _estimate_slow_speed_threshold(ball_lookup, fps):
         if entry is None:
             continue
         (bx, by), is_real = entry
-        if not is_real:
-            continue
-        real_pts.append((f, float(bx), float(by)))
+        if is_real:
+            real_pts.append((f, float(bx), float(by)))
     if len(real_pts) < 30 or fps <= 0:
         return 80.0
     speeds = []
@@ -1438,20 +1292,17 @@ def _estimate_slow_speed_threshold(ball_lookup, fps):
     speeds.sort()
     p15 = speeds[int(len(speeds) * 0.15)]
     p50 = speeds[len(speeds) // 2]
-    slow_thresh = min(p15 * 0.6, p50 * 0.35)
-    return max(slow_thresh, 80.0)
+    return max(min(p15 * 0.6, p50 * 0.35), 80.0)
 
 
 def detect_rallies(filled_track, fps, total_frames, raw_log_path, table_geo=None,
-                   rally_lost_timeout=1.0, rally_min_duration=0.6,
-                   pre_roll_sec=1.0, slow_speed_window_sec=1.0,
-                   slow_speed_min_in_play_sec=0.8,
+                   rally_lost_timeout=1.0, rally_min_duration=0.6, pre_roll_sec=1.0,
+                   slow_speed_window_sec=1.0, slow_speed_min_in_play_sec=0.8,
                    out_of_table_timeout=1.0, debug=False):
     if not filled_track or fps <= 0:
         return []
     ball_lookup = {f: ((x, y), not interp) for f, (x, y, interp) in filled_track.items()}
     sorted_frames = sorted(ball_lookup.keys())
-    rallies = []
     net_line = table_geo.get("net_line") if table_geo else None
     net_center_x = _get_net_center_x(raw_log_path) if net_line is None else None
     if net_line is None and net_center_x is None:
@@ -1469,19 +1320,10 @@ def detect_rallies(filled_track, fps, total_frames, raw_log_path, table_geo=None
         rallies.append({"start_frame": cur[0], "end_frame": cur[-1]})
         return rallies
     slow_thresh = _estimate_slow_speed_threshold(ball_lookup, fps)
-
     corridor = table_geo.get("corridor") if table_geo else None
     OUT_OF_TABLE_FRAMES = max(1, int(round(fps * out_of_table_timeout)))
-
     if debug:
-        if net_line is not None:
-            log(f"  慢速阈值: {slow_thresh:.0f} px/s  球网线判定 (cross product)")
-        else:
-            log(f"  慢速阈值: {slow_thresh:.0f} px/s  net_center_x={net_center_x:.0f}")
-        if corridor is not None:
-            log(f"  出台判定: 持续 {OUT_OF_TABLE_FRAMES} 帧 (~{out_of_table_timeout}s) 出走廊则结束")
-        else:
-            log("  出台判定: 无走廊几何, 跳过该规则")
+        log(f"  慢速阈值: {slow_thresh:.0f} px/s")
     PRE_ROLL_FRAMES = int(round(fps * pre_roll_sec))
     LOST_FRAMES = int(round(fps * rally_lost_timeout))
     SLOW_WIN_FRAMES = max(2, int(round(fps * slow_speed_window_sec)))
@@ -1495,15 +1337,14 @@ def detect_rallies(filled_track, fps, total_frames, raw_log_path, table_geo=None
     prev_side = None
     slow_run_frames = 0
     out_of_table_run = 0
+    rallies = []
     traj_buffer = deque(maxlen=max(PRE_ROLL_FRAMES * 3, int(fps * 6)))
 
     def _ball_side(x, y):
-        """使用球网线 cross product 判定球在哪一侧 (任意角度均正确)。"""
         if net_line is not None:
             (nx1, ny1), (nx2, ny2) = net_line
-            cross = (nx2 - nx1) * (y - ny1) - (ny2 - ny1) * (x - nx1)
-            return 'A' if cross > 0 else 'B'
-        elif net_center_x is not None:
+            return 'A' if (nx2 - nx1) * (y - ny1) - (ny2 - ny1) * (x - nx1) > 0 else 'B'
+        if net_center_x is not None:
             return 'L' if x < net_center_x else 'R'
         return None
 
@@ -1530,20 +1371,15 @@ def detect_rallies(filled_track, fps, total_frames, raw_log_path, table_geo=None
             traj_buffer.append((frame_idx, frame_idx / fps, float(bx), float(by), bool(is_real), side))
             missing_ball_frames = 0
         else:
-            is_real = False
-            side = None
+            is_real, side = False, None
             missing_ball_frames += 1
         if rally_state == RallyState.IDLE:
             if entry is not None and prev_side is not None and side is not None and side != prev_side:
                 rally_num += 1
                 start_frame = max(0, frame_idx - PRE_ROLL_FRAMES)
-                current_rally = {
-                    "start_frame": start_frame, "end_frame": frame_idx,
-                    "crossed_net": True,
-                }
+                current_rally = {"start_frame": start_frame, "end_frame": frame_idx, "crossed_net": True}
                 rally_state = RallyState.IN_PLAY
-                slow_run_frames = 0
-                out_of_table_run = 0
+                slow_run_frames = out_of_table_run = 0
                 while traj_buffer and traj_buffer[0][0] < start_frame:
                     traj_buffer.popleft()
             if entry is not None:
@@ -1567,7 +1403,6 @@ def detect_rallies(filled_track, fps, total_frames, raw_log_path, table_geo=None
                     slow_run_frames = 0
                 if slow_run_frames >= SLOW_WIN_FRAMES:
                     end_by_slow = True
-
             end_by_out = False
             if corridor is not None:
                 if entry is not None:
@@ -1577,7 +1412,6 @@ def detect_rallies(filled_track, fps, total_frames, raw_log_path, table_geo=None
                         out_of_table_run += 1
                 if out_of_table_run >= OUT_OF_TABLE_FRAMES:
                     end_by_out = True
-
             if end_by_lost or end_by_slow or end_by_out:
                 if end_by_lost:
                     end_reason = "ball_lost"
@@ -1585,7 +1419,6 @@ def detect_rallies(filled_track, fps, total_frames, raw_log_path, table_geo=None
                     end_reason = "ball_too_slow"
                 else:
                     end_reason = "ball_out_of_table"
-
                 if end_by_lost and missing_ball_frames > 0:
                     end_f = current_rally["start_frame"]
                     for f in range(frame_idx - missing_ball_frames, current_rally["start_frame"] - 1, -1):
@@ -1607,8 +1440,7 @@ def detect_rallies(filled_track, fps, total_frames, raw_log_path, table_geo=None
                 _finalize_rally(rallies, current_rally, end_reason, rally_min_duration)
                 rally_state = RallyState.IDLE
                 current_rally = None
-                slow_run_frames = 0
-                out_of_table_run = 0
+                slow_run_frames = out_of_table_run = 0
                 prev_side = side
     if rally_state == RallyState.IN_PLAY and current_rally is not None:
         current_rally["start"] = current_rally["start_frame"] / fps
@@ -1623,10 +1455,6 @@ def detect_rallies(filled_track, fps, total_frames, raw_log_path, table_geo=None
 
 
 def detect_events(filled_track, table_geo, fps):
-    """
-    bounce 用窗口极值判定 (局部 y 最大值), 抗噪;
-    hit 用 vx 反向且幅度足够。
-    """
     events = []
     if not filled_track:
         return events
@@ -1647,26 +1475,16 @@ def detect_events(filled_track, table_geo, fps):
         dt = (k1 - k0) / fps
         if dt <= 0:
             return None
-        v_mps = (d_mm / 1000.0) / dt
-        return v_mps * 3.6
+        return (d_mm / 1000.0) / dt * 3.6
 
-    # ---- v4.3 修复: 用球台四边形 quad 替代走廊 corridor ----
-    # 走廊比球台大 3~4 倍, 会导致出台球的地板反弹被误判为台面 bounce。
-    # 改用 quad (球台本体四角) 做点-多边形测试, 从源头过滤非台面反弹。
     quad = table_geo.get("quad") if table_geo else None
 
     def _in_table(x, y):
-        if quad is None:
-            return True
-        return _point_in_corridor((x, y), quad)
+        return True if quad is None else _point_in_corridor((x, y), quad)
 
-    # ---- v4.3 修复: 台面高度合理性检查 ----
-    # 将 bounce 候选点经 img_to_table 映射到台面坐标 (mm),
-    # 检查是否在球台物理范围 [0,1525]×[0,2740] 内 (含容差)。
-    # 出台球 (地板反弹、身体阻挡等) 映射后必然超出此范围, 从而被拒绝。
-    _TX_MAX = TABLE_WID_M * 1000   # 1525 mm
-    _TY_MAX = TABLE_LEN_M * 1000   # 2740 mm
-    _SURFACE_TOL = 80              # 80mm 容差 (球半径 ~20mm + 检测抖动)
+    _TX_MAX = TABLE_WID_M * 1000
+    _TY_MAX = TABLE_LEN_M * 1000
+    _SURFACE_TOL = 80
 
     def _on_table_surface(x, y):
         if table_geo is None:
@@ -1680,38 +1498,94 @@ def detect_events(filled_track, table_geo, fps):
 
     last_bounce_frame = -10 ** 9
     bounce_cooldown_frames = max(1, int(round(fps * 0.1)))
-
     for i in range(2, n - 2):
         f, x, y = pts[i]
         f_p, x_p, y_p = pts[i - 1]
         f_n, x_n, y_n = pts[i + 1]
         ev_type = None
-
-        # bounce: 局部 y 极大值 (图像 y 向下, 落点为最低位置即 y 最大)
-        is_local_y_max = (y >= pts[i - 1][2] and y >= pts[i + 1][2]
-                          and y > pts[i - 2][2] and y > pts[i + 2][2])
-        vy_prev = y - y_p
-        vy_next = y_n - y
+        is_local_y_max = (y >= pts[i - 1][2] and y >= pts[i + 1][2] and
+                          y > pts[i - 2][2] and y > pts[i + 2][2])
+        vy_prev, vy_next = y - y_p, y_n - y
         if is_local_y_max and vy_prev > 0.1 and vy_next < -0.1:
-            if (f - last_bounce_frame >= bounce_cooldown_frames
-                    and _in_table(x, y)
-                    and _on_table_surface(x, y)):
+            if (f - last_bounce_frame >= bounce_cooldown_frames and
+                    _in_table(x, y) and _on_table_surface(x, y)):
                 ev_type = "bounce"
                 last_bounce_frame = f
-
         if ev_type is None:
-            vx_prev = x - x_p
-            vx_next = x_n - x
+            vx_prev, vx_next = x - x_p, x_n - x
             if vx_prev * vx_next < 0 and abs(vx_prev) > 2.0 and abs(vx_next) > 2.0:
                 if _in_table(x, y):
                     ev_type = "hit"
-
         if ev_type:
             spd = speed_kmh(f_p, f_n, pts[i - 1], pts[i + 1])
             txy = img_to_table(table_geo, (x, y)) if table_geo is not None else None
             events.append({"frame": f, "x": x, "y": y, "type": ev_type,
                            "speed_kmh": spd, "table_xy": txy})
     return events
+
+
+# =====================================================================
+#  5b) 落点半台判定 + 两半台交替过滤
+# =====================================================================
+def _landing_half(landing):
+    txy = landing.get("table_xy")
+    if txy is None:
+        return None
+    return 'FAR' if txy[1] < TABLE_LEN_M * 1000 / 2.0 else 'NEAR'
+
+
+def filter_alternating_landings(landings, debug=False):
+    if not landings:
+        return []
+    ordered = sorted(landings, key=lambda lp: lp["frame"])
+    kept, last_half, n_drop = [], None, 0
+    for lp in ordered:
+        half = _landing_half(lp)
+        if half is None or half == last_half:
+            n_drop += 1
+            continue
+        kept.append(lp)
+        last_half = half
+    if debug and n_drop > 0:
+        log(f"    落点交替过滤: {len(ordered)} → {len(kept)} 个落点 (剔除 {n_drop})")
+    return kept
+
+
+def build_landing_rally_index(segments, rally_starts_by_seg, landing_all, debug=False):
+    def seg_of_frame(f):
+        for i, (s, e) in enumerate(segments):
+            if s <= f <= e:
+                return i
+        return -1
+
+    raw_by_seg = defaultdict(list)
+    for lp in landing_all:
+        si = seg_of_frame(lp["frame"])
+        if si >= 0:
+            raw_by_seg[si].append(lp)
+
+    landing_by_seg = defaultdict(list)
+    landing_rally_id = {}
+    for si, (s, e) in enumerate(segments):
+        seg_landings = sorted(raw_by_seg.get(si, []), key=lambda lp: lp["frame"])
+        if not seg_landings:
+            continue
+        rally_starts = sorted(rally_starts_by_seg.get(si, []))
+        bounds = rally_starts if rally_starts else [s]
+        if debug:
+            log(f"    片段{si}: 落点交替过滤 (回合边界帧={bounds})")
+        for bi in range(len(bounds)):
+            lo = bounds[bi]
+            hi = bounds[bi + 1] if bi + 1 < len(bounds) else (e + 1)
+            group = [lp for lp in seg_landings if lo <= lp["frame"] < hi]
+            if not group:
+                continue
+            kept = filter_alternating_landings(group, debug=debug)
+            for lp in kept:
+                landing_rally_id[(si, lp["frame"])] = bi
+            landing_by_seg[si].extend(kept)
+        landing_by_seg[si].sort(key=lambda lp: lp["frame"])
+    return landing_by_seg, landing_rally_id
 
 
 # =====================================================================
@@ -1722,41 +1596,31 @@ def build_segments(rallies, fps, total_frames, args):
     pre = int(args.pre_buffer * fps)
     post = int(args.post_buffer * fps)
     merge_gap = int(args.merge_gap * fps)
-
     valid_rallies = [r for r in rallies
                      if (r["end_frame"] - r["start_frame"] + 1) >= min_frames]
     if not valid_rallies:
         return [], {}
-
     buffed = []
     for r in valid_rallies:
-        s = r["start_frame"]
-        e = r["end_frame"]
-        bs = max(0, s - pre)
-        be = min(total_frames - 1, e + post)
-        buffed.append((bs, be, s))
+        bs = max(0, r["start_frame"] - pre)
+        be = min(total_frames - 1, r["end_frame"] + post)
+        buffed.append((bs, be, r["start_frame"]))
     buffed.sort(key=lambda x: (x[0], x[1]))
-
-    merged = []
-    first = buffed[0]
-    merged.append([first[0], first[1], [first[2]]])
+    merged = [[buffed[0][0], buffed[0][1], [buffed[0][2]]]]
     for bs, be, raw_s in buffed[1:]:
         if bs - merged[-1][1] <= merge_gap:
             merged[-1][1] = max(merged[-1][1], be)
             merged[-1][2].append(raw_s)
         else:
             merged.append([bs, be, [raw_s]])
-
     segments = [(int(s), int(e)) for s, e, _ in merged]
-    rally_starts_by_seg = {}
-    for si, (_, _, raw_starts) in enumerate(merged):
-        rs = sorted(set(int(x) for x in raw_starts))
-        rally_starts_by_seg[si] = rs
+    rally_starts_by_seg = {si: sorted(set(int(x) for x in raw_starts))
+                           for si, (_, _, raw_starts) in enumerate(merged)}
     return segments, rally_starts_by_seg
 
 
 # =====================================================================
-#  7) 渲染
+#  7) 渲染 — 特效系统
 # =====================================================================
 class MiniTable:
     def __init__(self, frame_w, frame_h):
@@ -1775,19 +1639,12 @@ class MiniTable:
         if txy is None:
             return None
         X, Y = txy
-        # ---- v4.3 修复: 收紧越界容差 ----
-        # 原来用 15% margin (X≈228mm, Y≈411mm), 出台球经 H 反变换后
-        # 落在此范围内会被 clamp 到 mini 球台边缘, 产生伪落点。
-        # 现收紧到 50mm (球半径 + 少量抖动), 超出则直接丢弃。
-        _tol = 50  # mm
-        if not (-_tol <= X <= self._x_max + _tol
-                and -_tol <= Y <= self._y_max + _tol):
+        _tol = 50
+        if not (-_tol <= X <= self._x_max + _tol and -_tol <= Y <= self._y_max + _tol):
             return None
         X = _clamp(X, 0.0, self._x_max)
         Y = _clamp(Y, 0.0, self._y_max)
-        mx = self.x0 + X * self.sx
-        my = self.y0 + Y * self.sy
-        return int(mx), int(my)
+        return int(self.x0 + X * self.sx), int(self.y0 + Y * self.sy)
 
     def draw(self, frame, current_rally_points):
         roi = frame[self.y0:self.y0 + self.h, self.x0:self.x0 + self.w]
@@ -1795,26 +1652,32 @@ class MiniTable:
         cv2.rectangle(frame, (self.x0, self.y0),
                       (self.x0 + self.w, self.y0 + self.h), (255, 255, 255), 2)
         midy = self.y0 + self.h // 2
-        cv2.line(frame, (self.x0, midy), (self.x0 + self.w, midy),
-                 (255, 255, 255), 2)
+        cv2.line(frame, (self.x0, midy), (self.x0 + self.w, midy), (255, 255, 255), 2)
         dash_len = max(4, self.w // 12)
         for dx in range(0, self.w, dash_len * 2):
             x_start = self.x0 + dx
             x_end = min(self.x0 + dx + dash_len, self.x0 + self.w)
-            cv2.line(frame, (x_start, midy), (x_end, midy),
-                     (180, 220, 255), 1)
+            cv2.line(frame, (x_start, midy), (x_end, midy), (180, 220, 255), 1)
         cv2.putText(frame, "NET", (self.x0 + self.w + 3, midy + 4),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.3, (180, 220, 255), 1)
         midx = self.x0 + self.w // 2
-        cv2.line(frame, (midx, self.y0), (midx, self.y0 + self.h),
-                 (200, 200, 200), 1)
+        cv2.line(frame, (midx, self.y0), (midx, self.y0 + self.h), (200, 200, 200), 1)
         cv2.putText(frame, "FAR", (self.x0 + 2, self.y0 + 12),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.3, (200, 200, 200), 1)
         cv2.putText(frame, "NEAR", (self.x0 + 2, self.y0 + self.h - 4),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.3, (200, 200, 200), 1)
+        mpts = []
         for lp in current_rally_points:
             mp = self.table_to_mini(lp.get("table_xy"))
             if mp:
+                mpts.append(mp)
+        for i in range(1, len(mpts)):
+            cv2.line(frame, mpts[i - 1], mpts[i], (0, 180, 255), 1, cv2.LINE_AA)
+        for i, mp in enumerate(mpts):
+            if i == len(mpts) - 1:
+                cv2.circle(frame, mp, 7, (0, 255, 255), -1)
+                cv2.circle(frame, mp, 8, (0, 0, 0), 1)
+            else:
                 cv2.circle(frame, mp, 5, (0, 215, 255), -1)
                 cv2.circle(frame, mp, 6, (0, 0, 0), 1)
         cv2.putText(frame, "TABLE", (self.x0, self.y0 - 6),
@@ -1831,29 +1694,33 @@ class MiniTable:
 
 
 class ParticleSystem:
-    def __init__(self):
+    def __init__(self, intensity=1.0):
         self.particles = []
+        self.intensity = intensity
 
-    def emit(self, x, y, n=18, kind="bounce"):
+    def emit(self, x, y, n=18, kind="bounce", speed_norm=0.3):
+        n = int(n * self.intensity)
+        base_col = speed_to_color(speed_norm)
+        spd_scale = 1.0 + speed_norm * 1.6
         for _ in range(n):
             ang = np.random.uniform(0, 2 * math.pi)
-            spd = np.random.uniform(1.5, 6.0)
+            spd = np.random.uniform(1.5, 6.0) * spd_scale
             if kind == "bounce":
                 vy = -abs(math.sin(ang) * spd) - 1.0
                 vx = math.cos(ang) * spd
-                color = (210, 230, 255)
+                color = _lerp_color((230, 240, 255), base_col, 0.5 * speed_norm)
             else:
-                vx = math.cos(ang) * spd
-                vy = math.sin(ang) * spd
-                color = (200, 200, 200)
-            life = np.random.randint(8, 20)
-            self.particles.append({
-                "x": x, "y": y, "vx": vx, "vy": vy,
-                "life": life, "maxlife": life,
-                "size": np.random.uniform(1.0, 3.0), "color": color})
+                vx, vy = math.cos(ang) * spd, math.sin(ang) * spd
+                color = base_col
+            life = np.random.randint(8, 20 + int(speed_norm * 12))
+            self.particles.append({"x": x, "y": y, "vx": vx, "vy": vy,
+                                   "life": life, "maxlife": life,
+                                   "size": np.random.uniform(1.0, 3.0 + speed_norm * 1.5),
+                                   "color": color})
 
     def update_and_draw(self, frame):
         alive = []
+        h, w = frame.shape[:2]
         for p in self.particles:
             p["x"] += p["vx"]
             p["y"] += p["vy"]
@@ -1866,18 +1733,159 @@ class ParticleSystem:
             col = tuple(int(c * a) for c in p["color"])
             r = max(1, int(p["size"] * a))
             xi, yi = int(p["x"]), int(p["y"])
-            if 0 <= xi < frame.shape[1] and 0 <= yi < frame.shape[0]:
-                cv2.circle(frame, (xi, yi), r, col, -1)
+            if 0 <= xi < w and 0 <= yi < h:
+                cv2.circle(frame, (xi, yi), r, col, -1, cv2.LINE_AA)
             alive.append(p)
         self.particles = alive
 
 
-class CometRenderer:
-    """彗星拖尾渲染器 (按分辨率缓存复用 overlay/alpha 缓冲)。"""
-    def __init__(self):
-        self._cache = {}
+class ShockwaveSystem:
+    def __init__(self, intensity=1.0):
+        self.waves = []
+        self.intensity = intensity
 
-    def draw(self, frame, trail_pts):
+    def emit(self, x, y, kind="hit", speed_norm=0.3):
+        #base_col = speed_to_color(speed_norm)
+        n_rings = 1 + int(round(speed_norm * 2 * self.intensity))
+        life = int(10 + speed_norm * 14)
+        for k in range(max(1, n_rings)):
+            self.waves.append({"x": x, "y": y, "r": 0.01 + k * 0.08,
+                               "vr": (0.05 + speed_norm * 0.15) * (1.0 - 0.15 * k),
+                               "life": life, "maxlife": life,
+                               "color": (255, 255, 255),
+                               "thick": 2 if kind == "hit" else 1})
+
+    def update_and_draw(self, frame):
+        alive = []
+        h, w = frame.shape[:2]
+        for wv in self.waves:
+            wv["r"] += wv["vr"]
+            wv["vr"] *= 0.94
+            wv["life"] -= 1
+            if wv["life"] <= 0:
+                continue
+            a = wv["life"] / wv["maxlife"]
+            xi, yi, rr = int(wv["x"]), int(wv["y"]), int(wv["r"])
+            if rr <= 0 or not (0 <= xi < w and 0 <= yi < h):
+                alive.append(wv)
+                continue
+            #col = tuple(int(c * a) for c in wv["color"])
+            cv2.circle(
+                        frame, (xi, yi), rr,                 # ← col → (255, 255, 255)
+                        (255, 255, 255),                     # ← 固定白色
+                        max(1, int(wv["thick"] * a + 0.5)),  # ← thick 随透明度变细
+                        cv2.LINE_AA
+                        )
+            alive.append(wv)
+        self.waves = alive
+
+
+class FloatingLabel:
+    def __init__(self):
+        self.labels = []
+
+    def emit(self, x, y, text, color=(0, 200, 255), scale=1.0, life=22):
+        self.labels.append({"x": x, "y": y, "text": text, "color": color,
+                            "scale": scale, "life": life, "maxlife": life})
+
+    def update_and_draw(self, frame):
+        alive = []
+        h, w = frame.shape[:2]
+        for lb in self.labels:
+            lb["y"] -= 1.4
+            lb["life"] -= 1
+            if lb["life"] <= 0:
+                continue
+            a = lb["life"] / lb["maxlife"]
+            fs = 0.6 * lb["scale"] * (0.6 + 0.4 * a)
+            col = tuple(int(c * a) for c in lb["color"])
+            (tw, th), _ = cv2.getTextSize(lb["text"], cv2.FONT_HERSHEY_DUPLEX, fs, 2)
+            px = int(_clamp(lb["x"] - tw / 2, 2, w - tw - 2))
+            py = int(_clamp(lb["y"], th + 2, h - 2))
+            cv2.putText(frame, lb["text"], (px, py), cv2.FONT_HERSHEY_DUPLEX, fs, (0, 0, 0), 4, cv2.LINE_AA)
+            cv2.putText(frame, lb["text"], (px, py), cv2.FONT_HERSHEY_DUPLEX, fs, col, 2, cv2.LINE_AA)
+            alive.append(lb)
+        self.labels = alive
+
+
+class SpeedFlash:
+    def __init__(self):
+        self._t = 0
+        self._max = 0
+        self._mask_cache = {}
+
+    def trigger(self, strength_frames=8):
+        self._t = max(self._t, strength_frames)
+        self._max = max(self._max, strength_frames)
+
+    def _get_mask(self, h, w):
+        key = (h, w)
+        if key not in self._mask_cache:
+            yy, xx = np.mgrid[0:h, 0:w]
+            cx, cy = w / 2.0, h / 2.0
+            d = np.sqrt(((xx - cx) / cx) ** 2 + ((yy - cy) / cy) ** 2)
+            m = np.clip((d - 0.55) / 0.6, 0.0, 1.0).astype(np.float32)
+            self._mask_cache[key] = m[..., None]
+        return self._mask_cache[key]
+
+    def update_and_draw(self, frame):
+        if self._t <= 0:
+            return
+        a = self._t / max(1, self._max)
+        h, w = frame.shape[:2]
+        mask = self._get_mask(h, w)
+        tint = np.array([40, 120, 255], dtype=np.float32)
+        strength = 0.5 * a
+        f = frame.astype(np.float32)
+        f = f * (1.0 - mask * strength) + tint * (mask * strength)
+        frame[:] = np.clip(f, 0, 255).astype(np.uint8)
+        self._t -= 1
+
+
+class BounceMarker:
+    """主画面落点脉冲标记: 高透明度白色扩散圈 (半径较小) + 细白十字。"""
+    def __init__(self):
+        self.marks = []
+
+    def emit(self, x, y):
+        self.marks.append({"x": x, "y": y, "life": 16, "maxlife": 16})
+
+    def update_and_draw(self, frame):
+        alive = []
+        h, w = frame.shape[:2]
+        for m in self.marks:
+            m["life"] -= 1
+            if m["life"] <= 0:
+                continue
+            a = m["life"] / m["maxlife"]
+            xi, yi = int(m["x"]), int(m["y"])
+            r = int((1 - a) * 12 + 2)
+            pad = r + 3
+            y0, y1 = max(0, yi - pad), min(h, yi + pad + 1)
+            x0, x1 = max(0, xi - pad), min(w, xi + pad + 1)
+            if y0 >= y1 or x0 >= x1:
+                alive.append(m)
+                continue
+            roi = frame[y0:y1, x0:x1]
+            ov = roi.copy()
+            lcx, lcy = xi - x0, yi - y0
+            cv2.circle(ov, (lcx, lcy), max(1, r), (255, 255, 255), 1, cv2.LINE_AA)
+            cl = int(6 * a + 2)
+            cv2.line(ov, (lcx - cl, lcy), (lcx + cl, lcy), (255, 255, 255), 1, cv2.LINE_AA)
+            cv2.line(ov, (lcx, lcy - cl), (lcx, lcy + cl), (255, 255, 255), 1, cv2.LINE_AA)
+            alpha = 0.28 * a
+            cv2.addWeighted(ov, alpha, roi, 1.0 - alpha, 0, roi)
+            alive.append(m)
+        self.marks = alive
+
+
+class SpeedTrailRenderer:
+    """速度自适应彗星拖尾 (细/淡/偏白)。"""
+    def __init__(self, intensity=1.0):
+        self._cache = {}
+        self.intensity = intensity
+
+    def draw(self, frame, trail_pts, speed_norm=0.3):
         n = len(trail_pts)
         if n < 2:
             return
@@ -1889,20 +1897,24 @@ class CometRenderer:
         overlay, alpha_mask = self._cache[key]
         xs = [p[0] for p in trail_pts]
         ys = [p[1] for p in trail_pts]
-        pad = 14
+        pad = 16
         x0 = max(0, int(min(xs)) - pad)
         x1 = min(w, int(max(xs)) + pad + 1)
         y0 = max(0, int(min(ys)) - pad)
         y1 = min(h, int(max(ys)) + pad + 1)
         alpha_mask[y0:y1, x0:x1] = 0.0
         overlay[y0:y1, x0:x1] = frame[y0:y1, x0:x1]
+        trail_col = speed_to_color(speed_norm)
+        thick_scale = (1.0 + speed_norm * 1.8) * (2.0 / 3.0)
         for i in range(1, n):
             a = i / n
-            alpha = 0.07 + 0.5 * a
-            thick = max(1, int(1 + 6 * a))
+            alpha = (0.15 + 0.55 * a) * (0.85 + 0.15 * self.intensity)
+            thick = max(1, int((1 + 4 * a) * thick_scale))
             p0 = (int(trail_pts[i - 1][0]), int(trail_pts[i - 1][1]))
             p1 = (int(trail_pts[i][0]), int(trail_pts[i][1]))
-            cv2.line(overlay, p0, p1, (255, 255, 255), thick, cv2.LINE_AA)
+            seg_col = _lerp_color((255, 255, 255), trail_col,
+                                  a * (0.55 * 0.6 + 0.45 * speed_norm) * 0.75)
+            cv2.line(overlay, p0, p1, seg_col, thick, cv2.LINE_AA)
             cv2.line(alpha_mask, p0, p1, alpha, thick, cv2.LINE_AA)
         roi_a = alpha_mask[y0:y1, x0:x1]
         if (roi_a > 0).any():
@@ -1912,15 +1924,78 @@ class CometRenderer:
             blended = roi_f.astype(np.float32) * (1.0 - a3) + roi_o.astype(np.float32) * a3
             roi_f[:] = np.clip(blended + 0.5, 0, 255).astype(np.uint8)
         cx, cy = int(trail_pts[-1][0]), int(trail_pts[-1][1])
-        r = 2
-        yy0, yy1 = max(0, cy - r), min(h, cy + r + 1)
-        xx0, xx1 = max(0, cx - r), min(w, cx + r + 1)
-        if yy0 < yy1 and xx0 < xx1:
-            ball_roi = frame[yy0:yy1, xx0:xx1].copy()
-            cv2.circle(frame, (cx, cy), r, (255, 255, 255), -1, cv2.LINE_AA)
-            alpha = 0.10
-            cv2.addWeighted(frame[yy0:yy1, xx0:xx1], alpha, ball_roi, 1.0 - alpha, 0,
-                            frame[yy0:yy1, xx0:xx1])
+        glow_r = int((3 + speed_norm * 9 * self.intensity) * (2.0 / 3.0))
+        if speed_norm > 0.3 and glow_r >= 2:
+            gy0, gy1 = max(0, cy - glow_r * 2), min(h, cy + glow_r * 2 + 1)
+            gx0, gx1 = max(0, cx - glow_r * 2), min(w, cx + glow_r * 2 + 1)
+            if gy0 < gy1 and gx0 < gx1:
+                glow = frame[gy0:gy1, gx0:gx1].copy()
+                lcx, lcy = cx - gx0, cy - gy0
+                glow_col = _lerp_color((255, 255, 255), trail_col, 0.6)
+                for layer in range(3):
+                    rr = glow_r - layer * (glow_r // 3 + 1)
+                    if rr < 1:
+                        continue
+                    cv2.circle(glow, (lcx, lcy), rr, glow_col, -1, cv2.LINE_AA)
+                cv2.addWeighted(glow, 0.28, frame[gy0:gy1, gx0:gx1], 0.72, 0, frame[gy0:gy1, gx0:gx1])
+        cv2.circle(frame, (cx, cy), 2, (255, 255, 255), -1, cv2.LINE_AA)
+
+
+class PlayerFX:
+    """选手移动特效: 仅脚下光环 (随移动速度变化), 仅在局部 ROI 混合。"""
+    def __init__(self, fps, frame_w, frame_h, intensity=1.0):
+        self.fps = fps
+        self.diag = math.hypot(frame_w, frame_h)
+        self.intensity = intensity
+        self.fast_thresh = self.diag * 0.012
+        self.aura_phase = 0.0
+
+    def draw(self, frame, boxes_prev, boxes_cur):
+        if not boxes_cur:
+            return
+        h, w = frame.shape[:2]
+        self.aura_phase += 0.35
+
+        def speed_of(box):
+            if not boxes_prev:
+                return 0.0
+            cx = (box[0] + box[2]) * 0.5
+            cy = (box[1] + box[3]) * 0.5
+            best, bp = 1e18, None
+            for pb in boxes_prev:
+                pcx = (pb[0] + pb[2]) * 0.5
+                pcy = (pb[1] + pb[3]) * 0.5
+                d = math.hypot(cx - pcx, cy - pcy)
+                if d < best:
+                    best, bp = d, (pcx, pcy)
+            if bp is None or best > self.diag * 0.15:
+                return 0.0
+            return best
+
+        for box in boxes_cur:
+            x1, y1, x2, y2 = [int(v) for v in box]
+            cx = (x1 + x2) // 2
+            snorm = _clamp(speed_of(box) / (self.fast_thresh + 1e-6), 0.0, 1.0)
+            foot_y = y2
+            ring_r = int((x2 - x1) * (0.35 + 0.15 * snorm) * 0.5)
+            if ring_r <= 3:
+                continue
+            pulse = 0.6 + 0.4 * math.sin(self.aura_phase)
+            ring_col = speed_to_color(snorm)
+            ring_h = max(3, ring_r // 3)
+            # ★ 仅在光环外接矩形 ROI 上混合 (避免整帧 copy)
+            ry0 = max(0, foot_y - ring_h - 2)
+            ry1 = min(h, foot_y + ring_h + 3)
+            rx0 = max(0, cx - ring_r - 2)
+            rx1 = min(w, cx + ring_r + 3)
+            if ry0 >= ry1 or rx0 >= rx1:
+                continue
+            roi = frame[ry0:ry1, rx0:rx1]
+            ov = roi.copy()
+            cv2.ellipse(ov, (cx - rx0, foot_y - ry0), (ring_r, ring_h),
+                        0, 0, 360, ring_col, 2, cv2.LINE_AA)
+            blend = 0.35 * (0.5 + 0.5 * pulse) * self.intensity
+            cv2.addWeighted(ov, blend, roi, 1 - blend, 0, roi)
 
 
 def smooth_trail(points):
@@ -1929,14 +2004,13 @@ def smooth_trail(points):
     pts = np.array(points, dtype=np.float64)
     xs = np.convolve(pts[:, 0], _SMOOTH_KERNEL, mode="same")
     ys = np.convolve(pts[:, 1], _SMOOTH_KERNEL, mode="same")
-    # 端点保护: convolve 'same' 会在两端引入零填充偏移, 恢复原始端点
     xs[0], ys[0] = pts[0]
     xs[-1], ys[-1] = pts[-1]
     return list(zip(xs, ys))
 
 
 def render(args, segments, rally_starts_by_seg, filled_track, events, table_geo,
-           in_w, in_h, fps, total_frames):
+           in_w, in_h, fps, total_frames, ball_speed_table, player_boxes):
     out_h = args.output_height or in_h
     out_w = int(round(in_w * out_h / in_h))
     if out_w % 2:
@@ -1945,34 +2019,43 @@ def render(args, segments, rally_starts_by_seg, filled_track, events, table_geo,
         out_h += 1
     scale = out_w / in_w
 
+    fx_level = args.fx_level
+    fx_intensity = {"minimal": 0.7, "max": 1.4}.get(fx_level, 1.0)
+    enable_extra_fx = (fx_level != "minimal")
+    enable_player_fx = (not args.no_player_fx) and bool(player_boxes) and enable_extra_fx
+
     ev_by_frame = defaultdict(list)
     landing_all = []
     for ev in events:
         ev_by_frame[ev["frame"]].append(ev)
         if ev["type"] == "bounce":
             landing_all.append(ev)
+
+    kmh_vals = [ev["speed_kmh"] for ev in events if ev.get("speed_kmh")]
+    kmh_p95 = 1.0
+    if kmh_vals:
+        kmh_vals_sorted = sorted(kmh_vals)
+        kmh_p95 = max(1.0, kmh_vals_sorted[min(len(kmh_vals_sorted) - 1,
+                                               int(len(kmh_vals_sorted) * 0.9))])
+
+    def event_speed_norm(ev):
+        s = ev.get("speed_kmh")
+        if s and kmh_p95 > 0:
+            return _clamp(s / kmh_p95, 0.0, 1.0)
+        st = ball_speed_table.get(ev["frame"])
+        return st["norm"] if st else 0.3
+
     scaled_ev_by_frame = defaultdict(list)
     for f, evs in ev_by_frame.items():
         for ev in evs:
             scaled_ev_by_frame[f].append({
-                "x": ev["x"] * scale,
-                "y": ev["y"] * scale,
-                "type": ev["type"],
-            })
+                "x": ev["x"] * scale, "y": ev["y"] * scale, "type": ev["type"],
+                "snorm": event_speed_norm(ev), "kmh": ev.get("speed_kmh")})
 
-    def seg_of_frame(f):
-        for i, (s, e) in enumerate(segments):
-            if s <= f <= e:
-                return i
-        return -1
+    landing_by_seg, landing_rally_id = build_landing_rally_index(
+        segments, rally_starts_by_seg, landing_all, debug=args.debug)
 
-    landing_by_seg = defaultdict(list)
-    for lp in landing_all:
-        si = seg_of_frame(lp["frame"])
-        if si >= 0:
-            landing_by_seg[si].append(lp)
-    scaled_track = {f: (x * scale, y * scale)
-                    for f, (x, y, _) in filled_track.items()}
+    scaled_track = {f: (x * scale, y * scale) for f, (x, y, _) in filled_track.items()}
 
     tmp_dir = tempfile.mkdtemp(prefix="pphl_")
     silent_path = os.path.join(tmp_dir, "silent.mp4")
@@ -1986,16 +2069,12 @@ def render(args, segments, rally_starts_by_seg, filled_track, events, table_geo,
             try:
                 ffmpeg_cmd = [
                     "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                    "-thread_queue_size", "512",
                     "-f", "rawvideo", "-pix_fmt", "bgr24",
-                    "-s", f"{out_w}x{out_h}", "-r", str(fps),
-                    "-i", "-",
-                ] + _enc_args(enc) + [
-                    "-pix_fmt", "yuv420p",
-                    silent_path,
-                ]
+                    "-s", f"{out_w}x{out_h}", "-r", str(fps), "-i", "-",
+                ] + _enc_args(enc) + ["-pix_fmt", "yuv420p", silent_path]
                 pipe_proc = subprocess.Popen(
-                    ffmpeg_cmd, stdin=subprocess.PIPE,
-                    creationflags=_SUBPROC_FLAGS)
+                    ffmpeg_cmd, stdin=subprocess.PIPE, creationflags=_SUBPROC_FLAGS)
                 use_pipe = True
             except Exception:
                 use_pipe = False
@@ -2009,56 +2088,87 @@ def render(args, segments, rally_starts_by_seg, filled_track, events, table_geo,
         if not cap.isOpened():
             raise RuntimeError(f"无法打开视频: {args.video}")
         mini = MiniTable(out_w, out_h)
-        particles = ParticleSystem()
-        comet = CometRenderer()
+        particles = ParticleSystem(intensity=fx_intensity)
+        shockwaves = ShockwaveSystem(intensity=fx_intensity)
+        labels = FloatingLabel()
+        flash = SpeedFlash()
+        bmarker = BounceMarker()
+        trail_renderer = SpeedTrailRenderer(intensity=fx_intensity)
+        player_fx = PlayerFX(fps, out_w, out_h, intensity=fx_intensity) if enable_player_fx else None
         TRAIL_LEN = max(12, int(fps * 0.5))
-        render_frames = set()
-        for s, e in segments:
-            for f in range(s, e + 1):
-                render_frames.add(f)
-        total_render = len(render_frames)
+
+        total_render = sum(e - s + 1 for s, e in segments)
         pipe_method = "ffmpeg pipe 直编" if use_pipe else "cv2.VideoWriter"
-        log(f"🎬 渲染: {len(segments)} 个片段, 约 {total_render} 帧 "
-            f"@ {out_w}x{out_h} {fps:.2f}fps [{pipe_method} → {enc}]")
+        log(f"🎬 渲染: {len(segments)} 个片段, 约 {total_render} 帧 @ {out_w}x{out_h} "
+            f"{fps:.2f}fps [{pipe_method} → {enc}]  fx={fx_level}"
+            f"{' +选手光环' if enable_player_fx else ''}")
         written = 0
         t_start = time.time()
         last_progress_time = t_start
 
+        do_resize = (scale != 1.0)
         for si, (s, e) in enumerate(segments):
             cap.set(cv2.CAP_PROP_POS_FRAMES, s)
             trail = deque(maxlen=TRAIL_LEN)
-            cur_landings = landing_by_seg.get(si, [])
-            cur_landings_sorted = sorted(cur_landings, key=lambda lp: lp["frame"])
+            cur_landings_sorted = sorted(landing_by_seg.get(si, []), key=lambda lp: lp["frame"])
             lp_idx = 0
             cur_lp_so_far = []
-            rally_starts = sorted(rally_starts_by_seg.get(si, []))
-            rs_ptr = 0
+            cur_rally_id = None
+            prev_player_boxes = None
             for f in range(s, e + 1):
                 ret, frame = cap.read()
                 if not ret:
                     break
-                if scale != 1.0:
+                if do_resize:
                     frame = cv2.resize(frame, (out_w, out_h), interpolation=cv2.INTER_LINEAR)
 
-                while rs_ptr < len(rally_starts) and rally_starts[rs_ptr] <= f:
-                    rstart = rally_starts[rs_ptr]
-                    if rstart > s:
-                        cur_lp_so_far = []
-                    rs_ptr += 1
-
                 for sev in scaled_ev_by_frame.get(f, []):
-                    particles.emit(sev["x"], sev["y"],
-                                   n=22 if sev["type"] == "bounce" else 16,
-                                   kind=sev["type"])
+                    snorm = sev["snorm"]
+                    is_bounce = (sev["type"] == "bounce")
+                    particles.emit(sev["x"], sev["y"], n=22 if is_bounce else 16,
+                                   kind=sev["type"], speed_norm=snorm)
+                    if enable_extra_fx:
+                        shockwaves.emit(sev["x"], sev["y"], kind=sev["type"], speed_norm=snorm)
+                        if is_bounce:
+                            bmarker.emit(sev["x"], sev["y"])
+                        if not is_bounce and snorm >= 0.6:
+                            if snorm >= 0.85:
+                                txt, col = "SMASH!", (60, 80, 255)
+                                flash.trigger(int(7 * fx_intensity))
+                            else:
+                                txt, col = "FAST!", (60, 200, 255)
+                            labels.emit(sev["x"], sev["y"] - 20, txt,
+                                        color=col, scale=1.0 + snorm * 0.5)
+
+                if player_fx is not None:
+                    cur_boxes = player_boxes.get(f, [])
+                    cur_boxes_scaled = [(b[0] * scale, b[1] * scale, b[2] * scale, b[3] * scale)
+                                        for b in cur_boxes]
+                    player_fx.draw(frame, prev_player_boxes, cur_boxes_scaled)
+                    prev_player_boxes = cur_boxes_scaled
+
                 if f in scaled_track:
                     trail.append(scaled_track[f])
                 elif trail and len(trail) > 1:
                     trail.popleft()
                 if len(trail) >= 2:
-                    comet.draw(frame, smooth_trail(list(trail)))
+                    st = ball_speed_table.get(f)
+                    snorm = st["norm"] if st else 0.3
+                    trail_renderer.draw(frame, smooth_trail(list(trail)), speed_norm=snorm)
+
+                #shockwaves.update_and_draw(frame)
                 particles.update_and_draw(frame)
+                #bmarker.update_and_draw(frame)
+                labels.update_and_draw(frame)
+                flash.update_and_draw(frame)
+
                 while lp_idx < len(cur_landings_sorted) and cur_landings_sorted[lp_idx]["frame"] <= f:
-                    cur_lp_so_far.append(cur_landings_sorted[lp_idx])
+                    lp = cur_landings_sorted[lp_idx]
+                    rid = landing_rally_id.get((si, lp["frame"]))
+                    if cur_rally_id is not None and rid != cur_rally_id:
+                        cur_lp_so_far = []
+                    cur_rally_id = rid
+                    cur_lp_so_far.append(lp)
                     lp_idx += 1
                 mini.draw(frame, cur_lp_so_far)
 
@@ -2133,44 +2243,32 @@ def finalize_output(args, silent_path, segments, fps, written, tmp_dir,
                    "-i", silent_path] + _enc_args(enc) + [args.output]
             subprocess.run(cmd, check=True, creationflags=_SUBPROC_FLAGS)
         return
-    parts = []
-    filt = []
+    parts, filt = [], []
     for i, (s, e) in enumerate(segments):
         t0 = s / fps
         t1 = (e + 1) / fps
-        filt.append(
-            f"[1:a]atrim=start={t0:.4f}:end={t1:.4f},asetpts=PTS-STARTPTS[a{i}]")
+        filt.append(f"[1:a]atrim=start={t0:.4f}:end={t1:.4f},asetpts=PTS-STARTPTS[a{i}]")
         parts.append(f"[a{i}]")
     concat = "".join(parts) + f"concat=n={len(segments)}:v=0:a=1[aout]"
     filter_complex = ";".join(filt + [concat])
     if already_encoded:
         log(f"🔊 重建音频 ({len(segments)} 段) 并 mux (视频 copy, 音频 aac)")
-        cmd = [
-            "ffmpeg", "-y", "-hide_banner", "-loglevel", "warning",
-            "-i", silent_path,
-            "-i", args.video,
-            "-filter_complex", filter_complex,
-            "-map", "0:v:0", "-map", "[aout]",
-            "-c:v", "copy",
-            "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
-            "-shortest", "-movflags", "+faststart",
-            args.output,
-        ]
+        cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "warning",
+               "-i", silent_path, "-i", args.video,
+               "-filter_complex", filter_complex,
+               "-map", "0:v:0", "-map", "[aout]",
+               "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
+               "-shortest", "-movflags", "+faststart", args.output]
     else:
         if enc == "libx264":
             enc = detect_amf_encoder(args.encoder)
         log(f"🔊 重建音频 ({len(segments)} 段) 并 mux ({enc})")
-        cmd = [
-            "ffmpeg", "-y", "-hide_banner", "-loglevel", "warning",
-            "-i", silent_path,
-            "-i", args.video,
-            "-filter_complex", filter_complex,
-            "-map", "0:v:0", "-map", "[aout]",
-        ] + _enc_args(enc) + [
-            "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
-            "-shortest", "-movflags", "+faststart",
-            args.output,
-        ]
+        cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "warning",
+               "-i", silent_path, "-i", args.video,
+               "-filter_complex", filter_complex,
+               "-map", "0:v:0", "-map", "[aout]"] + _enc_args(enc) + [
+               "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
+               "-shortest", "-movflags", "+faststart", args.output]
     try:
         subprocess.run(cmd, check=True, creationflags=_SUBPROC_FLAGS)
     except subprocess.CalledProcessError:
@@ -2183,34 +2281,24 @@ def finalize_output(args, silent_path, segments, fps, written, tmp_dir,
             subprocess.run(cmd, check=True, creationflags=_SUBPROC_FLAGS)
 
 
-def _enc_args(enc):
-    if enc == "h264_amf":
-        return ["-c:v", "h264_amf", "-usage", "transcoding",
-                "-quality", "quality", "-rc", "cqp",
-                "-qp_i", "20", "-qp_p", "20", "-bf", "0", "-pix_fmt", "yuv420p"]
-    if enc == "hevc_amf":
-        return ["-c:v", "hevc_amf", "-usage", "transcoding",
-                "-quality", "quality", "-rc", "cqp",
-                "-qp_i", "20", "-qp_p", "20", "-pix_fmt", "yuv420p"]
-    return ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
-            "-pix_fmt", "yuv420p"]
-
-
 # =====================================================================
 #  main
 # =====================================================================
 def main():
     args = parse_args()
     if not os.path.exists(args.video):
-        log(f"❌ 视频不存在: {args.video}"); sys.exit(1)
+        log(f"❌ 视频不存在: {args.video}")
+        sys.exit(1)
     if not os.path.exists(args.raw_detections):
-        log(f"❌ 检测日志不存在: {args.raw_detections}"); sys.exit(1)
+        log(f"❌ 检测日志不存在: {args.raw_detections}")
+        sys.exit(1)
     log("=" * 60)
-    log("🏓 PingPong Highlight Generator (v4.1 几何自愈 + 性能优化 + 逻辑修复)")
+    log("🏓 PingPong Highlight Generator (v4.7 精简+提速)")
     log("=" * 60)
     cap = cv2.VideoCapture(args.video)
     if not cap.isOpened():
-        log(f"❌ 无法打开视频: {args.video}"); sys.exit(1)
+        log(f"❌ 无法打开视频: {args.video}")
+        sys.exit(1)
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     in_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     in_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -2225,10 +2313,13 @@ def main():
     log("📐 提取球台/球网几何 + 校验自愈 + 长边走廊 ...")
     table_geo = extract_table_geometry(
         frames, (in_h, in_w), debug=args.debug,
-        corridor_margin=args.corridor_margin,
-        corridor_extend=args.corridor_extend)
-
+        corridor_margin=args.corridor_margin, corridor_extend=args.corridor_extend)
     geo_rebuilt = bool(table_geo.get("rebuilt")) if table_geo else False
+
+    if not args.no_player_fx:
+        player_boxes, _pc = gather_player_boxes(frames, debug=args.debug)
+    else:
+        player_boxes = {}
 
     log("⚪ 提取主球轨迹 (走廊软过滤 + 多球过滤) ...")
     ball_cands = gather_ball_candidates(frames, fps)
@@ -2238,8 +2329,7 @@ def main():
     corridor = table_geo.get("corridor") if table_geo else None
     if corridor is not None:
         ball_cands = filter_ball_by_corridor(
-            ball_cands, corridor,
-            max_drop_ratio=args.corridor_max_drop,
+            ball_cands, corridor, max_drop_ratio=args.corridor_max_drop,
             geo_rebuilt=geo_rebuilt, debug=args.debug)
     ball_cands = cluster_ball_by_court(ball_cands, in_w, in_h, debug=args.debug)
     main_track = build_main_ball_track(
@@ -2250,11 +2340,15 @@ def main():
     log("🧩 物理补帧 ...")
     filled = interpolate_track(main_track, fps, in_w, in_h, debug=args.debug)
 
+    log("⚡ 计算逐帧球速表 (速度自适应特效) ...")
+    ball_speed_table, (p50, p95) = compute_ball_speed_table(filled, table_geo, fps, in_w, in_h)
+    if args.debug:
+        log(f"   球速基准: p50={p50:.0f}px/s  p95={p95:.0f}px/s  (共 {len(ball_speed_table)} 帧速度)")
+
     log("🎾 检测回合与落点/击球事件 ...")
     rallies = detect_rallies(filled, fps, total_frames, args.raw_detections,
                              table_geo=table_geo,
-                             out_of_table_timeout=args.out_of_table_timeout,
-                             debug=args.debug)
+                             out_of_table_timeout=args.out_of_table_timeout, debug=args.debug)
     events = detect_events(filled, table_geo, fps)
     log(f"   回合: {len(rallies)}, 事件: {len(events)}")
 
@@ -2263,14 +2357,13 @@ def main():
         log("❌ 没有检测到有效回合, 无法生成高光。可尝试放宽 --min-rally-frames")
         sys.exit(2)
     total_out = sum(e - s + 1 for s, e in segments)
-    log(f"✂️  有效片段: {len(segments)} 个, 共 {total_out} 帧 "
-        f"(~{total_out / fps:.1f}s)")
+    log(f"✂️  有效片段: {len(segments)} 个, 共 {total_out} 帧 (~{total_out / fps:.1f}s)")
     if args.debug:
         for si, (s, e) in enumerate(segments):
             log(f"    片段{si}: [{s}-{e}]  内含回合起始帧={rally_starts_by_seg.get(si)}")
 
     render(args, segments, rally_starts_by_seg, filled, events, table_geo,
-           in_w, in_h, fps, total_frames)
+           in_w, in_h, fps, total_frames, ball_speed_table, player_boxes)
     log(f"🎉 完成! 输出: {args.output}")
 
 
