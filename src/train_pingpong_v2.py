@@ -80,7 +80,7 @@ def parse_args():
 
     # 学习率 / 优化器
     parser.add_argument("--lr0", type=float, default=0.005)
-    parser.add_argument("--lrf", type=float, default=0.001,
+    parser.add_argument("--lrf", type=float, default=0.005,
                         help="最终学习率因子（lr_final = lr0 * lrf）")
     parser.add_argument("--optimizer", type=str, default="auto",
                         choices=["auto", "SGD", "AdamW", "Adam", "RMSProp"])

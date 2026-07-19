@@ -11,6 +11,8 @@ python src/train_pingpong_v2.py     --data train_data/all11_split/data.yaml     
 
 python src/train_pingpong_v2.py     --data train_data/all16_split/data.yaml     --pretrained yolo26m-seg.pt    --name all16_ft --epochs 300 --batch 12 --imgsz 960
 
+python src/train_pingpong_v2.py     --data train_data/all18_split/data.yaml     --pretrained yolo26m-seg.pt    --name all18_ft --epochs 300 --batch 16 --imgsz 960
+
 python inference_video.py --video Videos/VID_20260527_214016.mp4 --model runs\all7_ft\weights\last.pt --output inference_output --batch-size 12 --half
 
 
@@ -39,6 +41,12 @@ python src\pingpong_highlight.py `  --video inference_output\pipeline_VID_202606
 python src\pingpong_highlight.py `  --video inference_output\pipeline_VID_20260627_222900\video_cfr.mp4 `  --raw-detections inference_output\pipeline_VID_20260627_222900\raw_detections.jsonl `  --output inference_output\pipeline_VID_20260627_222900\VID_20260627_222900_highlight.mp4 --debug 
 
 python src\pingpong_highlight.py `  --video inference_output\pipeline_VID_20260627_224004\video_cfr.mp4 `  --raw-detections inference_output\pipeline_VID_20260627_224004\raw_detections.jsonl `  --output inference_output\pipeline_VID_20260627_224004\VID_20260627_224004_highlight.mp4 --debug 
+
+python src\pingpong_highlight.py `  --video inference_output\pipeline_VID_20260717_222701\video_cfr.mp4 `  --raw-detections inference_output\pipeline_VID_20260717_222701\raw_detections.jsonl `  --output inference_output\pipeline_VID_20260717_222701\VID_20260717_222701_highlight.mp4 --debug
+
+python src\pingpong_highlight.py `  --video inference_output\pipeline_VID_20260717_224033\video_cfr.mp4 `  --raw-detections inference_output\pipeline_VID_20260717_224033\raw_detections.jsonl `  --output inference_output\pipeline_VID_20260717_224033\VID_20260717_224033_highlight.mp4 --debug
+
+python src\pingpong_highlight.py `  --video inference_output\pipeline_VID_20260717_225817\video_cfr.mp4 `  --raw-detections inference_output\pipeline_VID_20260717_225817\raw_detections.jsonl `  --output inference_output\pipeline_VID_20260717_225817\VID_20260717_225817_highlight.mp4 --debug
 
 inference_video.py是使用yolo26对视频推理的脚本，输出raw_detections.jsonl，包含乒乓球&选手&球拍的矩形框和球台&球网的多边形边界框；
 pingpong_highlight.py是根据raw_detections.jsonl的数据，对视频进行自动渲染和剪辑的脚本，现在已完成自动剪辑以及残影渲染，水花特效等工作；

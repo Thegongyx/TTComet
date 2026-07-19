@@ -82,6 +82,8 @@ def parse_args():
     p.add_argument("--corridor-extend", type=float, default=1.2, help="走廊沿长轴向短边外延伸倍数")
     p.add_argument("--out-of-table-timeout", type=float, default=1.0, help="持续出走廊该秒数则回合结束")
     p.add_argument("--corridor-max-drop", type=float, default=0.55, help="走廊过滤单次剔除比例上限")
+    p.add_argument("--ball-conf", type=float, default=0.5,
+                   help="乒乓球检测最小置信度, 低于该值的球候选在收集阶段直接丢弃")
     p.add_argument("--no-audio", action="store_true", help="不保留原声")
     p.add_argument("--encoder", default="auto",
                    choices=["auto", "libx264", "h264_amf", "hevc_amf"],
@@ -254,18 +256,48 @@ def order_quad(quad):
     return q.astype(np.float32)
 
 
-def _get_polygon_pts_single(fr, target_class, conf_min=0.5):
-    pts = []
+def _get_polygon_pts_single(fr, target_class, conf_min=0.5, img_hw=None):
+    """
+    取单帧中指定类别的多边形顶点。
+
+    若同一帧识别到多个同类实例（例如多个球台 / 多条球网），
+    按各实例几何中心离画面中心最近的原则挑选单个实例返回，
+    避免把多个实例的顶点混成一坨导致拟合畸形。
+    """
+    insts = []
     for det in fr.get("detections", []):
         if det["class"] != target_class or det.get("confidence", 0) < conf_min:
             continue
         poly = det.get("polygon")
-        if poly:
-            pts.extend(poly)
+        if poly and len(poly) >= 4:
+            insts.append(np.array(poly, dtype=np.float32))
         else:
             b = det["bbox"]
-            pts.extend([[b[0], b[1]], [b[2], b[1]], [b[2], b[3]], [b[0], b[3]]])
-    return np.array(pts, dtype=np.float32) if pts else None
+            insts.append(np.array(
+                [[b[0], b[1]], [b[2], b[1]], [b[2], b[3]], [b[0], b[3]]],
+                dtype=np.float32))
+
+    if not insts:
+        return None
+    if len(insts) == 1:
+        return insts[0]
+
+    # 多实例：选离画面中心最近的那个
+    if img_hw is not None:
+        h, w = img_hw
+        cx, cy = w * 0.5, h * 0.5
+    else:
+        # 退化：以所有点的包围盒中心近似画面中心
+        all_pts = np.concatenate(insts, axis=0)
+        cx, cy = all_pts[:, 0].mean(), all_pts[:, 1].mean()
+
+    best_idx, best_dist = 0, float("inf")
+    for i, poly in enumerate(insts):
+        icx, icy = poly[:, 0].mean(), poly[:, 1].mean()
+        d = math.hypot(icx - cx, icy - cy)
+        if d < best_dist:
+            best_dist, best_idx = d, i
+    return insts[best_idx]
 
 
 def _fit_quad_single(pts):
@@ -560,7 +592,7 @@ def extract_table_geometry(frames, img_hw, debug=False, persp_blend=0.5,
     sample_frames = frames[::10]
     all_table_pts, table_quads = [], []
     for fr in sample_frames:
-        pts = _get_polygon_pts_single(fr, "table", conf_min=0.5)
+        pts = _get_polygon_pts_single(fr, "table", conf_min=0.5, img_hw=img_hw)
         if pts is not None and len(pts) >= 4:
             all_table_pts.append(pts)
             quad = _fit_quad_single(pts)
@@ -579,7 +611,7 @@ def extract_table_geometry(frames, img_hw, debug=False, persp_blend=0.5,
 
     net_lines = []
     for fr in sample_frames:
-        pts = _get_polygon_pts_single(fr, "net", conf_min=0.5)
+        pts = _get_polygon_pts_single(fr, "net", conf_min=0.5, img_hw=img_hw)
         if pts is not None and len(pts) >= 2:
             line = _fit_net_line_single(pts)
             if line is not None:
@@ -751,12 +783,14 @@ def img_to_table(H_or_geo, pt):
 # =====================================================================
 #  3) 球检测整理 + 错误球过滤
 # =====================================================================
-def gather_ball_candidates(frames, fps):
+def gather_ball_candidates(frames, fps, conf_min=0.35):
     out = []
     for fr in frames:
         cands = []
         for det in fr.get("detections", []):
             if det["class"] != "pingpangball":
+                continue
+            if det.get("confidence", 0.0) < conf_min:
                 continue
             b = det["bbox"]
             cx, cy = bbox_center(b)
@@ -2322,7 +2356,7 @@ def main():
         player_boxes = {}
 
     log("⚪ 提取主球轨迹 (走廊软过滤 + 多球过滤) ...")
-    ball_cands = gather_ball_candidates(frames, fps)
+    ball_cands = gather_ball_candidates(frames, fps, conf_min=args.ball_conf)
     ball_cands = filter_static_ball_candidates(
         ball_cands, fps, in_w, in_h,
         min_static_count=args.min_static_ball_count, debug=args.debug)
