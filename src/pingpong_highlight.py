@@ -1626,7 +1626,7 @@ def build_landing_rally_index(segments, rally_starts_by_seg, landing_all, debug=
 #  6) 剪辑片段计算
 # =====================================================================
 def build_segments(rallies, fps, total_frames, args):
-    min_frames = args.min_rally_frames or int(fps * 0.6)
+    min_frames = args.min_rally_frames or int(fps * 3)
     pre = int(args.pre_buffer * fps)
     post = int(args.post_buffer * fps)
     merge_gap = int(args.merge_gap * fps)
