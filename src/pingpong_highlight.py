@@ -16,6 +16,9 @@ v4.7 在 v4.6 基础上的改动 (功能/画质不变, 仅精简与提速):
   ★ 其余几何自愈 / 走廊 / 落点交替过滤 / 速度自适应特效行为完全保留。
 
 v4.6 特效 (脚下光环 / 高透明白色落点圈 / 更淡拖尾 / 按回合重置落点) 全保留。
+
+本次移植跟踪版已验证的高球 (lob) 修复: 走廊顶部开放 (open_top) +
+out-of-table-timeout 默认放宽至 2.0s。
 """
 
 import os
@@ -80,7 +83,8 @@ def parse_args():
     p.add_argument("--merge-gap", type=float, default=2.0, help="相邻回合间隔小于该秒数则合并")
     p.add_argument("--corridor-margin", type=float, default=0.5, help="长边走廊横向容差")
     p.add_argument("--corridor-extend", type=float, default=1.2, help="走廊沿长轴向短边外延伸倍数")
-    p.add_argument("--out-of-table-timeout", type=float, default=1.0, help="持续出走廊该秒数则回合结束")
+    p.add_argument("--out-of-table-timeout", type=float, default=2.0,
+                   help="持续出走廊该秒数则回合结束 (默认 2.0, 放宽以容忍放高球滞空时间)")
     p.add_argument("--corridor-max-drop", type=float, default=0.55, help="走廊过滤单次剔除比例上限")
     p.add_argument("--ball-conf", type=float, default=0.5,
                    help="乒乓球检测最小置信度, 低于该值的球候选在收集阶段直接丢弃")
@@ -545,7 +549,8 @@ def validate_and_refine_quad(quad, table_pts, net_line, img_hw, debug=False):
 #  长边走廊
 # =====================================================================
 def build_corridor(far_left, far_right, near_left, near_right,
-                   corridor_margin=0.45, corridor_extend=1.2, img_hw=None, debug=False):
+                   corridor_margin=0.45, corridor_extend=1.2, img_hw=None,
+                   open_top=True, debug=False):
     fl = np.array(far_left, dtype=np.float64)
     fr = np.array(far_right, dtype=np.float64)
     nl = np.array(near_left, dtype=np.float64)
@@ -572,10 +577,28 @@ def build_corridor(far_left, far_right, near_left, near_right,
     near_left_ext -= side_dir * margin_px
     far_right_ext += side_dir * margin_px
     near_right_ext += side_dir * margin_px
+    # 顶部开放: 沿走廊两侧斜边的射线 (near_ext → far_ext) 延长/回缩到 y=-10
+    # (略高于画面顶, 避免边界浮点问题), 保持侧边斜率不变, 覆盖放高球 (lob)
+    # 飞出走廊上边界的场景; 射线几乎水平时退化为直接钳 Y, 避免除零
+    top_y = -10.0
+    if open_top:
+        for near_pt, far_pt in ((near_left_ext, far_left_ext),
+                                (near_right_ext, far_right_ext)):
+            d = far_pt - near_pt
+            if abs(d[1]) < 1e-6:
+                far_pt[1] = top_y          # 射线几乎水平 → 直接钳 Y
+            else:
+                t = (top_y - near_pt[1]) / d[1]
+                if t > 0:
+                    far_pt[0] = near_pt[0] + d[0] * t
+                    far_pt[1] = top_y      # 沿射线求与 y=top_y 的交点
+                else:
+                    far_pt[1] = top_y      # 射线朝下 (几何异常) → 兜底钳 Y
     corridor = np.array([far_left_ext, far_right_ext, near_right_ext, near_left_ext],
                         dtype=np.float32)
     if debug:
-        log(f"  ◆ 长边走廊: 横向容差={margin_px:.0f}px, 纵向延伸={ext:.0f}px")
+        top_note = f", 顶部开放(远端钳至 y={top_y:.0f})" if open_top else ""
+        log(f"  ◆ 长边走廊: 横向容差={margin_px:.0f}px, 纵向延伸={ext:.0f}px{top_note}")
     return corridor
 
 
