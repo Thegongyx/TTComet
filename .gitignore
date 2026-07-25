@@ -43,6 +43,7 @@ Videos/
 Thumbs.db
 desktop.ini
 
-# IDE
+# IDE / 工具
 .vscode/
 .idea/
+.qoder/
