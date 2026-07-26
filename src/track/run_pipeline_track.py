@@ -289,6 +289,8 @@ def _process_one_video(args, python_cmd, has_ffmpeg, video_index=None, video_tot
         # 跟踪参数透传 (TRACK MODE 新增)
         if args.tracker is not None:
             infer_cmd += ["--tracker", args.tracker]
+        if args.gmc_method is not None:
+            infer_cmd += ["--gmc-method", args.gmc_method]
         if args.track_buffer is not None:
             infer_cmd += ["--track-buffer", str(args.track_buffer)]
         if args.track_high_thresh is not None:
@@ -467,8 +469,13 @@ def main():
 
     # === 跟踪参数 (传给 inference_video_track.py, 默认 None 表示不透传, 由下游脚本用自身默认值) ===
     parser.add_argument("--tracker", default=None,
-                        choices=["botsort", "bytetrack"],
-                        help="跟踪器类型 (下游默认 botsort)")
+                        choices=["bytetrack", "botsort"],
+                        help="跟踪器类型 (下游默认 bytetrack, 轻量快速; botsort 功能更全但更慢)")
+    parser.add_argument("--gmc-method", default=None,
+                        choices=["none", "sparseOptFlow", "orb", "sift", "ecc"],
+                        help="botsort 的全局运动补偿方法 (下游默认 none=关闭; "
+                             "如需旧版默认行为请显式指定 --gmc-method sparseOptFlow; "
+                             "sparseOptFlow 为纯 CPU 光流, 会显著拖慢推理)")
     parser.add_argument("--track-buffer", type=int, default=None,
                         help="轨迹丢失后保留帧数 (下游默认 45)")
     parser.add_argument("--track-high-thresh", type=float, default=None,
@@ -629,6 +636,8 @@ def main():
         # 跟踪参数透传 (TRACK MODE 新增, 与单视频推理保持一致)
         if args.tracker is not None:
             batch_infer_cmd += ["--tracker", args.tracker]
+        if args.gmc_method is not None:
+            batch_infer_cmd += ["--gmc-method", args.gmc_method]
         if args.track_buffer is not None:
             batch_infer_cmd += ["--track-buffer", str(args.track_buffer)]
         if args.track_high_thresh is not None:

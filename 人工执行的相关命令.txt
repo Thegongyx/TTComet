@@ -15,6 +15,10 @@ python src/train_pingpong_v2.py     --data train_data/all18_split/data.yaml     
 
 python inference_video.py --video Videos/VID_20260527_214016.mp4 --model runs\all7_ft\weights\last.pt --output inference_output --batch-size 12 --half
 
+python src/train_pingpong_v2.py     --data train_data/all19_split/data.yaml     --pretrained models\m960n.pt    --name all19_ft --epochs 200 --batch 12 --lr0 0.00005
+
+python src/train_pingpong_v2.py     --data train_data/all19_split/data.yaml     --pretrained yolo26m-seg.pt    --name all19_ft --epochs 300 --batch 16 --imgsz 960
+
 
 
 这个文件/home/gongy/yolo26_frames/inference_output/detection_log.json 是 /home/gongy/yolo26_frames/inference_output/video_cfr.mp4 这个视频的学习后的结果，你能找到20帧 上一帧有球，下一帧也有球，只有当前帧没有球的帧，帮我抽出来20张这么样的帧图片，我要标注并重新用来训练，，，这个重视频里抽图片的脚本，你在/home/gongy/yolo26_frames/文件夹下新创建一个项目文件用来存储

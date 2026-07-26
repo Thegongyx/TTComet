@@ -1,7 +1,7 @@
 # PROJECT KNOWLEDGE BASE
 
 **Generated:** 2025-06-19
-**No git repo** — data+scripts workbench
+**Git 仓库** — 使用 git 版本控制
 
 ## ENVIRONMENT
 - **Shell**: PowerShell（Windows 原生）。所有命令使用 PowerShell 语法：换行符用 `` ` ``（反引号），不用 `^` 或 `\`。
@@ -19,20 +19,39 @@ YOLO 视频帧提取、推理与模型微调工具集。从检测日志中抽帧
 │   ├── extract_rejected_ball_frames.py  #   错误球帧收集（标注负样本）
 │   ├── random_sample_frames.py          #   通用随机抽帧（支持无日志模式）
 │   ├── inference_video.py              #   YOLO 逐帧推理 → 检测日志 + 可视化视频
+│   ├── inference_video_track.py        #   YOLO 逐帧推理（track 追踪模式）
 │   ├── pingpong_highlight.py           #   高光特效剪辑（球轨迹 + 彗尾 + 迷你球台）
+│   ├── pingpong_highlight_track.py     #   高光特效剪辑（track 追踪模式）
 │   ├── run_pipeline.py                 #   一键流水线: 推理 → 高光 (串联上述两个)
+│   ├── run_pipeline_track.py           #   一键流水线（track 追踪模式）
+│   ├── convert_yolo_to_labelstudio.py  #   YOLO 标注转 Label Studio 格式
 │   ├── train_pingpong_v2.py            #   YOLO 分割训练启动（bbox→polygon 转换）
 │   └── split_all1.py                   #   数据集拆分 train/val
+├── src_yls/                             # Label Studio ML 后端
+│   ├── model.py                         #   ML 后端模型入口
+│   ├── control_models/                  #   控制模型实现
+│   ├── utils/                           #   工具函数
+│   ├── cli.py                           #   CLI 入口
+│   ├── start.py                         #   启动脚本
+│   └── requirements.txt                 #   依赖清单
+├── models/                              # 自定义训练权重
+│   ├── m960n.pt                         #   自定义模型权重
+│   └── m960nold.pt                      #   旧版自定义模型权重
 ├── yolo26x-seg.pt                       # YOLO 分割预训练权重 (26M params)
+├── yolo26l-seg.pt                       # YOLO large 分割预训练权重
+├── yolo26m-seg.pt                       # YOLO medium 分割预训练权重
+├── yolo26s-seg.pt                       # YOLO small 分割预训练权重
 ├── yolo26n.pt                           # YOLO nano 预训练权重
 ├── train_data/                          # 标注数据集 (images/ + labels/ + data.yaml)
-│   ├── all9/                            #   6 类全量数据集 (最新版本)
-│   └── all9_split/                      #   同上, 已拆分 80/20 train/val
+│   ├── all18/                           #   全量数据集 (最新版本)
+│   ├── all18_split/                     #   同上, 已拆分 80/20 train/val
+│   └── all17_split/                     #   历史版本, 已拆分
 ├── runs/                                # 训练输出 (weights, metrics, plots)
 ├── Videos/                              # 原始输入视频
 ├── random_frames/                       # 输出: random_sample_frames.py 抽帧结果
-├── rejected_ball_frames/                # 输出: extract_rejected_ball_frames.py 结果
+├── missing_ball_frames/                 # 输出: extract_missing_ball.py 漏检帧结果
 ├── inference_output/                    # 输出: inference_video.py 推理结果
+├── tmp/                                 # 临时文件（脚本自动创建）
 ├── old/                                 # 归档旧版本文件
 └── .omo/                                # 规划文件 (内部使用)
 ```
@@ -48,6 +67,11 @@ YOLO 视频帧提取、推理与模型微调工具集。从检测日志中抽帧
 | 一键流水线（推理+高光） | `src/run_pipeline.py` | 最少只需 `--video`；支持批量目录模式 |
 | YOLO 分割模型训练 | `src/train_pingpong_v2.py` | bbox→polygon 自动转换, best_class AP/mAP50 双追踪 |
 | 数据集拆分 train/val | `src/split_all1.py` | `--src` / `--dst` CLI 参数 |
+| YOLO→Label Studio 转换 | `src/convert_yolo_to_labelstudio.py` | YOLO 标注格式转 Label Studio |
+| Track 逐帧推理 | `src/inference_video_track.py` | 带目标追踪的推理模式 |
+| Track 高光剪辑 | `src/pingpong_highlight_track.py` | 带目标追踪的高光模式 |
+| Track 一键流水线 | `src/run_pipeline_track.py` | track 模式推理+高光 |
+| Label Studio ML 后端 | `src_yls/model.py` | Label Studio 集成，`src_yls/start.py` 启动 |
 | 查找训练结果 | `runs/<name>/weights/best.pt` | 同时保存 best_class_*_ap.pt 和 best_class_*_map50.pt |
 | 训练配置 | `train_data/*/data.yaml` | nc, names, path 字段 |
 
@@ -118,11 +142,11 @@ conda run -n yolo26 python src/run_pipeline.py `
 
 # 数据集拆分 80/20
 conda run -n yolo26 python src/split_all1.py `
-    --src train_data/all9 --dst train_data/all9_split
+    --src train_data/all18 --dst train_data/all18_split
 
 # YOLO 分割训练
 conda run -n yolo26 python src/train_pingpong_v2.py `
-    --data train_data/all9_split/data.yaml `
+    --data train_data/all18_split/data.yaml `
     --pretrained yolo26x-seg.pt `
     --name my_run --epochs 100 --batch 4
 ```
@@ -130,7 +154,7 @@ conda run -n yolo26 python src/train_pingpong_v2.py `
 ## NOTES
 - **GPU**: AMD Radeon via ROCm (`device: "0"` in ultralytics) 或 NVIDIA CUDA 均可，ultralytics 自动检测
 - **Python 命令**: Windows 用 `python`，WSL/Linux 用 `python3`
-- **Pre-trained weights**: `yolo26x-seg.pt` (26M params, segmentation) 和 `yolo26n.pt` (nano) 在项目根目录
+- **Pre-trained weights**: `yolo26x-seg.pt` (26M params, segmentation)、`yolo26l-seg.pt`、`yolo26m-seg.pt`、`yolo26s-seg.pt` 和 `yolo26n.pt` (nano) 在项目根目录；`models/` 下有自定义训练权重 `m960n.pt`
 - **Label format is mixed**: some files are polygon (9 values), some are bbox (5 values) — `train_pingpong_v2.py` auto-converts bbox→polygon before training
 - **OOM workaround**: reduce `--batch` (default 4) if GPU runs out of memory
 - **mAP@50-95 >0.60** is target for production models

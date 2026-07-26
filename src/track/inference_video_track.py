@@ -6,7 +6,10 @@ PingPong Video Inference v7-TRACK — 跟踪版 (TRACK MODE)
   - 使用 model.track() 逐帧推理 (persist=True), 输出稳定的跟踪 ID
   - JSONL 每个 detection 对象新增字段 "track_id": int (≥0 为跟踪 ID, 无跟踪时 -1)
   - 新增 CLI 跟踪参数: --tracker / --track-buffer / --track-high-thresh /
-    --track-low-thresh / --new-track-thresh / --match-thresh
+    --track-low-thresh / --new-track-thresh / --match-thresh / --gmc-method
+  - [性能] 默认跟踪器为 bytetrack (无 GMC/无 ReID, CPU 开销最小);
+    选 botsort 时 GMC 默认关闭 (sparseOptFlow 为纯 CPU 光流, 每帧 30-68ms,
+    GPU 空转等待), 需要相机运动补偿时用 --gmc-method sparseOptFlow 显式开启
   - 新增 build_tracker_yaml(): 基于 ultralytics 内置模板生成运行时 tracker yaml
   - 新增 reset_tracker(): 每个视频开始前重置跟踪器状态, 避免跨视频 ID 串联
   - 删除尾批零帧 padding 逻辑 (跟踪需要时序连续, 逐帧推理无需固定 batch shape)
@@ -182,9 +185,15 @@ def parse_args():
     parser.add_argument("--max-det", type=int, default=300,
                         help="单帧最大检测数（NMS-free 模式硬上限 300；乒乓球场景目标少，默认 300 足够）")
     # [TRACK MODE] 跟踪参数
-    parser.add_argument("--tracker", type=str, default="botsort",
-                        choices=["botsort", "bytetrack"],
-                        help="跟踪器类型: botsort (默认, 带相机运动补偿) 或 bytetrack")
+    parser.add_argument("--tracker", type=str, default="bytetrack",
+                        choices=["bytetrack", "botsort"],
+                        help="跟踪器类型 (默认 bytetrack: 无 GMC/无 ReID, 匹配轻量, GPU 利用率高; "
+                             "botsort 功能更全但 CPU 匹配开销更大)")
+    parser.add_argument("--gmc-method", type=str, default="none",
+                        choices=["none", "sparseOptFlow", "orb", "sift", "ecc"],
+                        help="botsort 的全局运动补偿 (GMC) 方法, 仅 --tracker botsort 时生效. "
+                             "默认 none=关闭; sparseOptFlow 为纯 CPU 光流, 每帧约 30-68ms, "
+                             "会显著拖慢推理 (GPU 空转等待), 仅在相机大幅移动场景需要时开启")
     parser.add_argument("--track-buffer", type=int, default=45,
                         help="轨迹丢失后保留的帧数缓冲 (默认 45)")
     parser.add_argument("--track-high-thresh", type=float, default=0.45,
@@ -891,8 +900,13 @@ def build_tracker_yaml(args):
                 "appearance_thresh": 0.25,
                 "with_reid": False,
             })
-    # 覆写用户指定的跟踪阈值 (botsort 模板中其余字段如 gmc_method 保留原值)
+    # 覆写用户指定的跟踪阈值
     cfg["tracker_type"] = args.tracker
+    # [性能] botsort 的 GMC 由 --gmc-method 控制, 默认 none=关闭:
+    # 模板默认 sparseOptFlow 是纯 CPU 光流 (每帧 30-68ms), 会让 GPU 空转等待。
+    # "none" 是本地 ultralytics gmc.py 认可的关闭写法 (none/None 均可)
+    if args.tracker == "botsort":
+        cfg["gmc_method"] = args.gmc_method
     cfg["track_buffer"] = int(args.track_buffer)
     cfg["track_high_thresh"] = float(args.track_high_thresh)
     cfg["track_low_thresh"] = float(args.track_low_thresh)
@@ -1009,10 +1023,18 @@ def process_one_video(video_path, args, ctx, output_dir=None):
         else:
             print(f"\n🚀 开始推理 (总帧数未知), batch={ctx.BATCH_SIZE}, "
                   f"half={ctx.use_half}, imgsz={ctx.IMGSZ}")
-        # [TRACK MODE] 启动横幅: 打印当前跟踪参数
-        print(f"[TRACK MODE] tracker={args.tracker} buffer={args.track_buffer} "
+        # [TRACK MODE] 启动横幅: 打印当前跟踪参数 (botsort 额外显示 GMC 方法)
+        _gmc_info = f" gmc={args.gmc_method}" if args.tracker == "botsort" else ""
+        print(f"[TRACK MODE] tracker={args.tracker}{_gmc_info} buffer={args.track_buffer} "
               f"high={args.track_high_thresh} low={args.track_low_thresh} "
               f"new={args.new_track_thresh} match={args.match_thresh}")
+        # [TRACK MODE] botsort 且 GMC 关闭时的一次性兼容提示 (批量多视频只打印一次)
+        if args.tracker == "botsort" and args.gmc_method == "none" \
+           and not getattr(process_one_video, "_gmc_hint_shown", False):
+            process_one_video._gmc_hint_shown = True
+            print("⚠️ 注意: 当前 botsort 已默认关闭 GMC (gmc_method=none)。"
+                  "如需恢复旧版相机运动补偿行为, 请显式加 --gmc-method sparseOptFlow "
+                  "(纯 CPU 光流, 会显著拖慢推理)")
         # [TRACK MODE] 开始逐帧推理前重置跟踪器, 避免跨视频轨迹 ID 串联
         reset_tracker(ctx.model)
         frame_idx = 0
