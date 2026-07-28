@@ -1,8 +1,22 @@
 #!/usr/bin/env python3
 """
-pingpong_highlight.py  (优化版 v4.7 - 精简 + 提速)
+pingpong_highlight.py  (优化版 v4.8 - 精彩回合前置 + 提速)
 =====================================================================
 乒乓球比赛 → 自动特效精华集锦
+
+v4.8 在 v4.7 基础上的改动:
+  ★ 前置精彩回合功能完善:
+    - 合并前回合时长 > --highlight-min-duration (默认 10s) 的回合参与排序
+    - 按平均球速 (px/s) 降序取前 --highlight-top-n (默认 7) 个回合
+    - 复制一份放到视频最前面, 用 --highlight-black-gap (默认 1s) 黑幕隔开
+    - 新增 --no-highlight-prepend 可关闭该功能
+  ★ _pick_top_speed_segments 效率优化:
+    - 将 ball_speed_table 预展平为 numpy 数组 (按帧号索引)
+    - 每个回合用切片 + 布尔掩码一次性求均值, 替代逐帧 dict.get 循环
+    - 对数千帧的回合列表, 球速计算从 O(n*python_loop) 降为 O(n*numpy_slice)
+  ★ 修复前置片段渲染中落点追踪 bug:
+    - rid 从硬编码 None 改为 prepend_landing_rally_id 查表
+    - 修复前置片段内多回合落点不会正确重置的问题
 
 v4.7 在 v4.6 基础上的改动 (功能/画质不变, 仅精简与提速):
   ★ 渲染热路径去除整帧 frame.copy(): PlayerFX 光环 / 球头辉光改为仅在
@@ -98,6 +112,14 @@ def parse_args():
     p.add_argument("--fx-level", default="normal", choices=["minimal", "normal", "max"],
                    help="特效强度")
     p.add_argument("--no-player-fx", action="store_true", help="关闭选手移动特效 (脚下光环)")
+    p.add_argument("--highlight-top-n", type=int, default=7,
+                   help="前置精彩回合数量 (按平均球速降序取前 N 个, 默认 7)")
+    p.add_argument("--highlight-min-duration", type=float, default=7.0,
+                   help="前置精彩回合的最小合并前时长 (秒, 默认 7.0)")
+    p.add_argument("--highlight-black-gap", type=float, default=1.0,
+                   help="前置精彩回合与全顺序视频之间的黑幕间隔 (秒, 默认 1.0)")
+    p.add_argument("--no-highlight-prepend", action="store_true",
+                   help="关闭前置精彩回合功能 (只输出全顺序视频)")
     p.add_argument("--debug", action="store_true", help="输出调试信息")
     return p.parse_args()
 
@@ -1213,7 +1235,14 @@ def interpolate_track(main_track, fps, frame_w, frame_h, debug=False):
             deg = min(2, len(wf) - 1)
             try:
                 px = np.polyfit(wf, wx, deg)
-                py = np.polyfit(wf, wy, deg)
+                # y: 二次项系数必须为正 (图像坐标系 y 轴向下, 重力使轨迹开口向上)
+                if deg == 2 and len(wf) >= 3:
+                    py = np.polyfit(wf, wy, 2)
+                    if py[0] <= 0:  # 开口向下或平直 → 反重力, 回退线性
+                        py = np.polyfit([f0, f1],
+                                        [main_track[f0][1], main_track[f1][1]], 1)
+                else:
+                    py = np.polyfit(wf, wy, deg)
             except Exception:
                 px = np.polyfit([f0, f1], [main_track[f0][0], main_track[f1][0]], 1)
                 py = np.polyfit([f0, f1], [main_track[f0][1], main_track[f1][1]], 1)
@@ -1676,6 +1705,65 @@ def build_segments(rallies, fps, total_frames, args):
     return segments, rally_starts_by_seg
 
 
+def _pick_top_speed_segments(rallies, ball_speed_table, fps, total_frames,
+                              top_n=7, min_duration=10.0,
+                              pre_buffer=0.5, post_buffer=1.5):
+    """筛选合并前时长 > min_duration 的回合, 按平均球速降序取 top_n, 返回片段列表 + rally_starts_by_seg。
+
+    效率优化: 将 ball_speed_table 预展平为 numpy 数组 (按帧号索引),
+    每个回合用切片 + 布尔掩码一次性求均值, 避免逐帧 dict.get + 字段访问的 Python 循环开销。
+    """
+    valid = [r for r in rallies if r.get("duration", 0) >= min_duration]
+    if not valid:
+        return [], {}
+
+    # 预展平 ball_speed_table → numpy 数组 (按帧号索引, 缺失帧为 0)
+    if ball_speed_table:
+        max_f = max(ball_speed_table.keys()) + 1
+        px_s_arr = np.zeros(max_f, dtype=np.float64)
+        for f, st in ball_speed_table.items():
+            v = st.get("px_s")
+            if v and v > 0:
+                px_s_arr[f] = v
+    else:
+        px_s_arr = np.zeros(0, dtype=np.float64)
+
+    rally_speeds = []
+    arr_len = px_s_arr.shape[0]
+    for r in valid:
+        s = r["start_frame"]
+        e = min(r["end_frame"] + 1, arr_len)
+        if s >= arr_len or e <= s:
+            rally_speeds.append((0.0, r))
+            continue
+        slice_sp = px_s_arr[s:e]
+        # 仅对非零帧求均值 (零帧 = 无速度数据)
+        mask = slice_sp > 0
+        if mask.any():
+            avg_sp = float(slice_sp[mask].mean())
+        else:
+            avg_sp = 0.0
+        rally_speeds.append((avg_sp, r))
+
+    rally_speeds.sort(key=lambda x: x[0], reverse=True)
+    top = rally_speeds[:top_n]
+    pre = int(pre_buffer * fps)
+    post = int(post_buffer * fps)
+    segments = []
+    rally_starts_by_seg = {}
+    for si, (sp, r) in enumerate(top):
+        bs = max(0, r["start_frame"] - pre)
+        be = min(total_frames - 1, r["end_frame"] + post)
+        segments.append((int(bs), int(be)))
+        rally_starts_by_seg[si] = [r["start_frame"]]
+    n_above = len(valid)
+    avg_top = [sp for sp, _ in top]
+    if avg_top:
+        log(f"🎯 前置精彩回合: {len(rallies)}回合中{n_above}个>={min_duration}s, "
+            f"球速排序取top{len(top)}, 速度{min(avg_top):.0f}~{max(avg_top):.0f} px/s")
+    return segments, rally_starts_by_seg
+
+
 # =====================================================================
 #  7) 渲染 — 特效系统
 # =====================================================================
@@ -2067,7 +2155,9 @@ def smooth_trail(points):
 
 
 def render(args, segments, rally_starts_by_seg, filled_track, events, table_geo,
-           in_w, in_h, fps, total_frames, ball_speed_table, player_boxes):
+           in_w, in_h, fps, total_frames, ball_speed_table, player_boxes,
+           prepend_segments=None, prepend_rally_starts_by_seg=None,
+           black_gap_sec=1.0):
     out_h = args.output_height or in_h
     out_w = int(round(in_w * out_h / in_h))
     if out_w % 2:
@@ -2154,7 +2244,36 @@ def render(args, segments, rally_starts_by_seg, filled_track, events, table_geo,
         player_fx = PlayerFX(fps, out_w, out_h, intensity=fx_intensity) if enable_player_fx else None
         TRAIL_LEN = max(12, int(fps * 0.5))
 
-        total_render = sum(e - s + 1 for s, e in segments)
+        prepend_frame_count = sum(e - ps + 1 for ps, e in (prepend_segments or []))
+        black_frame_count = int(round(fps * black_gap_sec)) if prepend_segments else 0
+        total_render = (prepend_frame_count + black_frame_count +
+                        sum(e - s + 1 for s, e in segments))
+
+        # ---- 淡入淡出参数 ----
+        fade_duration = 0.3  # 淡入淡出时长（秒）
+        fade_frames = int(round(fps * fade_duration))
+        main_start = prepend_frame_count + black_frame_count
+        black_img = np.zeros((out_h, out_w, 3), dtype=np.uint8)
+
+        def _apply_fade(frame, fidx):
+            """对帧应用淡入淡出 (in-place), fidx 为 0-based 全局帧序号。"""
+            if total_render <= fade_frames * 2:
+                return
+            alpha = 1.0
+            if fidx < fade_frames:
+                # ① 开头淡入
+                alpha = fidx / fade_frames
+            elif prepend_segments and prepend_frame_count - fade_frames <= fidx < prepend_frame_count:
+                # ② 前置→黑幕 淡出
+                alpha = (prepend_frame_count - fidx) / fade_frames
+            elif prepend_segments and main_start <= fidx < main_start + fade_frames:
+                # ③ 黑幕→主视频 淡入
+                alpha = (fidx - main_start) / fade_frames
+            elif fidx >= total_render - fade_frames:
+                # ④ 末尾淡出
+                alpha = (total_render - fidx) / fade_frames
+            if alpha < 1.0:
+                cv2.addWeighted(frame, alpha, black_img, 1.0 - alpha, 0, dst=frame)
         pipe_method = "ffmpeg pipe 直编" if use_pipe else "cv2.VideoWriter"
         log(f"🎬 渲染: {len(segments)} 个片段, 约 {total_render} 帧 @ {out_w}x{out_h} "
             f"{fps:.2f}fps [{pipe_method} → {enc}]  fx={fx_level}"
@@ -2164,6 +2283,123 @@ def render(args, segments, rally_starts_by_seg, filled_track, events, table_geo,
         last_progress_time = t_start
 
         do_resize = (scale != 1.0)
+
+        # — 前置精彩回合 (球速最快) —
+        if prepend_segments:
+            # 为前置片段构建落点索引 (同时保留 rally_id 以正确重置回合内落点)
+            prepend_landing_by_seg, prepend_landing_rally_id = build_landing_rally_index(
+                prepend_segments, prepend_rally_starts_by_seg or {},
+                landing_all, debug=False)
+            log(f"🎬 渲染前置精彩回合: {len(prepend_segments)} 段")
+            for psi, (ps, pe) in enumerate(prepend_segments):
+                cap.set(cv2.CAP_PROP_POS_FRAMES, ps)
+                trail = deque(maxlen=TRAIL_LEN)
+                cur_landings = sorted(prepend_landing_by_seg.get(psi, []),
+                                      key=lambda lp: lp["frame"])
+                lp_idx = 0
+                cur_lp_so_far = []
+                cur_rally_id = None
+                prev_player_boxes = None
+                for f in range(ps, pe + 1):
+                    ret, frame = cap.read()
+                    if not ret:
+                        break
+                    if do_resize:
+                        frame = cv2.resize(frame, (out_w, out_h),
+                                           interpolation=cv2.INTER_LINEAR)
+                    for sev in scaled_ev_by_frame.get(f, []):
+                        snorm = sev["snorm"]
+                        is_bounce = (sev["type"] == "bounce")
+                        particles.emit(sev["x"], sev["y"],
+                                       n=22 if is_bounce else 16,
+                                       kind=sev["type"], speed_norm=snorm)
+                        if enable_extra_fx:
+                            shockwaves.emit(sev["x"], sev["y"],
+                                            kind=sev["type"], speed_norm=snorm)
+                            if is_bounce:
+                                bmarker.emit(sev["x"], sev["y"])
+                            if not is_bounce and snorm >= 0.6:
+                                if snorm >= 0.85:
+                                    txt, col = "SMASH!", (60, 80, 255)
+                                    flash.trigger(int(7 * fx_intensity))
+                                else:
+                                    txt, col = "FAST!", (60, 200, 255)
+                                labels.emit(sev["x"], sev["y"] - 20, txt,
+                                            color=col, scale=1.0 + snorm * 0.5)
+                    if player_fx is not None:
+                        cur_boxes = player_boxes.get(f, [])
+                        cur_boxes_scaled = [
+                            (b[0] * scale, b[1] * scale, b[2] * scale, b[3] * scale)
+                            for b in cur_boxes]
+                        player_fx.draw(frame, prev_player_boxes, cur_boxes_scaled)
+                        prev_player_boxes = cur_boxes_scaled
+                    if f in scaled_track:
+                        trail.append(scaled_track[f])
+                    elif trail and len(trail) > 1:
+                        trail.popleft()
+                    if len(trail) >= 2:
+                        st = ball_speed_table.get(f)
+                        snorm = st["norm"] if st else 0.3
+                        trail_renderer.draw(frame, smooth_trail(list(trail)),
+                                            speed_norm=snorm)
+                    particles.update_and_draw(frame)
+                    labels.update_and_draw(frame)
+                    flash.update_and_draw(frame)
+                    while lp_idx < len(cur_landings) and cur_landings[lp_idx]["frame"] <= f:
+                        lp = cur_landings[lp_idx]
+                        rid = prepend_landing_rally_id.get((psi, lp["frame"]))
+                        if cur_rally_id is not None and rid != cur_rally_id:
+                            cur_lp_so_far = []
+                        cur_rally_id = rid
+                        cur_lp_so_far.append(lp)
+                        lp_idx += 1
+                    mini.draw(frame, cur_lp_so_far)
+                    _apply_fade(frame, written)
+                    if use_pipe:
+                        try:
+                            pipe_proc.stdin.write(frame.tobytes())
+                        except (BrokenPipeError, OSError):
+                            log("⚠️ ffmpeg pipe 断开, 回退到 cv2.VideoWriter")
+                            try:
+                                pipe_proc.wait()
+                            except Exception:
+                                pass
+                            use_pipe = False
+                            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+                            writer = cv2.VideoWriter(silent_path, fourcc, fps,
+                                                     (out_w, out_h))
+                            if not writer.isOpened():
+                                raise RuntimeError("无法创建回退视频写入器")
+                            writer.write(frame)
+                    else:
+                        writer.write(frame)
+                    written += 1
+            # 黑幕间隔
+            black_frames = int(round(fps * black_gap_sec))
+            black = np.zeros((out_h, out_w, 3), dtype=np.uint8)
+            for _ in range(black_frames):
+                if use_pipe:
+                    try:
+                        pipe_proc.stdin.write(black.tobytes())
+                    except (BrokenPipeError, OSError):
+                        log("⚠️ ffmpeg pipe 断开(黑幕), 回退 cv2.VideoWriter")
+                        try:
+                            pipe_proc.wait()
+                        except Exception:
+                            pass
+                        use_pipe = False
+                        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+                        writer = cv2.VideoWriter(silent_path, fourcc, fps,
+                                                 (out_w, out_h))
+                        if not writer.isOpened():
+                            raise RuntimeError("无法创建回退视频写入器")
+                        writer.write(black)
+                else:
+                    writer.write(black)
+                written += 1
+            log(f"⏯️  前置 {len(prepend_segments)} 段 + 黑幕 {black_gap_sec}s 完成, "
+                f"进入全顺序视频")
+
         for si, (s, e) in enumerate(segments):
             cap.set(cv2.CAP_PROP_POS_FRAMES, s)
             trail = deque(maxlen=TRAIL_LEN)
@@ -2228,6 +2464,7 @@ def render(args, segments, rally_starts_by_seg, filled_track, events, table_geo,
                     cur_lp_so_far.append(lp)
                     lp_idx += 1
                 mini.draw(frame, cur_lp_so_far)
+                _apply_fade(frame, written)
 
                 if use_pipe:
                     try:
@@ -2280,13 +2517,16 @@ def render(args, segments, rally_starts_by_seg, filled_track, events, table_geo,
 
     try:
         finalize_output(args, silent_path, segments, fps, written, tmp_dir,
-                        already_encoded=use_pipe, enc=enc)
+                        already_encoded=use_pipe, enc=enc,
+                        prepend_segments=prepend_segments,
+                        black_gap_sec=black_gap_sec if prepend_segments else 0.0)
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 def finalize_output(args, silent_path, segments, fps, written, tmp_dir,
-                    already_encoded=False, enc="libx264"):
+                    already_encoded=False, enc="libx264",
+                    prepend_segments=None, black_gap_sec=0.0):
     has_audio = (not args.no_audio) and ffprobe_has_audio(args.video)
     if not has_audio or not shutil.which("ffmpeg"):
         if already_encoded:
@@ -2300,13 +2540,34 @@ def finalize_output(args, silent_path, segments, fps, written, tmp_dir,
                    "-i", silent_path] + _enc_args(enc) + [args.output]
             subprocess.run(cmd, check=True, creationflags=_SUBPROC_FLAGS)
         return
+    # 构建完整音频滤镜: 前置精彩剪辑 + 静音间隔 + 全顺序剪辑
     parts, filt = [], []
+    aidx = 0
+    # 前置片段
+    if prepend_segments:
+        for ps, pe in prepend_segments:
+            t0 = ps / fps
+            t1 = (pe + 1) / fps
+            filt.append(
+                f"[1:a]atrim=start={t0:.4f}:end={t1:.4f},"
+                f"asetpts=PTS-STARTPTS[a{aidx}]")
+            parts.append(f"[a{aidx}]")
+            aidx += 1
+    # 黑幕静音
+    if black_gap_sec > 0:
+        filt.append(f"anullsrc=r=48000:cl=stereo,atrim=0:{black_gap_sec},asetpts=PTS-STARTPTS[a{aidx}]")
+        parts.append(f"[a{aidx}]")
+        aidx += 1
+    # 主片段
     for i, (s, e) in enumerate(segments):
         t0 = s / fps
         t1 = (e + 1) / fps
-        filt.append(f"[1:a]atrim=start={t0:.4f}:end={t1:.4f},asetpts=PTS-STARTPTS[a{i}]")
-        parts.append(f"[a{i}]")
-    concat = "".join(parts) + f"concat=n={len(segments)}:v=0:a=1[aout]"
+        filt.append(
+            f"[1:a]atrim=start={t0:.4f}:end={t1:.4f},"
+            f"asetpts=PTS-STARTPTS[a{aidx}]")
+        parts.append(f"[a{aidx}]")
+        aidx += 1
+    concat = "".join(parts) + f"concat=n={aidx}:v=0:a=1[aout]"
     filter_complex = ";".join(filt + [concat])
     if already_encoded:
         log(f"🔊 重建音频 ({len(segments)} 段) 并 mux (视频 copy, 音频 aac)")
@@ -2327,9 +2588,14 @@ def finalize_output(args, silent_path, segments, fps, written, tmp_dir,
                "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
                "-shortest", "-movflags", "+faststart", args.output]
     try:
-        subprocess.run(cmd, check=True, creationflags=_SUBPROC_FLAGS)
-    except subprocess.CalledProcessError:
+        subprocess.run(cmd, check=True, capture_output=True, text=True, creationflags=_SUBPROC_FLAGS)
+    except subprocess.CalledProcessError as e:
         log("⚠️ 音频 mux 失败, 退回输出无声视频")
+        log(f"⚠️ FFmpeg 返回码: {e.returncode}")
+        if e.stderr:
+            log(f"⚠️ FFmpeg 错误详情:\n{e.stderr}")
+        else:
+            log(f"⚠️ FFmpeg 无 Stderr 输出, Stdout 详情:\n{e.stdout}")
         if already_encoded:
             shutil.copy2(silent_path, args.output)
         else:
@@ -2419,8 +2685,21 @@ def main():
         for si, (s, e) in enumerate(segments):
             log(f"    片段{si}: [{s}-{e}]  内含回合起始帧={rally_starts_by_seg.get(si)}")
 
+    # 选取球速最快的精彩回合作为前置
+    if args.no_highlight_prepend:
+        top_segs, top_rally_starts = [], {}
+        log("ℹ️ 已通过 --no-highlight-prepend 关闭前置精彩回合功能")
+    else:
+        top_segs, top_rally_starts = _pick_top_speed_segments(
+            rallies, ball_speed_table, fps, total_frames,
+            top_n=args.highlight_top_n, min_duration=args.highlight_min_duration,
+            pre_buffer=args.pre_buffer, post_buffer=args.post_buffer)
+
     render(args, segments, rally_starts_by_seg, filled, events, table_geo,
-           in_w, in_h, fps, total_frames, ball_speed_table, player_boxes)
+           in_w, in_h, fps, total_frames, ball_speed_table, player_boxes,
+           prepend_segments=top_segs or None,
+           prepend_rally_starts_by_seg=top_rally_starts,
+           black_gap_sec=args.highlight_black_gap)
     log(f"🎉 完成! 输出: {args.output}")
 
 
