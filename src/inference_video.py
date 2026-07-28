@@ -169,6 +169,13 @@ def parse_args():
                              "默认关闭=走 one-to-many+NMS，--iou 生效、召回更高，适合多目标计数")
     parser.add_argument("--max-det", type=int, default=300,
                         help="单帧最大检测数（NMS-free 模式硬上限 300；乒乓球场景目标少，默认 300 足够）")
+    # ---- CFR 转换时的画面调整 ----
+    parser.add_argument("--cfr-highlights", type=float, default=10.0,
+                        help="CFR 转换时高光下降百分比 (默认 10=下降10%, 0=不调整, 范围 0~50)")
+    parser.add_argument("--cfr-contrast", type=float, default=10.0,
+                        help="CFR 转换时对比度提升百分比 (默认 10=提升10%, 0=不调整, 范围 -50~100)")
+    parser.add_argument("--cfr-saturation", type=float, default=6.0,
+                        help="CFR 转换时饱和度提升百分比 (默认 6=提升6%, 0=不调整, 范围 -50~200)")
     return parser.parse_args()
 
 
@@ -287,7 +294,8 @@ def _probe_has_audio(video_path):
         return False
 
 
-def convert_vfr_to_cfr(video_path, output_path, target_fps=None):
+def convert_vfr_to_cfr(video_path, output_path, target_fps=None,
+                       highlights_pct=10.0, contrast_pct=10.0, saturation_pct=6.0):
     """
     [关键修复 v7]
     ffmpeg 8.1 (Windows) 下原来的 `-r N -fps_mode cfr -c:a copy` 组合会让
@@ -304,6 +312,17 @@ def convert_vfr_to_cfr(video_path, output_path, target_fps=None):
          不再 copy 原始时戳 (这是问题根源)
       5. `-video_track_timescale 90000` 固定 MP4 时基 = 90000 Hz,
          避免 Windows 播放器对小时基视频的解码毛刺
+
+    [画面调整 v8]
+    在 CFR 转换的同时对画面做调色, 默认值匹配用户需求:
+      - 高光下降 10%  → curves 滤镜, 把曲线顶端 1.0→0.9, 只压暗高光,
+                       不影响中间调 (0.5→0.5) 和阴影 (0.0→0.0)
+      - 对比度提升 10% → eq 滤镜 contrast=1.10
+      - 饱和度提升 6%  → eq 滤镜 saturation=1.06
+    滤镜顺序: fps → eq(对比度+饱和度) → curves(高光)
+      先做 eq 提对比度 (1.0 仍 clamp 到 1.0), 再 curves 把 1.0 压到 0.9,
+      保证高光端最终落在 0.9 (即下降 10%)。
+    三个参数任一为 0 则跳过对应滤镜, 全 0 时退化为纯 fps 转换。
     """
     if not shutil.which("ffmpeg"):
         raise RuntimeError("ffmpeg not found.")
@@ -317,11 +336,40 @@ def convert_vfr_to_cfr(video_path, output_path, target_fps=None):
     has_audio = _probe_has_audio(video_path)
     print(f"  Converting VFR to CFR @ {target_fps} fps (audio: {'yes' if has_audio else 'no'}) ...")
 
+    # ---- 构建 -vf 滤镜链: fps + 画面调整 ----
+    vf_filters = [f"fps={target_fps}"]
+
+    # 对比度 / 饱和度 (eq 滤镜, 二者可合并到一条 eq)
+    eq_opts = []
+    if contrast_pct != 0.0:
+        # contrast=1.0 为原样, +10% → 1.10
+        eq_opts.append(f"contrast={1.0 + contrast_pct / 100.0:.4f}")
+    if saturation_pct != 0.0:
+        # saturation=1.0 为原样, +6% → 1.06
+        eq_opts.append(f"saturation={1.0 + saturation_pct / 100.0:.4f}")
+    if eq_opts:
+        vf_filters.append("eq=" + ":".join(eq_opts))
+
+    # 高光 (curves 滤镜, 只动曲线顶端)
+    #   master='0/0 0.5/0.5 1/{H}' 把输入 1.0 映射到输出 H,
+    #   中间调 0.5 和阴影 0.0 保持不变, 实现选择性压暗高光。
+    #   单引号是 ffmpeg filter 解析器的分组符, subprocess 传 list 时
+    #   单引号会原样透传给 ffmpeg, 由其 filter parser 解析。
+    if highlights_pct != 0.0:
+        h_max = max(0.0, 1.0 - highlights_pct / 100.0)   # 10% → 0.9
+        vf_filters.append(f"curves=master='0/0 0.5/0.5 1/{h_max:.4f}'")
+
+    vf_chain = ",".join(vf_filters)
+
+    if highlights_pct or contrast_pct or saturation_pct:
+        print(f"  🎨 画面调整: 高光-{highlights_pct}%  对比度+{contrast_pct}%  饱和度+{saturation_pct}%")
+        print(f"     -vf chain: {vf_chain}")
+
     cmd = [
         "ffmpeg", "-y", "-hide_banner", "-loglevel", "warning",
         "-fflags", "+genpts",
         "-i", video_path,
-        "-vf", f"fps={target_fps}",
+        "-vf", vf_chain,
         "-vsync", "cfr",            # 旧名 (ffmpeg <= 7 兼容)
         "-fps_mode", "cfr",         # 新名 (ffmpeg 8.x 推荐)
         "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
@@ -833,7 +881,12 @@ def process_one_video(video_path, args, ctx, output_dir=None):
         if is_variable_frame_rate(video_path):
             print("⚠️ Variable Frame Rate (VFR) detected!")
             cfr_video_path = os.path.join(output_dir_or_ctx, "video_cfr.mp4")
-            video_input_path = convert_vfr_to_cfr(video_path, cfr_video_path)
+            video_input_path = convert_vfr_to_cfr(
+                video_path, cfr_video_path,
+                highlights_pct=args.cfr_highlights,
+                contrast_pct=args.cfr_contrast,
+                saturation_pct=args.cfr_saturation,
+            )
         else:
             print("✅ Constant Frame Rate (CFR) confirmed.")
             video_input_path = video_path

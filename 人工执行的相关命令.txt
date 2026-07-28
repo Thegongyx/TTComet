@@ -52,6 +52,8 @@ python src\pingpong_highlight.py `  --video inference_output\pipeline_VID_202607
 
 python src\pingpong_highlight.py `  --video inference_output\pipeline_VID_20260724_224938\video_cfr.mp4 `  --raw-detections inference_output\pipeline_VID_20260724_224938\raw_detections.jsonl `  --output inference_output\pipeline_VID_20260724_224938\VID_20260724_224938_highlight.mp4 --debug
 
+python src\pingpong_highlight.py `  --video inference_output\pipeline_VID_20260726_175753\video_cfr.mp4 `  --raw-detections inference_output\pipeline_VID_20260726_175753\raw_detections.jsonl `  --output inference_output\pipeline_VID_20260726_175753\VID_20260726_175753_highlight.mp4 --debug
+
 inference_video.py是使用yolo26对视频推理的脚本，输出raw_detections.jsonl，包含乒乓球&选手&球拍的矩形框和球台&球网的多边形边界框；
 pingpong_highlight.py是根据raw_detections.jsonl的数据，对视频进行自动渲染和剪辑的脚本，现在已完成自动剪辑以及残影渲染，水花特效等工作；
 
