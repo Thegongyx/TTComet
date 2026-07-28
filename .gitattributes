@@ -1,0 +1,23 @@
+# Auto-detect text files; Git will store them with LF in the repo
+* text=auto
+
+# --- Binary / non-text files (keep as-is, no EOL conversion) ---
+*.jpg   binary
+*.png   binary
+*.mp4   binary
+*.pt    binary
+*.npy   binary
+*.pyc   binary
+*.cache binary
+
+# --- Text files (explicit, though text=auto should handle them) ---
+*.py    text diff=python
+*.md    text
+*.txt   text
+*.json  text
+*.jsonl text
+*.yaml  text
+*.csv   text
+*.log   text
+*.bat   text
+*.tsx   text diff=typescript
