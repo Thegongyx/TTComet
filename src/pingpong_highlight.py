@@ -100,6 +100,8 @@ def parse_args():
     p.add_argument("--out-of-table-timeout", type=float, default=2.0,
                    help="持续出走廊该秒数则回合结束 (默认 2.0, 放宽以容忍放高球滞空时间)")
     p.add_argument("--corridor-max-drop", type=float, default=0.55, help="走廊过滤单次剔除比例上限")
+    p.add_argument("--center-dist-ratio", type=float, default=0.2,
+                   help="实例中心离画面中心超过该比例×长边时丢弃 (0=关闭)")
     p.add_argument("--ball-conf", type=float, default=0.5,
                    help="乒乓球检测最小置信度, 低于该值的球候选在收集阶段直接丢弃")
     p.add_argument("--no-audio", action="store_true", help="不保留原声")
@@ -282,13 +284,17 @@ def order_quad(quad):
     return q.astype(np.float32)
 
 
-def _get_polygon_pts_single(fr, target_class, conf_min=0.5, img_hw=None):
+def _get_polygon_pts_single(fr, target_class, conf_min=0.5, img_hw=None,
+                            center_dist_max=None):
     """
     取单帧中指定类别的多边形顶点。
 
     若同一帧识别到多个同类实例（例如多个球台 / 多条球网），
     按各实例几何中心离画面中心最近的原则挑选单个实例返回，
     避免把多个实例的顶点混成一坨导致拟合畸形。
+
+    若指定 center_dist_max（像素），则选中的实例离画面中心超距时
+    丢弃该帧（返回 None），防止远端误检污染中位数统计。
     """
     insts = []
     for det in fr.get("detections", []):
@@ -305,25 +311,37 @@ def _get_polygon_pts_single(fr, target_class, conf_min=0.5, img_hw=None):
 
     if not insts:
         return None
-    if len(insts) == 1:
-        return insts[0]
 
-    # 多实例：选离画面中心最近的那个
-    if img_hw is not None:
+    # 选实例：单实例直接取；多实例取离画面中心最近的那个
+    if len(insts) == 1:
+        best = insts[0]
+    else:
+        if img_hw is not None:
+            h, w = img_hw
+            cx, cy = w * 0.5, h * 0.5
+        else:
+            # 退化：以所有点的包围盒中心近似画面中心
+            all_pts = np.concatenate(insts, axis=0)
+            cx, cy = all_pts[:, 0].mean(), all_pts[:, 1].mean()
+
+        best_idx, best_dist = 0, float("inf")
+        for i, poly in enumerate(insts):
+            icx, icy = poly[:, 0].mean(), poly[:, 1].mean()
+            d = math.hypot(icx - cx, icy - cy)
+            if d < best_dist:
+                best_dist, best_idx = d, i
+        best = insts[best_idx]
+
+    # 离画面中心太远的实例视为误检，直接丢弃
+    if center_dist_max is not None and img_hw is not None:
         h, w = img_hw
         cx, cy = w * 0.5, h * 0.5
-    else:
-        # 退化：以所有点的包围盒中心近似画面中心
-        all_pts = np.concatenate(insts, axis=0)
-        cx, cy = all_pts[:, 0].mean(), all_pts[:, 1].mean()
+        bc = best.mean(axis=0)
+        d = math.hypot(bc[0] - cx, bc[1] - cy)
+        if d > center_dist_max:
+            return None
 
-    best_idx, best_dist = 0, float("inf")
-    for i, poly in enumerate(insts):
-        icx, icy = poly[:, 0].mean(), poly[:, 1].mean()
-        d = math.hypot(icx - cx, icy - cy)
-        if d < best_dist:
-            best_dist, best_idx = d, i
-    return insts[best_idx]
+    return best
 
 
 def _fit_quad_single(pts):
@@ -632,12 +650,22 @@ def _point_in_corridor(pt, corridor):
 
 
 def extract_table_geometry(frames, img_hw, debug=False, persp_blend=0.5,
-                           corridor_margin=0.45, corridor_extend=1.2):
+                           corridor_margin=0.45, corridor_extend=1.2,
+                           center_dist_ratio=0.3):
+    """
+    参数
+    ----
+    center_dist_ratio : float, default=0.3
+        实例中心离画面中心超过 center_dist_ratio × max(w,h) 时丢弃该帧。
+        设为 None 或 0 关闭过滤。
+    """
     h, w = img_hw
     sample_frames = frames[::10]
+    center_dist_max = center_dist_ratio * max(w, h) if center_dist_ratio else None
     all_table_pts, table_quads = [], []
     for fr in sample_frames:
-        pts = _get_polygon_pts_single(fr, "table", conf_min=0.5, img_hw=img_hw)
+        pts = _get_polygon_pts_single(fr, "table", conf_min=0.5, img_hw=img_hw,
+                                       center_dist_max=center_dist_max)
         if pts is not None and len(pts) >= 4:
             all_table_pts.append(pts)
             quad = _fit_quad_single(pts)
@@ -656,7 +684,8 @@ def extract_table_geometry(frames, img_hw, debug=False, persp_blend=0.5,
 
     net_lines = []
     for fr in sample_frames:
-        pts = _get_polygon_pts_single(fr, "net", conf_min=0.5, img_hw=img_hw)
+        pts = _get_polygon_pts_single(fr, "net", conf_min=0.5, img_hw=img_hw,
+                                       center_dist_max=center_dist_max)
         if pts is not None and len(pts) >= 2:
             line = _fit_net_line_single(pts)
             if line is not None:
@@ -680,7 +709,7 @@ def extract_table_geometry(frames, img_hw, debug=False, persp_blend=0.5,
         edge_lens = [float(np.linalg.norm(q[(i + 1) % 4] - q[i])) for i in range(4)]
         side_a = (edge_lens[0] + edge_lens[2]) * 0.5
         side_b = (edge_lens[1] + edge_lens[3]) * 0.5
-        if min(side_a, side_b) < net_len * 0.7:
+        if min(side_a, side_b) < net_len * 0.5:
             if debug:
                 log(f"  ⚠️ 短边远小于球网长度, 四边形过窄, 启动约束重建")
             rebuilt = rebuild_quad_from_constraints(table_pts_agg, net_line, img_hw, debug=debug)
@@ -2636,7 +2665,8 @@ def main():
     log("📐 提取球台/球网几何 + 校验自愈 + 长边走廊 ...")
     table_geo = extract_table_geometry(
         frames, (in_h, in_w), debug=args.debug,
-        corridor_margin=args.corridor_margin, corridor_extend=args.corridor_extend)
+        corridor_margin=args.corridor_margin, corridor_extend=args.corridor_extend,
+        center_dist_ratio=args.center_dist_ratio)
     geo_rebuilt = bool(table_geo.get("rebuilt")) if table_geo else False
 
     if not args.no_player_fx:
