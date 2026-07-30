@@ -33,26 +33,12 @@ python infer.py -v video.mp4 --half --batch-size 8 --writer-backend ffmpeg
 python infer.py -v video.mp4 --half --batch-size 8 --compile
 
 
-
-python src\pingpong_highlight.py `  --video inference_output\pipeline_VID_20260627_220437\video_cfr.mp4 `  --raw-detections inference_output\pipeline_VID_20260627_220437\raw_detections.jsonl `  --output inference_output\pipeline_VID_20260627_220437\VID_20260627_220437_highlight.mp4 --debug 
-
-python src\pingpong_highlight.py `  --video inference_output\pipeline_VID_20260627_214023\video_cfr.mp4 `  --raw-detections inference_output\pipeline_VID_20260627_214023\raw_detections.jsonl `  --output inference_output\pipeline_VID_20260627_214023\VID_20260627_214023_highlight.mp4 --debug 
-
-python src\pingpong_highlight.py `  --video inference_output\pipeline_VID_20260627_214742\video_cfr.mp4 `  --raw-detections inference_output\pipeline_VID_20260627_214742\raw_detections.jsonl `  --output inference_output\pipeline_VID_20260627_214742\VID_20260627_214742_highlight.mp4 --debug 
-
-python src\pingpong_highlight.py `  --video inference_output\pipeline_VID_20260627_221353\video_cfr.mp4 `  --raw-detections inference_output\pipeline_VID_20260627_221353\raw_detections.jsonl `  --output inference_output\pipeline_VID_20260627_221353\VID_20260627_221353_highlight.mp4 --debug 
-
-python src\pingpong_highlight.py `  --video inference_output\pipeline_VID_20260627_222900\video_cfr.mp4 `  --raw-detections inference_output\pipeline_VID_20260627_222900\raw_detections.jsonl `  --output inference_output\pipeline_VID_20260627_222900\VID_20260627_222900_highlight.mp4 --debug 
-
-python src\pingpong_highlight.py `  --video inference_output\pipeline_VID_20260627_224004\video_cfr.mp4 `  --raw-detections inference_output\pipeline_VID_20260627_224004\raw_detections.jsonl `  --output inference_output\pipeline_VID_20260627_224004\VID_20260627_224004_highlight.mp4 --debug 
-
-python src\pingpong_highlight.py `  --video inference_output\pipeline_VID_20260717_222701\video_cfr.mp4 `  --raw-detections inference_output\pipeline_VID_20260717_222701\raw_detections.jsonl `  --output inference_output\pipeline_VID_20260717_222701\VID_20260717_222701_highlight.mp4 --debug
-
-python src\pingpong_highlight.py `  --video inference_output\pipeline_VID_20260717_224033\video_cfr.mp4 `  --raw-detections inference_output\pipeline_VID_20260717_224033\raw_detections.jsonl `  --output inference_output\pipeline_VID_20260717_224033\VID_20260717_224033_highlight.mp4 --debug
-
 python src\pingpong_highlight.py `  --video inference_output\pipeline_VID_20260724_224938\video_cfr.mp4 `  --raw-detections inference_output\pipeline_VID_20260724_224938\raw_detections.jsonl `  --output inference_output\pipeline_VID_20260724_224938\VID_20260724_224938_highlight.mp4 --debug
 
 python src\pingpong_highlight.py `  --video inference_output\pipeline_VID_20260726_175753\video_cfr.mp4 `  --raw-detections inference_output\pipeline_VID_20260726_175753\raw_detections.jsonl `  --output inference_output\pipeline_VID_20260726_175753\VID_20260726_175753_highlight.mp4 --debug
+
+python src\pingpong_highlight.py `  --video inference_output\pipeline_VID_20260729_200332\video_cfr.mp4 `  --raw-detections inference_output\pipeline_VID_20260729_200332\raw_detections.jsonl `  --output inference_output\pipeline_VID_20260729_200332\VID_20260729_200332_highlight.mp4 --debug
+
 
 inference_video.py是使用yolo26对视频推理的脚本，输出raw_detections.jsonl，包含乒乓球&选手&球拍的矩形框和球台&球网的多边形边界框；
 pingpong_highlight.py是根据raw_detections.jsonl的数据，对视频进行自动渲染和剪辑的脚本，现在已完成自动剪辑以及残影渲染，水花特效等工作；
