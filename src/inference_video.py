@@ -1,33 +1,26 @@
 #!/usr/bin/env python3
 """
-PingPong Video Inference v7 — AMD Radeon 8060S / Windows Native 深度优化
+PingPong Video Inference v8 — AMD Radeon 8060S / Windows Native 深度优化
 ==========================================================
-v6 (WSL/VAAPI) → v7 (Windows/AMF) 迁移修复:
-  严重 Bug fixes:
-    - [致命] convert_vfr_to_cfr 在 ffmpeg 8.1 下导致 video_cfr.mp4 播放卡顿:
-        ffmpeg 8.x 改了 VFR→CFR 时戳处理, -r + -fps_mode cfr + -c:a copy
-        组合会让音频保留原始 VFR PTS, 视频被强制 CFR, A/V 时戳错位 →
-        Windows 媒体播放器表现为画面停顿。
-        修复: 改用 -vf fps=N filter 重建时戳; 音频改 AAC 重编(不 copy);
-        加 -fflags +genpts -vsync cfr -async 1 -video_track_timescale 90000
-    - [致命] VAAPI(/dev/dri/renderD128, h264_vaapi) 在 Windows 不存在,
-        改用 AMD AMF: h264_amf / hevc_amf / av1_amf (Windows 原生 AMD 硬编)
-    - MIOpen cache 路径跨平台化 (Windows 使用 %LOCALAPPDATA%\\miopen)
-    - 默认 --video / --model 路径改成 Windows 风格的占位符
-  优化:
-    - AMF 主路径用 -quality quality -rc cqp 获得最佳质量/体积平衡
-    - 软编 fallback: veryfast/crf20
-    - frame_writer join timeout 拉到 300s, 大视频不会被截断
-    - 进程启动加 CREATE_NO_WINDOW 标志, 避免 Windows 下弹黑窗
-  保留 v6 全部优化:
-    - polygon 只对 table/net 提取
-    - mask overlay cv2.addWeighted ROI
-    - inference_mode、batch padding、EWMA fps、周期性显存清理 等
+v7 → v8 性能优化 (解决 GPU 利用率仅 60% / 45fps 瓶颈):
+  [v8 PERF] 核心改动 —— 解耦 GPU 推理与 CPU 后处理:
+    - [关键] 后处理 (resize/绘图/mask/JSON) 从主循环剥离到独立 worker 线程池。
+        原来: GPU推理 → 主线程串行做完所有后处理 → 下一批 (GPU 空转等 CPU)
+        现在: 主线程只负责 喂批 + GPU 推理 + 一次性搬运结果到 CPU;
+              后处理由 N 个 worker 并行消费 → GPU 连续满载。
+    - [关键] 结果 GPU→CPU 搬运在主线程一次性完成 (extract_result_cpu),
+        避免后处理线程里再触发 .cpu() 同步 stall GPU。
+    - 多解码线程: 大分辨率视频单线程 cap.read() 是隐藏瓶颈,
+        可用 --reader-threads 拆多个解码器分段并行 (可选)。
+    - 顺序保证: 后处理结果带 seq 号, 由 ordering buffer 重排后再写盘,
+        保证视频帧顺序 100% 正确。
+    - read_queue / 后处理队列加深, 吸收抖动。
+    - torch.cuda.synchronize 只在必要处; 移除每帧隐式同步。
+  v7 全部功能保留 (AMF 硬编 / VFR→CFR 调色 / polygon 选择性提取 等)。
 """
 
 # ---------------------------------------------------------------------------
 # MIOpen / HIP 环境变量 (必须在 import torch 之前!)
-# Windows: 使用 %LOCALAPPDATA%\miopen; Linux/WSL: 使用 ~/.cache/miopen
 # ---------------------------------------------------------------------------
 import os
 import sys
@@ -63,7 +56,12 @@ from datetime import datetime
 from collections import defaultdict
 from dataclasses import dataclass
 
-# Windows 子进程不弹黑窗
+# [v8 PERF] 限制 OpenCV 内部线程数, 避免与我们的后处理线程池抢 CPU 打架
+try:
+    cv2.setNumThreads(2)
+except Exception:
+    pass
+
 _SUBPROC_FLAGS = 0
 if _IS_WINDOWS:
     _SUBPROC_FLAGS = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
@@ -96,8 +94,6 @@ CLASS_CONFIG_TEMPLATE = {
     },
 }
 BALL_LOGIC_NAME = "pingpangball"
-
-# 这些类别在下游需要 polygon 轮廓 (mini 球台几何提取); 其余只取 bbox.
 POLYGON_NEEDED_LOGIC_NAMES = {"table", "net"}
 
 
@@ -121,7 +117,7 @@ def _default_output():
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="PingPong Video Inference v7 (Windows/AMF)")
+    parser = argparse.ArgumentParser(description="PingPong Video Inference v8 (Windows/AMF, perf-tuned)")
     parser.add_argument("--video", "-v", type=str, default=_default_video())
     parser.add_argument("--video-list-file", type=str, default=None,
                         help="批处理模式: UTF-8 文本文件, 每行一个视频绝对路径")
@@ -129,8 +125,7 @@ def parse_args():
     parser.add_argument("--output", "-o", type=str, default=_default_output())
     parser.add_argument("--device", type=str, default="0")
     parser.add_argument("--half", action="store_true", help="FP16 推理 (ROCm/CUDA 加速)")
-    parser.add_argument("--imgsz", type=int, default=960,
-                        help="推理分辨率, 默认 960")
+    parser.add_argument("--imgsz", type=int, default=960, help="推理分辨率, 默认 960")
     parser.add_argument("--conf", type=float, default=0.30)
     parser.add_argument("--iou",  type=float, default=0.45)
     parser.add_argument("--conf-ball",   type=float, default=0.30)
@@ -139,51 +134,40 @@ def parse_args():
     parser.add_argument("--conf-table",  type=float, default=None)
     parser.add_argument("--conf-net",    type=float, default=None)
     parser.add_argument("--batch-size", type=int, default=8,
-                        help="批大小, ROCm 建议 4-8; 尾批用零帧 padding 保持固定 shape")
-    parser.add_argument("--remove-cfr", action="store_true",
-                        help="VFR 转 CFR 后删除中间文件")
-    parser.add_argument("--log-flush-interval", type=float, default=0.5,
-                        help="log writer 自动 flush 间隔 (秒)")
+                        help="批大小, ROCm 建议 8-16; 尾批用零帧 padding 保持固定 shape")
+    parser.add_argument("--remove-cfr", action="store_true")
+    parser.add_argument("--log-flush-interval", type=float, default=0.5)
     parser.add_argument("--writer-backend", type=str, default="ffmpeg",
-                        choices=["ffmpeg", "opencv"],
-                        help="视频写入后端")
-    parser.add_argument("--out-width", type=int, default=640,
-                        help="输出视频宽度 (默认 640, aspect 自动)")
-    parser.add_argument("--no-polygon", action="store_true",
-                        help="完全跳过 polygon 输出 (mini 球台依赖此特性, 关闭可省 IO)")
-    parser.add_argument("--empty-cache-every", type=int, default=200,
-                        help="每 N 批清一次 GPU 缓存 (0 关闭)")
-    parser.add_argument("--conf-margin", type=float, default=0.05,
-                        help="传给模型的 conf = min(各类阈值)-margin, 防止边缘类别被 GPU NMS 提前裁")
-    # Windows AMF 编码器
+                        choices=["ffmpeg", "opencv"])
+    parser.add_argument("--out-width", type=int, default=640)
+    parser.add_argument("--no-polygon", action="store_true")
+    parser.add_argument("--empty-cache-every", type=int, default=0,
+                        help="每 N 批清一次 GPU 缓存 (0 关闭; v8 默认关闭, 清缓存会 stall)")
+    parser.add_argument("--conf-margin", type=float, default=0.05)
     parser.add_argument("--encoder", type=str, default="auto",
-                        choices=["auto", "libx264", "h264_amf", "hevc_amf", "av1_amf"],
-                        help="输出视频编码器; auto=优先探测 AMD AMF 硬编")
+                        choices=["auto", "libx264", "h264_amf", "hevc_amf", "av1_amf"])
     parser.add_argument("--amf-quality", type=str, default="quality",
-                        choices=["speed", "balanced", "quality"],
-                        help="AMF -quality 参数 (speed=最快, quality=最好)")
-    parser.add_argument("--amf-qp", type=int, default=20,
-                        help="AMF CQP 量化参数 (越小越清晰, 18-28 常用)")
-    parser.add_argument("--end2end", action="store_true",
-                        help="YOLO26 走 NMS-free end2end 推理（更快，但 --iou 失效，单帧上限 max_det）。"
-                             "默认关闭=走 one-to-many+NMS，--iou 生效、召回更高，适合多目标计数")
-    parser.add_argument("--max-det", type=int, default=300,
-                        help="单帧最大检测数（NMS-free 模式硬上限 300；乒乓球场景目标少，默认 300 足够）")
-    # ---- CFR 转换时的画面调整 ----
-    parser.add_argument("--cfr-highlights", type=float, default=10.0,
-                        help="CFR 转换时高光下降百分比 (默认 10=下降10%, 0=不调整, 范围 0~50)")
-    parser.add_argument("--cfr-contrast", type=float, default=10.0,
-                        help="CFR 转换时对比度提升百分比 (默认 10=提升10%, 0=不调整, 范围 -50~100)")
-    parser.add_argument("--cfr-saturation", type=float, default=6.0,
-                        help="CFR 转换时饱和度提升百分比 (默认 6=提升6%, 0=不调整, 范围 -50~200)")
+                        choices=["speed", "balanced", "quality"])
+    parser.add_argument("--amf-qp", type=int, default=20)
+    parser.add_argument("--end2end", action="store_true")
+    parser.add_argument("--max-det", type=int, default=300)
+    parser.add_argument("--cfr-highlights", type=float, default=10.0)
+    parser.add_argument("--cfr-contrast", type=float, default=10.0)
+    parser.add_argument("--cfr-saturation", type=float, default=6.0)
+    # [v8 PERF] 新增性能相关参数
+    parser.add_argument("--post-workers", type=int, default=8,
+                        help="[v8] CPU 后处理 worker 线程数 (绘图/resize/mask/JSON)。"
+                             "GPU 利用率低时调大 (4-8); CPU 核多可到物理核数-2")
+    parser.add_argument("--reader-threads", type=int, default=1,
+                        help="[v8] 视频解码线程数。大分辨率视频单线程 cap.read() "
+                             "可能是瓶颈, 设 2-3 分段并行解码 (需 total_frames 已知)")
+    parser.add_argument("--prefetch-batches", type=int, default=6,
+                        help="[v8] 预取批数 (read_queue 深度), 吸收解码/GPU 抖动")
     return parser.parse_args()
 
 
 # ==================== 硬件加速探测 (AMF for AMD on Windows) ====================
 def _detect_amf_encoder(prefer="auto"):
-    """返回 (encoder_name, None) 或 (None, None)。仅检测并返回推荐配置。
-    Windows AMD GPU 用 AMF, 不需要设备路径 (内部走 DXGI/D3D11)。
-    """
     if prefer == "libx264":
         return None, None
     if not shutil.which("ffmpeg"):
@@ -212,7 +196,6 @@ def _detect_amf_encoder(prefer="auto"):
         enc = "av1_amf"
     else:
         return None, None
-    # 探测一次编码器是否真的可用 (避免列表里有但驱动没启用)
     try:
         probe = subprocess.run([
             "ffmpeg", "-hide_banner", "-loglevel", "error",
@@ -261,7 +244,6 @@ def is_variable_frame_rate(video_path):
         if not r_fps or not avg_fps:
             return False
 
-        # 解析分数 / 浮点; 容忍 1% 误差
         def _to_f(x):
             try:
                 if "/" in x:
@@ -280,7 +262,6 @@ def is_variable_frame_rate(video_path):
 
 
 def _probe_has_audio(video_path):
-    """检测视频是否含有音频流; 没有的话 ffmpeg 加 -c:a 会报错。"""
     if not shutil.which("ffprobe"):
         return False
     try:
@@ -296,34 +277,6 @@ def _probe_has_audio(video_path):
 
 def convert_vfr_to_cfr(video_path, output_path, target_fps=None,
                        highlights_pct=10.0, contrast_pct=10.0, saturation_pct=6.0):
-    """
-    [关键修复 v7]
-    ffmpeg 8.1 (Windows) 下原来的 `-r N -fps_mode cfr -c:a copy` 组合会让
-      - 视频流被强制 CFR (PTS = idx * 1/fps)
-      - 音频流仍保留原始 VFR PTS
-    两条流时戳基准不同 → A/V 不同步 → Windows Media Player / 浏览器表现为画面卡顿。
-
-    修复策略:
-      1. 用 `-vf fps={fps}` filter 在 filter 层显式重采样到固定帧率,
-         比 `-r` 输出选项更可靠 (filter 内部会丢/复帧, 时戳干净)
-      2. 加 `-fflags +genpts` 让 ffmpeg 重新生成 demuxer 端 PTS
-      3. 加 `-vsync cfr` (新版叫 -fps_mode cfr, 这里两个都给) 显式 CFR
-      4. 音频改 `-c:a aac -b:a 192k -ar 48000 -async 1` 重编码 + 时戳软对齐,
-         不再 copy 原始时戳 (这是问题根源)
-      5. `-video_track_timescale 90000` 固定 MP4 时基 = 90000 Hz,
-         避免 Windows 播放器对小时基视频的解码毛刺
-
-    [画面调整 v8]
-    在 CFR 转换的同时对画面做调色, 默认值匹配用户需求:
-      - 高光下降 10%  → curves 滤镜, 把曲线顶端 1.0→0.9, 只压暗高光,
-                       不影响中间调 (0.5→0.5) 和阴影 (0.0→0.0)
-      - 对比度提升 10% → eq 滤镜 contrast=1.10
-      - 饱和度提升 6%  → eq 滤镜 saturation=1.06
-    滤镜顺序: fps → eq(对比度+饱和度) → curves(高光)
-      先做 eq 提对比度 (1.0 仍 clamp 到 1.0), 再 curves 把 1.0 压到 0.9,
-      保证高光端最终落在 0.9 (即下降 10%)。
-    三个参数任一为 0 则跳过对应滤镜, 全 0 时退化为纯 fps 转换。
-    """
     if not shutil.which("ffmpeg"):
         raise RuntimeError("ffmpeg not found.")
     if target_fps is None:
@@ -336,29 +289,17 @@ def convert_vfr_to_cfr(video_path, output_path, target_fps=None,
     has_audio = _probe_has_audio(video_path)
     print(f"  Converting VFR to CFR @ {target_fps} fps (audio: {'yes' if has_audio else 'no'}) ...")
 
-    # ---- 构建 -vf 滤镜链: fps + 画面调整 ----
     vf_filters = [f"fps={target_fps}"]
-
-    # 对比度 / 饱和度 (eq 滤镜, 二者可合并到一条 eq)
     eq_opts = []
     if contrast_pct != 0.0:
-        # contrast=1.0 为原样, +10% → 1.10
         eq_opts.append(f"contrast={1.0 + contrast_pct / 100.0:.4f}")
     if saturation_pct != 0.0:
-        # saturation=1.0 为原样, +6% → 1.06
         eq_opts.append(f"saturation={1.0 + saturation_pct / 100.0:.4f}")
     if eq_opts:
         vf_filters.append("eq=" + ":".join(eq_opts))
-
-    # 高光 (curves 滤镜, 只动曲线顶端)
-    #   master='0/0 0.5/0.5 1/{H}' 把输入 1.0 映射到输出 H,
-    #   中间调 0.5 和阴影 0.0 保持不变, 实现选择性压暗高光。
-    #   单引号是 ffmpeg filter 解析器的分组符, subprocess 传 list 时
-    #   单引号会原样透传给 ffmpeg, 由其 filter parser 解析。
     if highlights_pct != 0.0:
-        h_max = max(0.0, 1.0 - highlights_pct / 100.0)   # 10% → 0.9
+        h_max = max(0.0, 1.0 - highlights_pct / 100.0)
         vf_filters.append(f"curves=master='0/0 0.5/0.5 1/{h_max:.4f}'")
-
     vf_chain = ",".join(vf_filters)
 
     if highlights_pct or contrast_pct or saturation_pct:
@@ -370,17 +311,14 @@ def convert_vfr_to_cfr(video_path, output_path, target_fps=None,
         "-fflags", "+genpts",
         "-i", video_path,
         "-vf", vf_chain,
-        "-vsync", "cfr",            # 旧名 (ffmpeg <= 7 兼容)
-        "-fps_mode", "cfr",         # 新名 (ffmpeg 8.x 推荐)
+        "-vsync", "cfr",
+        "-fps_mode", "cfr",
         "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
         "-pix_fmt", "yuv420p",
         "-video_track_timescale", "90000",
     ]
     if has_audio:
-        cmd += [
-            "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
-            "-async", "1",
-        ]
+        cmd += ["-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-async", "1"]
     else:
         cmd += ["-an"]
     cmd += ["-movflags", "+faststart", output_path]
@@ -391,68 +329,38 @@ def convert_vfr_to_cfr(video_path, output_path, target_fps=None,
 
 # ==================== ffmpeg 管道写入器 ====================
 class FFmpegWriter:
-    """ffmpeg 管道 BGR raw → 优先 AMD AMF 硬编 / 回退 libx264 软编。
-    在 Windows + AMD Radeon 8060S 上默认使用 h264_amf, 写入耗时减 2-4x。
-    """
     def __init__(self, out_path, width, height, fps, prefer="auto",
                  amf_quality="quality", amf_qp=24):
         self.encoder = None
         enc, _ = _detect_amf_encoder(prefer=prefer)
-
-        # 通用输入参数 (BGR raw pipe)
         input_args = [
             "ffmpeg", "-y", "-hide_banner", "-loglevel", "warning",
             "-f", "rawvideo", "-vcodec", "rawvideo",
             "-pix_fmt", "bgr24", "-s", f"{width}x{height}", "-r", str(fps),
             "-i", "-",
         ]
-
         if enc:
             self.encoder = enc
-            # AMF: D3D11 后端, 不需要设备节点
-            # -usage transcoding: 高质量转码场景 (vs ultralowlatency / lowlatency)
-            # -quality {speed|balanced|quality}
-            # -rc cqp + -qp_i/p/b: 固定 QP, 质量稳定
-            # -bf 0: 不用 B 帧, 兼容性好 (有些 AMD 驱动 B 帧会绿屏)
             qp = int(amf_qp)
             enc_args = [
-                "-c:v", enc,
-                "-usage", "transcoding",
-                "-quality", amf_quality,
-                "-rc", "cqp",
-                "-qp_i", str(qp),
-                "-qp_p", str(min(51, qp + 2)),
-                "-bf", "0",
-                "-pix_fmt", "yuv420p",
-                "-movflags", "+faststart",
-                "-video_track_timescale", "90000",
-                out_path,
+                "-c:v", enc, "-usage", "transcoding", "-quality", amf_quality,
+                "-rc", "cqp", "-qp_i", str(qp), "-qp_p", str(min(51, qp + 2)),
+                "-bf", "0", "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+                "-video_track_timescale", "90000", out_path,
             ]
-            # av1_amf 不支持 qp_p 参数, 单独处理
             if enc == "av1_amf":
                 enc_args = [
-                    "-c:v", enc,
-                    "-usage", "transcoding",
-                    "-quality", amf_quality,
-                    "-rc", "cqp",
-                    "-qp_i", str(qp),
-                    "-pix_fmt", "yuv420p",
-                    "-movflags", "+faststart",
-                    "-video_track_timescale", "90000",
+                    "-c:v", enc, "-usage", "transcoding", "-quality", amf_quality,
+                    "-rc", "cqp", "-qp_i", str(qp), "-pix_fmt", "yuv420p",
+                    "-movflags", "+faststart", "-video_track_timescale", "90000",
                     out_path,
                 ]
             cmd = input_args + enc_args
         else:
-            # 软编 fallback: veryfast/crf20
             cmd = input_args + [
-                "-c:v", "libx264",
-                "-preset", "veryfast",
-                "-tune", "zerolatency",
-                "-crf", "20",
-                "-pix_fmt", "yuv420p",
-                "-threads", "0",
-                "-movflags", "+faststart",
-                "-video_track_timescale", "90000",
+                "-c:v", "libx264", "-preset", "veryfast", "-tune", "zerolatency",
+                "-crf", "20", "-pix_fmt", "yuv420p", "-threads", "0",
+                "-movflags", "+faststart", "-video_track_timescale", "90000",
                 out_path,
             ]
         self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, bufsize=0,
@@ -470,7 +378,6 @@ class FFmpegWriter:
         except Exception:
             pass
         try:
-            # 大视频编码 flush 可能需要很久, 给到 5 分钟
             self.proc.wait(timeout=300)
         except Exception:
             self.proc.kill()
@@ -495,10 +402,6 @@ def draw_detections(frame, detections_list, colors):
 
 
 def draw_mask_overlay_inplace(frame, bool_mask, color, alpha=0.4):
-    """
-    用 cv2.addWeighted 替代 fancy indexing。
-    对 ROI 做加权混合 → 整体快 2-5x (依 mask 占比)。
-    """
     if bool_mask is None or not bool_mask.any():
         return frame
     ys, xs = np.where(bool_mask)
@@ -510,17 +413,16 @@ def draw_mask_overlay_inplace(frame, bool_mask, color, alpha=0.4):
     sub_mask  = bool_mask[y0:y1, x0:x1]
     if sub_frame.size == 0 or not sub_mask.any():
         return frame
-
     color_img = np.empty_like(sub_frame)
     color_img[:] = color
     blended = cv2.addWeighted(sub_frame, 1.0 - alpha, color_img, alpha, 0.0)
-    # 仅写入 mask 内像素
     sub_frame[sub_mask] = blended[sub_mask]
     return frame
 
 
-# ==================== I/O 线程 ====================
+# ==================== [v8 PERF] 多线程解码 reader ====================
 def frame_reader(cap, q, batch_size, stop_evt):
+    """单线程顺序解码 (reader_threads=1 时用)。"""
     idx = 0
     try:
         while not stop_evt.is_set():
@@ -537,12 +439,42 @@ def frame_reader(cap, q, batch_size, stop_evt):
                 q.put(None)
                 break
     except Exception as e:
-        # 出错时向主线程传递 None, 避免主循环永久等待
         try:
             q.put(None)
         except Exception:
             pass
         print(f"⚠️ frame_reader error: {e}")
+
+
+def frame_reader_segmented(video_path, q, batch_size, stop_evt,
+                           seg_start, seg_end, out_seq_offset):
+    """
+    [v8 PERF] 分段解码: 每个线程用独立 VideoCapture 打开视频并 seek 到 seg_start,
+    只解码 [seg_start, seg_end) 区间, 帧的全局 idx = seg_start + 本地偏移。
+    多个这样的线程并行 → 提升总解码吞吐 (大分辨率 CPU 解码瓶颈时有效)。
+    """
+    cap = cv2.VideoCapture(video_path)
+    try:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, seg_start)
+        idx = seg_start
+        while not stop_evt.is_set() and idx < seg_end:
+            batch = []
+            for _ in range(batch_size):
+                if idx >= seg_end:
+                    break
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                batch.append((idx, frame))
+                idx += 1
+            if batch:
+                q.put(batch)
+            if idx >= seg_end or len(batch) == 0:
+                break
+    except Exception as e:
+        print(f"⚠️ segmented reader error [{seg_start},{seg_end}): {e}")
+    finally:
+        cap.release()
 
 
 def frame_writer(writer, q):
@@ -554,7 +486,6 @@ def frame_writer(writer, q):
 
 
 def log_writer(log_f, q, flush_interval=0.5):
-    """按时间间隔 flush (不再依赖固定 buffer 大小, 对短视频更友好)。"""
     buf = []
     last_flush = datetime.now()
     while True:
@@ -575,9 +506,7 @@ def log_writer(log_f, q, flush_interval=0.5):
 
 # ==================== mask 处理 ====================
 class MaskProcessor:
-    """对 table/net mask 做 resize → uint8 二值。"""
-    def resize_masks(self, masks_np, cls_ids,
-                     out_hw, table_cls_id, net_cls_id):
+    def resize_masks(self, masks_np, cls_ids, out_hw, table_cls_id, net_cls_id):
         out_h, out_w = out_hw
         table_mask = net_mask = None
         for mask, cls_id in zip(masks_np, cls_ids):
@@ -592,18 +521,62 @@ class MaskProcessor:
         return table_mask, net_mask
 
 
-# ==================== 单帧处理 ====================
-def process_single_result(
-    result, frame_raw, frame_idx, fps,
-    CLASS_CONFIG, CONF_THRESHOLDS, CLASS_NAMES, COLORS,
-    BALL_CLASS_ID, TABLE_CLASS_ID, NET_CLASS_ID,
-    POLYGON_NEEDED_CLASS_IDS,  # set of cls_id
-    mask_proc, state, want_polygons: bool
-):
+# ==================== [v8 PERF] GPU→CPU 一次性搬运 ====================
+def extract_result_cpu(result, want_polygons, polygon_needed_cls_ids):
+    """
+    [v8 PERF 关键] 在主线程 (GPU 上下文所在线程) 一次性把当前 result 需要的
+    张量搬到 CPU numpy。这样后处理 worker 线程里就不再触发任何 .cpu() 同步,
+    GPU 不会因后处理线程的懒下载而 stall。
+    返回一个纯 CPU 的轻量 dict, 可安全跨线程传递。
+    """
     boxes = result.boxes
     masks = result.masks
-    out_h = state["out_height"]
-    out_w = state["out_width"]
+    payload = {"xyxy": None, "conf": None, "cls": None,
+               "masks_np": None, "polygons_by_idx": None}
+
+    if boxes is not None and len(boxes) > 0:
+        payload["xyxy"] = boxes.xyxy.cpu().numpy()
+        payload["conf"] = boxes.conf.cpu().numpy()
+        payload["cls"]  = boxes.cls.cpu().numpy().astype(np.int32)
+
+        if masks is not None and masks.data is not None and len(masks.data) > 0:
+            payload["masks_np"] = masks.data.cpu().numpy()
+
+            # polygon 也在这里一次性取出 (masks.xy 内部也走 CPU)
+            if want_polygons:
+                all_cls = payload["cls"]
+                need_idx = [i for i in range(len(all_cls))
+                            if int(all_cls[i]) in polygon_needed_cls_ids]
+                if need_idx:
+                    polys = {}
+                    try:
+                        xy_list = masks.xy
+                        for i in need_idx:
+                            if i < len(xy_list):
+                                poly = xy_list[i]
+                                if poly is not None and len(poly) > 0:
+                                    polys[i] = [
+                                        [round(float(x), 1), round(float(y), 1)]
+                                        for x, y in poly
+                                    ]
+                    except Exception:
+                        pass
+                    payload["polygons_by_idx"] = polys
+    return payload
+
+
+# ==================== [v8 PERF] 后处理 (纯 CPU, 在 worker 线程执行) ====================
+def process_payload_cpu(
+    payload, frame_raw, frame_idx, fps,
+    CLASS_CONFIG, CONF_THRESHOLDS, CLASS_NAMES, COLORS,
+    BALL_CLASS_ID, TABLE_CLASS_ID, NET_CLASS_ID,
+    mask_proc, out_w, out_h, want_polygons
+):
+    """
+    纯 CPU 后处理: 由 extract_result_cpu 产出的 payload (已在 CPU) 出发,
+    做绘图/resize/mask/JSON。绝不触碰 GPU 张量 → 可在 worker 线程并行。
+    返回 (out_frame, log_line, class_counts_local, ball_present_bool)
+    """
     h_raw, w_raw = frame_raw.shape[:2]
     sx = out_w / w_raw
     sy = out_h / h_raw
@@ -612,40 +585,15 @@ def process_single_result(
     frame_detections = []
     best_detections = {}
 
-    # ---- 一次性下载 boxes + masks ----
-    masks_np = None
-    cls_ids_np = None
-    if boxes is not None and len(boxes) > 0:
-        all_xyxy = boxes.xyxy.cpu().numpy()
-        all_conf = boxes.conf.cpu().numpy()
-        all_cls  = boxes.cls.cpu().numpy().astype(np.int32)
+    all_xyxy = payload["xyxy"]
+    all_conf = payload["conf"]
+    all_cls  = payload["cls"]
+    masks_np = payload["masks_np"]
+    polygons_by_idx = payload["polygons_by_idx"] or {}
+    cls_ids_np = all_cls
+
+    if all_cls is not None:
         n = len(all_cls)
-        cls_ids_np = all_cls
-
-        if masks is not None and masks.data is not None and len(masks.data) > 0:
-            masks_np = masks.data.cpu().numpy()  # 一次下载
-
-        # 仅对 polygon 需求类别提取 polygon — 跳过 ball/player/racket
-        polygons_by_idx = {}
-        if want_polygons and masks_np is not None:
-            need_polygon_idx = [
-                i for i in range(n)
-                if int(all_cls[i]) in POLYGON_NEEDED_CLASS_IDS
-            ]
-            if need_polygon_idx:
-                try:
-                    xy_list = masks.xy
-                    for i in need_polygon_idx:
-                        if i < len(xy_list):
-                            poly = xy_list[i]
-                            if poly is not None and len(poly) > 0:
-                                polygons_by_idx[i] = [
-                                    [round(float(x), 1), round(float(y), 1)]
-                                    for x, y in poly
-                                ]
-                except Exception:
-                    pass
-
         for i in range(n):
             cls_id = int(all_cls[i])
             conf = float(all_conf[i])
@@ -660,19 +608,16 @@ def process_single_result(
             }
             frame_detections.append(det)
             frame_class_counts_local[cls_id] += 1
-            state["total_class_counts"][cls_id] += 1
             if cls_id not in best_detections or conf > best_detections[cls_id]["confidence"]:
                 best_detections[cls_id] = det
 
-    # ---- table/net mask overlay ----
+    # table/net mask overlay
     if masks_np is not None and cls_ids_np is not None:
         table_mask_u8, net_mask_u8 = mask_proc.resize_masks(
-            masks_np, cls_ids_np, (out_h, out_w),
-            TABLE_CLASS_ID, NET_CLASS_ID)
+            masks_np, cls_ids_np, (out_h, out_w), TABLE_CLASS_ID, NET_CLASS_ID)
     else:
         table_mask_u8 = net_mask_u8 = None
 
-    # ---- ball 中心 (供日志) ----
     ball_det = best_detections.get(BALL_CLASS_ID)
     bx = by = 0.0
     ball_pos = None
@@ -680,7 +625,6 @@ def process_single_result(
         bx, by = get_bbox_center(ball_det["bbox"])
         ball_pos = (bx, by)
 
-    # ---- 可视化输出帧 ----
     out_frame = cv2.resize(frame_raw, (out_w, out_h))
     if table_mask_u8 is not None:
         draw_mask_overlay_inplace(out_frame, table_mask_u8.astype(bool),
@@ -695,7 +639,6 @@ def process_single_result(
         scaled_dets.append({**det, "bbox": [b[0]*sx, b[1]*sy, b[2]*sx, b[3]*sy]})
     draw_detections(out_frame, scaled_dets, COLORS)
 
-    # ---- 日志 ----
     timestamp = frame_idx / fps
     log_obj = {
         "frame": frame_idx,
@@ -704,32 +647,20 @@ def process_single_result(
                    for cls_id in CLASS_NAMES},
         "ball_pos": (round(bx, 1), round(by, 1)) if ball_pos else None,
         "detections": [
-            {
-                "class": d["class"],
-                "confidence": d["confidence"],
-                "bbox": [round(x, 1) for x in d["bbox"]],
-                "polygon": d.get("polygon")
-            }
+            {"class": d["class"], "confidence": d["confidence"],
+             "bbox": [round(x, 1) for x in d["bbox"]], "polygon": d.get("polygon")}
             for d in frame_detections
         ]
     }
     log_line = json.dumps(log_obj) + "\n"
 
-    any_det = False
-    for cls_id, count in frame_class_counts_local.items():
-        if count > 0:
-            state["class_frame_counts"][cls_id].append(timestamp)
-            any_det = True
-    if not any_det:
-        state["empty_frames"] += 1
-
-    return out_frame, log_line
+    any_det = any(c > 0 for c in frame_class_counts_local.values())
+    return out_frame, log_line, frame_class_counts_local, any_det, timestamp
 
 
-# ==================== 推理上下文（一次性加载结果）====================
+# ==================== 推理上下文 ====================
 @dataclass
 class InferenceContext:
-    """存放模型加载、类别映射、配置初始化等一次性计算结果。"""
     model: 'YOLO'
     device: str
     use_half: bool
@@ -753,8 +684,6 @@ class InferenceContext:
 
 
 def load_model_and_config(args):
-    """加载模型、建立类别映射、初始化所有配置，返回 InferenceContext。"""
-    # ---- 输出目录 ----
     if args.output.endswith(".json"):
         OUTPUT_DIR = os.path.dirname(args.output) or "."
         LOG_FILENAME = os.path.basename(args.output)
@@ -768,10 +697,9 @@ def load_model_and_config(args):
     IMGSZ      = args.imgsz
 
     print("=" * 60)
-    print(f"🏓 PingPong Video Inference v7 [Platform: {platform.system()}]")
+    print(f"🏓 PingPong Video Inference v8 [Platform: {platform.system()}]")
     print("=" * 60)
 
-    # ---- 设备 ----
     device = args.device
     use_half = args.half
     if device != "cpu" and not torch.cuda.is_available():
@@ -784,12 +712,9 @@ def load_model_and_config(args):
     if device != "cpu":
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.benchmark = True
-
-    if device != "cpu":
         try:
             dev_idx = int(device) if device.isdigit() else 0
-            gpu_name = torch.cuda.get_device_name(dev_idx)
-            print(f"GPU: {gpu_name}")
+            print(f"GPU: {torch.cuda.get_device_name(dev_idx)}")
         except Exception:
             pass
 
@@ -803,7 +728,6 @@ def load_model_and_config(args):
     except Exception as e:
         print(f"⚠️ fuse() failed: {e}")
 
-    # ---- 类别映射 (只在启动时计算一次) ----
     _alias_lookup = {}
     for logic_name, cfg in CLASS_CONFIG_TEMPLATE.items():
         for a in cfg["aliases"]:
@@ -836,10 +760,9 @@ def load_model_and_config(args):
     }
     want_polygons = (not args.no_polygon) and bool(POLYGON_NEEDED_CLASS_IDS)
     if not want_polygons:
-        print("ℹ️ Polygon 输出已禁用 (--no-polygon 或模型不含 table/net 类别)")
+        print("ℹ️ Polygon 输出已禁用")
     else:
-        print(f"ℹ️ Polygon 仅对类别 {sorted(POLYGON_NEEDED_CLASS_IDS)} 提取, "
-              f"跳过其他类别以节省 CPU")
+        print(f"ℹ️ Polygon 仅对类别 {sorted(POLYGON_NEEDED_CLASS_IDS)} 提取")
 
     mask_proc = MaskProcessor()
     pad_frame_zero = np.zeros((IMGSZ, IMGSZ, 3), dtype=np.uint8)
@@ -847,36 +770,78 @@ def load_model_and_config(args):
                                min(CONF_THRESHOLDS.values()) - float(args.conf_margin))
 
     return InferenceContext(
-        model=model,
-        device=device,
-        use_half=use_half,
-        CLASS_CONFIG=CLASS_CONFIG,
-        CLASS_NAMES=CLASS_NAMES,
-        COLORS=COLORS,
-        CONF_THRESHOLDS=CONF_THRESHOLDS,
-        BALL_CLASS_ID=BALL_CLASS_ID,
-        TABLE_CLASS_ID=TABLE_CLASS_ID,
-        NET_CLASS_ID=NET_CLASS_ID,
+        model=model, device=device, use_half=use_half,
+        CLASS_CONFIG=CLASS_CONFIG, CLASS_NAMES=CLASS_NAMES, COLORS=COLORS,
+        CONF_THRESHOLDS=CONF_THRESHOLDS, BALL_CLASS_ID=BALL_CLASS_ID,
+        TABLE_CLASS_ID=TABLE_CLASS_ID, NET_CLASS_ID=NET_CLASS_ID,
         POLYGON_NEEDED_CLASS_IDS=POLYGON_NEEDED_CLASS_IDS,
-        want_polygons=want_polygons,
-        OUTPUT_DIR=OUTPUT_DIR,
-        LOG_FILENAME=LOG_FILENAME,
-        BATCH_SIZE=BATCH_SIZE,
-        IMGSZ=IMGSZ,
-        args=args,
-        mask_proc=mask_proc,
-        pad_frame_zero=pad_frame_zero,
+        want_polygons=want_polygons, OUTPUT_DIR=OUTPUT_DIR,
+        LOG_FILENAME=LOG_FILENAME, BATCH_SIZE=BATCH_SIZE, IMGSZ=IMGSZ,
+        args=args, mask_proc=mask_proc, pad_frame_zero=pad_frame_zero,
         min_conf_for_predict=min_conf_for_predict,
     )
 
 
+# ==================== [v8 PERF] 后处理 worker + 排序写盘 ====================
+def _post_worker(ctx, fps, out_w, out_h, in_q, done_dict, done_lock, done_cv):
+    """
+    后处理 worker: 从 in_q 取 (seq, payload, frame_raw), 做 CPU 后处理,
+    结果连同 seq 存进 done_dict, 由 ordering 线程按 seq 顺序取出写盘。
+    """
+    while True:
+        item = in_q.get()
+        if item is None:
+            in_q.put(None)  # 传染给其他 worker
+            break
+        seq, payload, frame_raw = item
+        out_frame, log_line, counts, any_det, ts = process_payload_cpu(
+            payload, frame_raw, seq, fps,
+            ctx.CLASS_CONFIG, ctx.CONF_THRESHOLDS, ctx.CLASS_NAMES, ctx.COLORS,
+            ctx.BALL_CLASS_ID, ctx.TABLE_CLASS_ID, ctx.NET_CLASS_ID,
+            ctx.mask_proc, out_w, out_h, ctx.want_polygons
+        )
+        with done_lock:
+            done_dict[seq] = (out_frame, log_line, counts, any_det, ts)
+            done_cv.notify_all()
+
+
+def _ordering_writer(write_queue, log_queue, done_dict, done_lock, done_cv,
+                     total_expected_holder, state):
+    """
+    按 seq 递增顺序从 done_dict 取结果 → 保证视频帧写入顺序正确。
+    total_expected_holder[0] 为总帧数 (推理结束后由主线程写入; -1 表示未知/未完)。
+    """
+    next_seq = 0
+    while True:
+        with done_lock:
+            while next_seq not in done_dict:
+                total = total_expected_holder[0]
+                if total >= 0 and next_seq >= total:
+                    return
+                done_cv.wait(timeout=1.0)
+                if next_seq not in done_dict:
+                    total = total_expected_holder[0]
+                    if total >= 0 and next_seq >= total:
+                        return
+                    continue
+            out_frame, log_line, counts, any_det, ts = done_dict.pop(next_seq)
+
+        write_queue.put(out_frame)
+        log_queue.put(log_line)
+        for cls_id, c in counts.items():
+            if c > 0:
+                state["total_class_counts"][cls_id] += c
+                state["class_frame_counts"][cls_id].append(ts)
+        if not any_det:
+            state["empty_frames"] += 1
+        next_seq += 1
+
+
 # ==================== process_one_video ====================
 def process_one_video(video_path, args, ctx, output_dir=None):
-    """处理单个视频的推理流程：VFR→CFR、推理循环、输出清理。"""
     try:
         output_dir_or_ctx = output_dir if output_dir is not None else ctx.OUTPUT_DIR
 
-        # ---- VFR 处理 ----
         print(f"\n📹 Video: {video_path}")
         if is_variable_frame_rate(video_path):
             print("⚠️ Variable Frame Rate (VFR) detected!")
@@ -907,8 +872,7 @@ def process_one_video(video_path, args, ctx, output_dir=None):
         output_video_path = os.path.join(output_dir_or_ctx, "pingpong_detection.mp4")
         if args.writer_backend == "ffmpeg" and shutil.which("ffmpeg"):
             out_video = FFmpegWriter(output_video_path, out_width, out_height, fps,
-                                     prefer=args.encoder,
-                                     amf_quality=args.amf_quality,
+                                     prefer=args.encoder, amf_quality=args.amf_quality,
                                      amf_qp=args.amf_qp)
             if out_video.encoder:
                 print(f"🎬 FFmpeg pipe writer ({out_video.encoder}, "
@@ -923,7 +887,6 @@ def process_one_video(video_path, args, ctx, output_dir=None):
                                         (out_width, out_height))
             print(f"🎬 OpenCV writer @ {out_width}x{out_height} fps={fps}")
 
-        # ---- 状态 ----
         state = {
             "total_class_counts": {cls_id: 0 for cls_id in ctx.CLASS_CONFIG},
             "class_frame_counts": defaultdict(list),
@@ -931,48 +894,104 @@ def process_one_video(video_path, args, ctx, output_dir=None):
             "out_width":          out_width,
             "out_height":         out_height,
         }
-        # ---- 流水线 ----
-        read_queue  = Queue(maxsize=max(8, ctx.BATCH_SIZE * 4))
-        write_queue = Queue(maxsize=240)
+
+        # ---- 队列 ----
+        read_queue  = Queue(maxsize=max(8, args.prefetch_batches))
+        write_queue = Queue(maxsize=512)
         raw_log_path = os.path.join(output_dir_or_ctx, "raw_detections.jsonl")
         raw_log_f = open(raw_log_path, "w", encoding="utf-8")
-        log_queue = Queue(maxsize=4000)
+        log_queue = Queue(maxsize=8000)
         reader_stop = threading.Event()
 
-        t_reader = threading.Thread(target=frame_reader,
-                                    args=(cap, read_queue, ctx.BATCH_SIZE, reader_stop),
-                                    daemon=True)
+        # [v8 PERF] 后处理相关: 输入队列 + 有序结果字典
+        post_in_q = Queue(maxsize=args.post_workers * ctx.BATCH_SIZE * 2)
+        done_dict = {}
+        done_lock = threading.Lock()
+        done_cv = threading.Condition(done_lock)
+        total_expected_holder = [-1]  # 推理完成后写入实际帧数
+
+        # ---- 解码线程 (单/多) ----
+        reader_threads = []
+        use_segmented = (args.reader_threads > 1 and total_frames > 0)
+        if use_segmented:
+            n_seg = args.reader_threads
+            seg_size = (total_frames + n_seg - 1) // n_seg
+            # 分段并行解码, 每段结果标全局 idx; 顺序由后处理 done_dict 保证
+            for s in range(n_seg):
+                seg_start = s * seg_size
+                seg_end = min(total_frames, seg_start + seg_size)
+                if seg_start >= seg_end:
+                    break
+                t = threading.Thread(
+                    target=frame_reader_segmented,
+                    args=(video_input_path, read_queue, ctx.BATCH_SIZE,
+                          reader_stop, seg_start, seg_end, seg_start),
+                    daemon=True)
+                reader_threads.append(t)
+            # 分段模式下 cap 只用来读元信息, 关掉
+            cap.release()
+            cap = None
+        else:
+            t = threading.Thread(target=frame_reader,
+                                 args=(cap, read_queue, ctx.BATCH_SIZE, reader_stop),
+                                 daemon=True)
+            reader_threads.append(t)
+
         t_writer = threading.Thread(target=frame_writer,
                                     args=(out_video, write_queue), daemon=True)
         t_logger = threading.Thread(target=log_writer,
                                     args=(raw_log_f, log_queue, args.log_flush_interval),
                                     daemon=True)
-        t_reader.start(); t_writer.start(); t_logger.start()
+
+        # [v8 PERF] 后处理 worker 池 + 排序写盘线程
+        post_workers = []
+        for _ in range(max(1, args.post_workers)):
+            wt = threading.Thread(target=_post_worker,
+                                  args=(ctx, fps, out_width, out_height,
+                                        post_in_q, done_dict, done_lock, done_cv),
+                                  daemon=True)
+            post_workers.append(wt)
+        t_order = threading.Thread(target=_ordering_writer,
+                                   args=(write_queue, log_queue, done_dict,
+                                         done_lock, done_cv,
+                                         total_expected_holder, state),
+                                   daemon=True)
+
+        for t in reader_threads:
+            t.start()
+        t_writer.start(); t_logger.start(); t_order.start()
+        for wt in post_workers:
+            wt.start()
 
         if total_frames > 0:
             print(f"\n🚀 开始推理: {total_frames:,} 帧, batch={ctx.BATCH_SIZE}, "
-                  f"half={ctx.use_half}, imgsz={ctx.IMGSZ}")
+                  f"half={ctx.use_half}, imgsz={ctx.IMGSZ}, "
+                  f"post_workers={args.post_workers}, "
+                  f"reader_threads={args.reader_threads}")
         else:
-            print(f"\n🚀 开始推理 (总帧数未知), batch={ctx.BATCH_SIZE}, "
-                  f"half={ctx.use_half}, imgsz={ctx.IMGSZ}")
+            print(f"\n🚀 开始推理 (总帧数未知), batch={ctx.BATCH_SIZE}")
+
         frame_idx = 0
+        processed_count = 0
         start_time = datetime.now()
         last_log_time = start_time
         last_log_idx  = 0
         ewma_fps = None
         batch_count = 0
-
-        # 预分配 padding 用的零帧 —— 小于 imgsz 不影响 letterbox, 使用 imgsz×imgsz 节省传输
-        # （pad_frame_zero 已在 load_model_and_config 中分配）
-
-        # 传给 GPU 端 NMS 的 conf: 取最小阈值减 margin, 避免边缘类别被提前刪除
-        # （min_conf_for_predict 已在 load_model_and_config 中计算）
+        # 记录已 dispatch 到后处理的最大 seq, 用于最终确定 total_expected
+        max_seq_seen = -1
+        finished_readers = 0
+        n_readers = len(reader_threads)
 
         try:
             while True:
                 batch_item = read_queue.get()
                 if batch_item is None:
-                    break
+                    finished_readers += 1
+                    # 所有 reader 都发了结束信号才退出
+                    if finished_readers >= n_readers:
+                        break
+                    continue
 
                 frames_in_batch = [item[1] for item in batch_item]
                 actual_n = len(frames_in_batch)
@@ -981,30 +1000,27 @@ def process_one_video(video_path, args, ctx, output_dir=None):
                     pad_n = ctx.BATCH_SIZE - actual_n
                     frames_in_batch = frames_in_batch + [ctx.pad_frame_zero] * pad_n
 
+                # [v8 PERF] 主线程只做 GPU 推理
                 with torch.inference_mode():
                     results = ctx.model.predict(
                         frames_in_batch,
                         conf=ctx.min_conf_for_predict, iou=args.iou,
                         verbose=False, imgsz=ctx.IMGSZ, augment=False,
-                        device=ctx.device, half=ctx.use_half,
-                        stream=False,
-                        # end2end=args.end2end,   # 新增：与训练验证保持一致
-                        # max_det=args.max_det,   # 新增：避免 NMS-free 模式漏检
+                        device=ctx.device, half=ctx.use_half, stream=False,
                     )
                 if pad_n > 0:
                     results = results[:actual_n]
 
+                # [v8 PERF] 一次性把 GPU 结果搬到 CPU (在本线程完成同步),
+                # 然后把纯 CPU payload 丢给后处理线程池 → GPU 立刻去跑下一批
                 for result, (orig_idx, frame_raw) in zip(results, batch_item):
+                    payload = extract_result_cpu(
+                        result, ctx.want_polygons, ctx.POLYGON_NEEDED_CLASS_IDS)
+                    post_in_q.put((orig_idx, payload, frame_raw))
+                    if orig_idx > max_seq_seen:
+                        max_seq_seen = orig_idx
                     frame_idx = orig_idx
-                    out_frame, log_line = process_single_result(
-                        result, frame_raw, frame_idx, fps,
-                        ctx.CLASS_CONFIG, ctx.CONF_THRESHOLDS, ctx.CLASS_NAMES, ctx.COLORS,
-                        ctx.BALL_CLASS_ID, ctx.TABLE_CLASS_ID, ctx.NET_CLASS_ID,
-                        ctx.POLYGON_NEEDED_CLASS_IDS,
-                        ctx.mask_proc, state, ctx.want_polygons
-                    )
-                    write_queue.put(out_frame)
-                    log_queue.put(log_line)
+                    processed_count += 1
 
                 batch_count += 1
                 if args.empty_cache_every > 0 and ctx.device != "cpu" \
@@ -1014,50 +1030,67 @@ def process_one_video(video_path, args, ctx, output_dir=None):
                     except Exception:
                         pass
 
-                # ---- 进度条 (每 ~2s 刷新, 含可视化进度条 + EWMA fps + 检测统计) ----
                 now = datetime.now()
-                if (now - last_log_time).total_seconds() >= 2.0 and frame_idx > 0:
+                if (now - last_log_time).total_seconds() >= 2.0 and processed_count > 0:
                     dt = (now - last_log_time).total_seconds()
-                    instant_fps = (frame_idx - last_log_idx) / max(dt, 1e-6)
+                    instant_fps = (processed_count - last_log_idx) / max(dt, 1e-6)
                     ewma_fps = instant_fps if ewma_fps is None \
                                else 0.7 * ewma_fps + 0.3 * instant_fps
                     total_dets_now = sum(state["total_class_counts"].values())
 
                     if total_frames > 0:
-                        pct = frame_idx / total_frames * 100
+                        pct = processed_count / total_frames * 100
                         bar_len = 30
-                        filled = int(bar_len * frame_idx / total_frames)
+                        filled = int(bar_len * processed_count / total_frames)
                         bar = "█" * filled + "░" * (bar_len - filled)
-                        eta = (total_frames - frame_idx) / max(ewma_fps, 1e-6)
+                        eta = (total_frames - processed_count) / max(ewma_fps, 1e-6)
                         print(f"  [{bar}] {pct:5.1f}%  "
-                              f"帧 {frame_idx:,}/{total_frames:,}  "
+                              f"帧 {processed_count:,}/{total_frames:,}  "
                               f"{instant_fps:.1f} fps | ETA {eta:.0f}s  "
-                              f"| 检出: {total_dets_now}", flush=True)
+                              f"| 检出(已写): {total_dets_now}", flush=True)
                     else:
                         elapsed_total = (now - start_time).total_seconds()
-                        print(f"  帧 {frame_idx:,}  "
+                        print(f"  帧 {processed_count:,}  "
                               f"{instant_fps:.1f} fps (EWMA {ewma_fps:.1f})  "
-                              f"已耗时 {elapsed_total:.0f}s  "
-                              f"| 检出: {total_dets_now}", flush=True)
+                              f"已耗时 {elapsed_total:.0f}s", flush=True)
 
                     last_log_time = now
-                    last_log_idx  = frame_idx
+                    last_log_idx  = processed_count
         finally:
-            # 通知子线程退出
             reader_stop.set()
+
+            # [v8 PERF] 告诉 ordering 线程总共有多少帧 (= 已 dispatch 的最大 seq + 1)
+            # 分段模式下 seq 对应全局 idx, 连续覆盖 [0, total_frames)
+            with done_lock:
+                total_expected_holder[0] = max_seq_seen + 1
+                done_cv.notify_all()
+
+            # 结束后处理 worker
+            post_in_q.put(None)
+
+            # 等 ordering 线程把所有帧写完 (它会在 next_seq 达到 total 时退出)
+            try: t_order.join(timeout=600)
+            except Exception: pass
+
+            # 收尾其余线程
+            for wt in post_workers:
+                try: wt.join(timeout=10)
+                except Exception: pass
+            for t in reader_threads:
+                try: t.join(timeout=5)
+                except Exception: pass
+
             write_queue.put(None)
             log_queue.put(None)
-            try: t_reader.join(timeout=5)
-            except Exception: pass
-            try: t_writer.join(timeout=300)   # 大视频 ffmpeg flush 可能久
+            try: t_writer.join(timeout=300)
             except Exception: pass
             try: t_logger.join(timeout=10)
             except Exception: pass
-            # 必须在 t_logger 退出后才 close (避免在 logger 还在写时被关)
             try: raw_log_f.close()
             except Exception: pass
-            try: cap.release()
-            except Exception: pass
+            if cap is not None:
+                try: cap.release()
+                except Exception: pass
             try: out_video.release()
             except Exception: pass
 
@@ -1067,8 +1100,9 @@ def process_one_video(video_path, args, ctx, output_dir=None):
             except Exception: pass
 
         elapsed = (datetime.now() - start_time).total_seconds()
-        avg_fps = frame_idx / max(elapsed, 1e-6)
-        print(f"\n⏱️  Total: {elapsed:.1f}s | Avg: {avg_fps:.2f} fps")
+        avg_fps = processed_count / max(elapsed, 1e-6)
+        print(f"\n⏱️  Total: {elapsed:.1f}s | Avg: {avg_fps:.2f} fps "
+              f"(processed {processed_count:,} frames)")
 
         total_detections = sum(state["total_class_counts"].values())
         print(f"🔍 检测统计: 总检测数={total_detections}")
@@ -1079,7 +1113,6 @@ def process_one_video(video_path, args, ctx, output_dir=None):
         print(f"✅ Inference Complete! Output: {output_dir_or_ctx}")
         print(f"📄 raw_detections.jsonl: {raw_log_path}")
         print(f"🎬 pingpong_detection.mp4: {output_video_path}")
-
         return True, raw_log_path
     except Exception as e:
         print(f"❌ process_one_video error: {e}")
@@ -1097,7 +1130,6 @@ def main():
     print(f"[BENCHMARK] model_loaded id={id(ctx.model)} time={dt:.1f}s")
 
     if args.video_list_file:
-        # ---- 列表模式 ----
         with open(args.video_list_file, "r", encoding="utf-8") as f:
             video_list = [line.strip() for line in f if line.strip()]
         if not video_list:
@@ -1124,7 +1156,6 @@ def main():
                 print(f"  - {f}")
             sys.exit(1)
     else:
-        # ---- 单视频模式（完全保持原样）----
         process_one_video(args.video, args, ctx)
 
 
