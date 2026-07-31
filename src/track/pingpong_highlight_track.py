@@ -2082,7 +2082,8 @@ class SpeedTrailRenderer:
                         continue
                     cv2.circle(glow, (lcx, lcy), rr, glow_col, -1, cv2.LINE_AA)
                 cv2.addWeighted(glow, 0.28, frame[gy0:gy1, gx0:gx1], 0.72, 0, frame[gy0:gy1, gx0:gx1])
-        cv2.circle(frame, (cx, cy), 2, (255, 255, 255), -1, cv2.LINE_AA)
+        # 残影末端的实心白点 (球头标记), 已注释掉: 低速/残影淡出时会在原地闪一个白点
+        # cv2.circle(frame, (cx, cy), 2, (255, 255, 255), -1, cv2.LINE_AA)
 
 
 class PlayerFX:
