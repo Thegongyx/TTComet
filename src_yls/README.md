@@ -48,13 +48,26 @@
 | 操作系统 | Windows 10 / 11 |
 | Python | 3.10 或更高版本 |
 | Conda 环境 | `yolo26`（预装 PyTorch + ultralytics） |
-| Label Studio | 运行在 WSL2 中，地址 `http://localhost:8080` |
+| Label Studio | 运行在 Windows 原生（conda 环境 `label-studio`），地址 `http://localhost:8080` |
 | GPU（推荐） | NVIDIA CUDA 或 AMD ROCm，ultralytics 自动检测 |
 | 磁盘空间 | 模型文件约 50 MB，标注缓存按需增长 |
 
 **为什么不用 Docker：**
 
 后端直接运行在 Windows 的 conda 环境中，与主项目的 YOLO 推理环境保持一致。避免 Docker 带来的网络映射、GPU 透传、文件路径等额外复杂度。
+
+**Label Studio 本体（Windows 原生）：**
+
+Label Studio 标注服务也已从 WSL2 迁移到 Windows 原生运行（conda 环境 `label-studio`，版本 1.23.0）：
+
+```powershell
+conda run -n label-studio label-studio start --port 8080
+```
+
+- 数据目录：`%LOCALAPPDATA%\label-studio\label-studio\`（sqlite 数据库 + media 上传图片 + `.env`）
+- `.env` 中的 `SECRET_KEY` 必须与迁移前一致，否则用户密码 / API token 无法解密
+- 迁移来源：WSL2 `~/.local/share/label-studio/`（原数据保留作为备份）
+- 与 ML 后端同机运行，图片下载走本地回环（loopback），不再跨 WSL2 网络栈，也无需再向 WSL2 复制图片
 
 ---
 
@@ -155,7 +168,7 @@ conda run -n yolo26 python start.py
 
 ### 前提：获取 Access Token
 
-1. 打开 Label Studio（WSL2 中 `http://localhost:8080`）
+1. 打开 Label Studio（`http://localhost:8080`）
 2. 进入 **Account & Settings** → **Access Token**
 3. 创建一个新 Token，复制它
 4. 写入 `src_yls/config.json`：
@@ -464,7 +477,7 @@ src_yls/
 
 2. 确认 LS 在 `http://localhost:8080` 正常运行。
 
-3. LS 在 WSL2 中运行时，Windows 上的后端通过 `localhost:8080` 访问 LS。WSL2 默认端口转发正常。
+3. LS 与 ML 后端均运行在 Windows 上，通过 `localhost:8080` 访问 LS，纯本地回环，无跨系统网络开销。
 
 4. 确认 `config.json` 中的 `LABEL_STUDIO_API_KEY` 是有效的 LS Access Token（不是 JWT，是 LS 后台生成的 API Token，格式如 `c853009a...`）。
 

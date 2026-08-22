@@ -15,9 +15,9 @@ python src/train_pingpong_v2.py     --data train_data/all18_split/data.yaml     
 
 python inference_video.py --video Videos/VID_20260527_214016.mp4 --model runs\all7_ft\weights\last.pt --output inference_output --batch-size 12 --half
 
-python src/train_pingpong_v2.py     --data train_data/all19_split/data.yaml     --pretrained models\m960n.pt    --name all19_ft --epochs 200 --batch 12 --lr0 0.00005
+python src/train_pingpong_v2.py     --data train_data/all22_split/data.yaml     --pretrained models\m960n.pt    --name all22_ft --epochs 20 --batch 16 --lr0 0.00005 --optimizer AdamW
 
-python src/train_pingpong_v2.py     --data train_data/all19_split/data.yaml     --pretrained yolo26m-seg.pt    --name all19_ft --epochs 300 --batch 16 --imgsz 960
+python src/train_pingpong_v2.py     --data train_data/all21_split/data.yaml     --pretrained yolo26m-seg.pt    --name all21_ft --epochs 300 --batch 16 --imgsz 960
 
 
 
@@ -38,6 +38,8 @@ python src\pingpong_highlight.py `  --video inference_output\pipeline_VID_202607
 python src\pingpong_highlight.py `  --video inference_output\pipeline_VID_20260726_175753\video_cfr.mp4 `  --raw-detections inference_output\pipeline_VID_20260726_175753\raw_detections.jsonl `  --output inference_output\pipeline_VID_20260726_175753\VID_20260726_175753_highlight.mp4 --debug
 
 python src\pingpong_highlight.py `  --video inference_output\pipeline_VID_20260729_200332\video_cfr.mp4 `  --raw-detections inference_output\pipeline_VID_20260729_200332\raw_detections.jsonl `  --output inference_output\pipeline_VID_20260729_200332\VID_20260729_200332_highlight.mp4 --debug
+
+python src\pingpong_highlight.py `  --video inference_output\pipeline_VID_20260821_224602\video_cfr.mp4 `  --raw-detections inference_output\pipeline_VID_20260821_224602\raw_detections.jsonl `  --output inference_output\pipeline_VID_20260821_224602\VID_20260821_224602_highlight.mp4 --debug
 
 
 inference_video.py是使用yolo26对视频推理的脚本，输出raw_detections.jsonl，包含乒乓球&选手&球拍的矩形框和球台&球网的多边形边界框；

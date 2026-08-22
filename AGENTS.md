@@ -6,7 +6,10 @@
 ## ENVIRONMENT
 - **Shell**: PowerShell（Windows 原生）。所有命令使用 PowerShell 语法：换行符用 `` ` ``（反引号），不用 `^` 或 `\`。
 - **语言**: 项目内全部使用中文沟通和思考（文档、注释、交互）。
-- **Python**: conda 环境 `yolo26`，Windows 用 `python`，WSL/Linux 用 `python3`。
+- **Python**: Windows 用 `python`，WSL/Linux 用 `python3`。
+- **Conda 环境**（Windows 原生，均已从 WSL2 迁移到 Windows）:
+  - `yolo26` — YOLO 推理 / 训练 / ML 后端（`src_yls`）
+  - `label-studio` — Label Studio 标注服务本体（Python 3.12，label-studio 1.23.0）
 
 ## OVERVIEW
 YOLO 视频帧提取、推理与模型微调工具集。从检测日志中抽帧、运行 YOLO 推理、自动生成高光集锦、训练微调模型（支持 ROCm / CUDA）。
@@ -43,6 +46,7 @@ YOLO 视频帧提取、推理与模型微调工具集。从检测日志中抽帧
 ├── yolo26s-seg.pt                       # YOLO small 分割预训练权重
 ├── yolo26n.pt                           # YOLO nano 预训练权重
 ├── train_data/                          # 标注数据集 (images/ + labels/ + data.yaml)
+│   ├── all12_labelstudio/               #   从 WSL2 迁移的数据集 (labelstudio_tasks.json 导出)
 │   ├── all18/                           #   全量数据集 (最新版本)
 │   ├── all18_split/                     #   同上, 已拆分 80/20 train/val
 │   └── all17_split/                     #   历史版本, 已拆分
@@ -72,6 +76,7 @@ YOLO 视频帧提取、推理与模型微调工具集。从检测日志中抽帧
 | Track 高光剪辑 | `src/pingpong_highlight_track.py` | 带目标追踪的高光模式 |
 | Track 一键流水线 | `src/run_pipeline_track.py` | track 模式推理+高光 |
 | Label Studio ML 后端 | `src_yls/model.py` | Label Studio 集成，`src_yls/start.py` 启动 |
+| Label Studio 标注服务 | conda 环境 `label-studio` | Windows 原生运行, `http://localhost:8080`, 数据在 `%LOCALAPPDATA%\label-studio\label-studio\` |
 | 查找训练结果 | `runs/<name>/weights/best.pt` | 同时保存 best_class_*_ap.pt 和 best_class_*_map50.pt |
 | 训练配置 | `train_data/*/data.yaml` | nc, names, path 字段 |
 
@@ -149,12 +154,19 @@ conda run -n yolo26 python src/train_pingpong_v2.py `
     --data train_data/all18_split/data.yaml `
     --pretrained yolo26x-seg.pt `
     --name my_run --epochs 100 --batch 4
+
+# Label Studio 标注服务 (Windows 原生, conda 环境 label-studio)
+conda run -n label-studio label-studio start --port 8080
+
+# Label Studio ML 后端 (Windows 原生, conda 环境 yolo26)
+conda run -n yolo26 python src_yls/_wsgi.py --port 9090 --host 0.0.0.0
 ```
 
 ## NOTES
 - **GPU**: AMD Radeon via ROCm (`device: "0"` in ultralytics) 或 NVIDIA CUDA 均可，ultralytics 自动检测
 - **Python 命令**: Windows 用 `python`，WSL/Linux 用 `python3`
 - **Pre-trained weights**: `yolo26x-seg.pt` (26M params, segmentation)、`yolo26l-seg.pt`、`yolo26m-seg.pt`、`yolo26s-seg.pt` 和 `yolo26n.pt` (nano) 在项目根目录；`models/` 下有自定义训练权重 `m960n.pt`
+- **Label Studio 已从 WSL2 迁移到 Windows**: 2026-08-23 迁移。数据在 `%LOCALAPPDATA%\label-studio\label-studio\`（sqlite + media + .env）。`.env` 中的 `SECRET_KEY` 必须与 WSL2 原数据一致，否则用户密码/API token 无法解密。WSL2 原数据保留在 `~/.local/share/label-studio/` 作为备份
 - **Label format is mixed**: some files are polygon (9 values), some are bbox (5 values) — `train_pingpong_v2.py` auto-converts bbox→polygon before training
 - **OOM workaround**: reduce `--batch` (default 4) if GPU runs out of memory
 - **mAP@50-95 >0.60** is target for production models
