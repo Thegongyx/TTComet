@@ -1,8 +1,14 @@
 #!/usr/bin/env python3
 """
-pingpong_highlight.py  (优化版 v4.8 - 精彩回合前置 + 提速)
+pingpong_highlight.py  (优化版 v4.9 - 精彩回合前置 + 提速)
 =====================================================================
 乒乓球比赛 → 自动特效精华集锦
+
+v4.9 在 v4.8 基础上的改动:
+  ★ 精彩回合候选池增加"或"条件:
+    - 时长 >= --highlight-min-duration (秒) 或
+      落点较少半台的落点数 > --highlight-min-bounce-count (默认 5)
+    - 满足任一条件即可进入球速排序候选池
 
 v4.8 在 v4.7 基础上的改动:
   ★ 前置精彩回合功能完善:
@@ -40,6 +46,7 @@ import sys
 import json
 import math
 import shutil
+import bisect
 import argparse
 import subprocess
 import tempfile
@@ -99,10 +106,10 @@ def parse_args():
     p.add_argument("--corridor-extend", type=float, default=5.0, help="走廊沿长轴向短边外延伸倍数")
     p.add_argument("--out-of-table-timeout", type=float, default=3.0,
                    help="持续出走廊该秒数则回合结束 (默认 3.0, 放宽以容忍放高球滞空时间)")
-    p.add_argument("--rally-lost-timeout", type=float, default=10.0,
-                   help="球连续丢失该秒数则回合以 ball_lost 结束 (默认 10.0, 高球漏检多可调大)")
-    p.add_argument("--no-bounce-timeout", type=float, default=5.0,
-                   help="回合内球台连续该秒数无新落点则回合结束 (默认 5.0)")
+    p.add_argument("--rally-lost-timeout", type=float, default=3.0,
+                   help="球连续丢失该秒数则回合以 ball_lost 结束 (默认 3.0, 高球漏检多可调大)")
+    p.add_argument("--no-bounce-timeout", type=float, default=3.0,
+                   help="回合内球台连续该秒数无新落点则回合结束 (默认 3.0)")
     p.add_argument("--corridor-max-drop", type=float, default=0.55, help="走廊过滤单次剔除比例上限")
     p.add_argument("--no-court-cluster", action="store_true",
                    help="关闭球台空间聚类过滤 (仅保留最大簇; 多球/高球误杀场景可关闭)")
@@ -124,6 +131,9 @@ def parse_args():
                    help="前置精彩回合数量 (按平均球速降序取前 N 个, 默认 7)")
     p.add_argument("--highlight-min-duration", type=float, default=7.0,
                    help="前置精彩回合的最小合并前时长 (秒, 默认 7.0)")
+    p.add_argument("--highlight-min-bounce-count", type=int, default=5,
+                   help="前置精彩回合的落点条件: 落点较少半台的落点数 > 该值"
+                        " (与时长条件取或, 满足任一即可入选, 默认 5)")
     p.add_argument("--highlight-black-gap", type=float, default=1.0,
                    help="前置精彩回合与全顺序视频之间的黑幕间隔 (秒, 默认 1.0)")
     p.add_argument("--no-highlight-prepend", action="store_true",
@@ -1846,13 +1856,34 @@ def build_segments(rallies, fps, total_frames, args):
 
 def _pick_top_speed_segments(rallies, ball_speed_table, fps, total_frames,
                               top_n=7, min_duration=10.0,
-                              pre_buffer=0.5, post_buffer=1.5):
-    """筛选合并前时长 > min_duration 的回合, 按平均球速降序取 top_n, 返回片段列表 + rally_starts_by_seg。
+                              pre_buffer=0.5, post_buffer=1.5,
+                              bounce_halves=None, min_bounce_count=0):
+    """筛选候选回合: 合并前时长 >= min_duration 或 落点数较少半台的落点数 > min_bounce_count
+    (两条件取或, 满足任一即可), 按平均球速降序取 top_n, 返回片段列表 + rally_starts_by_seg。
 
     效率优化: 将 ball_speed_table 预展平为 numpy 数组 (按帧号索引),
     每个回合用切片 + 布尔掩码一次性求均值, 避免逐帧 dict.get + 字段访问的 Python 循环开销。
+    落点计数: 两半台落点帧号预先排序, 用 bisect 在 O(log n) 内统计回合区间内落点数。
     """
-    valid = [r for r in rallies if r.get("duration", 0) >= min_duration]
+    # 落点半台索引: 两半台各自的落点帧号升序列表
+    bounce_far = []
+    bounce_near = []
+    if bounce_halves:
+        bounce_far = sorted(f for f, h in bounce_halves.items() if h == "FAR")
+        bounce_near = sorted(f for f, h in bounce_halves.items() if h == "NEAR")
+
+    def _rally_min_side_bounces(r):
+        """回合 [start,end] 区间内两半台各自落点数, 取较少一侧。无落点信息返回 0。"""
+        if not bounce_far and not bounce_near:
+            return 0
+        s, e = r["start_frame"], r["end_frame"]
+
+        def _cnt(lst):
+            return bisect.bisect_right(lst, e) - bisect.bisect_left(lst, s)
+        return min(_cnt(bounce_far), _cnt(bounce_near))
+
+    valid = [r for r in rallies if (r.get("duration", 0) >= min_duration
+                                    or _rally_min_side_bounces(r) > min_bounce_count)]
     if not valid:
         return [], {}
 
@@ -1898,7 +1929,8 @@ def _pick_top_speed_segments(rallies, ball_speed_table, fps, total_frames,
     n_above = len(valid)
     avg_top = [sp for sp, _ in top]
     if avg_top:
-        log(f"🎯 前置精彩回合: {len(rallies)}回合中{n_above}个>={min_duration}s, "
+        log(f"🎯 前置精彩回合: {len(rallies)}回合中{n_above}个通过筛选 "
+            f"(时长>={min_duration}s 或 少落点半台落点>{min_bounce_count}), "
             f"球速排序取top{len(top)}, 速度{min(avg_top):.0f}~{max(avg_top):.0f} px/s")
     return segments, rally_starts_by_seg
 
@@ -2834,10 +2866,14 @@ def main():
         top_segs, top_rally_starts = [], {}
         log("ℹ️ 已通过 --no-highlight-prepend 关闭前置精彩回合功能")
     else:
+        # 落点半台分布: 供精彩回合"少落点半台落点数 > m"条件使用 (独立重算, 不动 detect_rallies 内部逻辑)
+        hl_bounce_halves = compute_bounce_halves(filled, table_geo, fps) if table_geo else {}
         top_segs, top_rally_starts = _pick_top_speed_segments(
             rallies, ball_speed_table, fps, total_frames,
             top_n=args.highlight_top_n, min_duration=args.highlight_min_duration,
-            pre_buffer=args.pre_buffer, post_buffer=args.post_buffer)
+            pre_buffer=args.pre_buffer, post_buffer=args.post_buffer,
+            bounce_halves=hl_bounce_halves,
+            min_bounce_count=args.highlight_min_bounce_count)
 
     render(args, segments, rally_starts_by_seg, filled, events, table_geo,
            in_w, in_h, fps, total_frames, ball_speed_table, player_boxes,
