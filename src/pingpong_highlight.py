@@ -92,17 +92,17 @@ def parse_args():
     p.add_argument("--output-height", type=int, default=None, help="输出高度像素 (默认原分辨率)")
     p.add_argument("--min-rally-frames", type=int, default=None, help="有效回合最小帧数 (默认 0.6s)")
     p.add_argument("--min-static-ball-count", type=int, default=20, help="静止球过滤最少静止检测数")
-    p.add_argument("--pre-buffer", type=float, default=0.5, help="每个回合前缓冲秒数")
-    p.add_argument("--post-buffer", type=float, default=1.5, help="每个回合后缓冲秒数")
+    p.add_argument("--pre-buffer", type=float, default=1.5, help="每个回合前缓冲秒数")
+    p.add_argument("--post-buffer", type=float, default=2.5, help="每个回合后缓冲秒数")
     p.add_argument("--merge-gap", type=float, default=2.0, help="相邻回合间隔小于该秒数则合并")
     p.add_argument("--corridor-margin", type=float, default=0.5, help="长边走廊横向容差")
     p.add_argument("--corridor-extend", type=float, default=5.0, help="走廊沿长轴向短边外延伸倍数")
     p.add_argument("--out-of-table-timeout", type=float, default=3.0,
                    help="持续出走廊该秒数则回合结束 (默认 3.0, 放宽以容忍放高球滞空时间)")
-    p.add_argument("--rally-lost-timeout", type=float, default=3.0,
-                   help="球连续丢失该秒数则回合以 ball_lost 结束 (默认 3.0, 高球漏检多可调大)")
-    p.add_argument("--no-bounce-timeout", type=float, default=4.0,
-                   help="回合内球台连续该秒数无新落点则回合结束 (默认 4.0)")
+    p.add_argument("--rally-lost-timeout", type=float, default=10.0,
+                   help="球连续丢失该秒数则回合以 ball_lost 结束 (默认 10.0, 高球漏检多可调大)")
+    p.add_argument("--no-bounce-timeout", type=float, default=5.0,
+                   help="回合内球台连续该秒数无新落点则回合结束 (默认 5.0)")
     p.add_argument("--corridor-max-drop", type=float, default=0.55, help="走廊过滤单次剔除比例上限")
     p.add_argument("--no-court-cluster", action="store_true",
                    help="关闭球台空间聚类过滤 (仅保留最大簇; 多球/高球误杀场景可关闭)")
@@ -1471,10 +1471,11 @@ def detect_rallies(filled_track, fps, total_frames, raw_log_path, table_geo=None
         return []
     ball_lookup = {f: ((x, y), not interp) for f, (x, y, interp) in filled_track.items()}
     sorted_frames = sorted(ball_lookup.keys())
+    bounce_halves = compute_bounce_halves(filled_track, table_geo, fps) if table_geo else {}
     net_line = table_geo.get("net_line") if table_geo else None
     net_center_x = _get_net_center_x(raw_log_path) if net_line is None else None
-    if net_line is None and net_center_x is None:
-        log("  ⚠️ 未提取到球网, 回退到连续性切分")
+    if net_line is None and net_center_x is None and not bounce_halves:
+        log("  ⚠️ 无球网且无落点信息, 回退到连续性切分")
         keys = sorted_frames
         max_gap = int(fps * 0.45)
         rallies = []
@@ -1491,7 +1492,7 @@ def detect_rallies(filled_track, fps, total_frames, raw_log_path, table_geo=None
     corridor = table_geo.get("corridor") if table_geo else None
     OUT_OF_TABLE_FRAMES = max(1, int(round(fps * out_of_table_timeout)))
     NO_BOUNCE_FRAMES = max(1, int(round(fps * no_bounce_timeout)))
-    bounce_halves = compute_bounce_halves(filled_track, table_geo, fps) if table_geo else {}
+    BOUNCE_START_WINDOW_FRAMES = max(1, int(round(fps * 2.0)))
     if debug:
         log(f"  落点半台检测: {len(bounce_halves)} 个落点")
     if debug:
@@ -1514,6 +1515,7 @@ def detect_rallies(filled_track, fps, total_frames, raw_log_path, table_geo=None
     no_bounce_last_frame = None
     rallies = []
     traj_buffer = deque(maxlen=max(PRE_ROLL_FRAMES * 3, int(fps * 6)))
+    idle_bounces = deque()
 
     def _ball_side(x, y):
         if net_line is not None:
@@ -1549,15 +1551,31 @@ def detect_rallies(filled_track, fps, total_frames, raw_log_path, table_geo=None
             is_real, side = False, None
             missing_ball_frames += 1
         if rally_state == RallyState.IDLE:
-            if entry is not None and prev_side is not None and side is not None and side != prev_side:
+            rally_start = None
+            if entry is not None:
+                if bounce_halves:
+                    # 落点驱动: 2 秒窗口内两半台(FAR/NEAR)都有落点 → 以倒数第二个落点开始回合
+                    bh = bounce_halves.get(frame_idx)
+                    if bh is not None:
+                        idle_bounces.append((frame_idx, bh))
+                        cutoff = frame_idx - BOUNCE_START_WINDOW_FRAMES
+                        while idle_bounces and idle_bounces[0][0] < cutoff:
+                            idle_bounces.popleft()
+                        halves = {h for _, h in idle_bounces}
+                        if len(idle_bounces) >= 2 and len(halves) == 2:
+                            rally_start = idle_bounces[-2][0]
+                elif prev_side is not None and side is not None and side != prev_side:
+                    # 无落点信息时跨网兜底
+                    rally_start = max(0, frame_idx - PRE_ROLL_FRAMES)
+            if rally_start is not None:
                 rally_num += 1
-                start_frame = max(0, frame_idx - PRE_ROLL_FRAMES)
-                current_rally = {"start_frame": start_frame, "end_frame": frame_idx, "crossed_net": True}
+                current_rally = {"start_frame": rally_start, "end_frame": frame_idx, "crossed_net": True}
                 rally_state = RallyState.IN_PLAY
                 slow_run_frames = out_of_table_run = 0
                 same_half_count, last_bounce_half = 0, None
                 no_bounce_last_frame = frame_idx
-                while traj_buffer and traj_buffer[0][0] < start_frame:
+                idle_bounces.clear()
+                while traj_buffer and traj_buffer[0][0] < rally_start:
                     traj_buffer.popleft()
             if entry is not None:
                 prev_side = side
@@ -1605,9 +1623,10 @@ def detect_rallies(filled_track, fps, total_frames, raw_log_path, table_geo=None
                         same_half_count, last_bounce_half = 1, bh
                     if same_half_count >= 3:
                         end_by_same_half = True
-                elif (bounce_halves and no_bounce_last_frame is not None and
-                        frame_idx - no_bounce_last_frame >= NO_BOUNCE_FRAMES):
-                    end_by_no_bounce = True
+            # 无落点超时不依赖球是否被检测到: 球丢失(漏检/出画)期间同样计时
+            if (bounce_halves and no_bounce_last_frame is not None and
+                    frame_idx - no_bounce_last_frame >= NO_BOUNCE_FRAMES):
+                end_by_no_bounce = True
             if end_by_lost or end_by_slow or end_by_out or end_by_same_half or end_by_no_bounce:
                 if end_by_same_half:
                     end_reason = "three_same_half"
@@ -1619,8 +1638,10 @@ def detect_rallies(filled_track, fps, total_frames, raw_log_path, table_geo=None
                     end_reason = "ball_lost"
                 else:
                     end_reason = "ball_too_slow"
-                if end_by_same_half or end_by_no_bounce:
+                if end_by_same_half:
                     end_f = frame_idx
+                elif end_by_no_bounce:
+                    end_f = no_bounce_last_frame  # 回退到最后一次落点帧, 裁掉无落点空窗
                 elif end_by_out:
                     end_f = frame_idx
                     for f in range(frame_idx, current_rally["start_frame"] - 1, -1):
