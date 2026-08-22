@@ -96,10 +96,16 @@ def parse_args():
     p.add_argument("--post-buffer", type=float, default=1.5, help="每个回合后缓冲秒数")
     p.add_argument("--merge-gap", type=float, default=2.0, help="相邻回合间隔小于该秒数则合并")
     p.add_argument("--corridor-margin", type=float, default=0.5, help="长边走廊横向容差")
-    p.add_argument("--corridor-extend", type=float, default=1.2, help="走廊沿长轴向短边外延伸倍数")
-    p.add_argument("--out-of-table-timeout", type=float, default=2.0,
-                   help="持续出走廊该秒数则回合结束 (默认 2.0, 放宽以容忍放高球滞空时间)")
+    p.add_argument("--corridor-extend", type=float, default=5.0, help="走廊沿长轴向短边外延伸倍数")
+    p.add_argument("--out-of-table-timeout", type=float, default=3.0,
+                   help="持续出走廊该秒数则回合结束 (默认 3.0, 放宽以容忍放高球滞空时间)")
+    p.add_argument("--rally-lost-timeout", type=float, default=3.0,
+                   help="球连续丢失该秒数则回合以 ball_lost 结束 (默认 3.0, 高球漏检多可调大)")
+    p.add_argument("--no-bounce-timeout", type=float, default=4.0,
+                   help="回合内球台连续该秒数无新落点则回合结束 (默认 4.0)")
     p.add_argument("--corridor-max-drop", type=float, default=0.55, help="走廊过滤单次剔除比例上限")
+    p.add_argument("--no-court-cluster", action="store_true",
+                   help="关闭球台空间聚类过滤 (仅保留最大簇; 多球/高球误杀场景可关闭)")
     p.add_argument("--center-dist-ratio", type=float, default=0.2,
                    help="实例中心离画面中心超过该比例×长边时丢弃 (0=关闭)")
     p.add_argument("--ball-conf", type=float, default=0.5,
@@ -108,7 +114,7 @@ def parse_args():
     p.add_argument("--encoder", default="auto",
                    choices=["auto", "libx264", "h264_amf", "hevc_amf"],
                    help="输出编码器, auto=优先 AMD AMF 硬编")
-    p.add_argument("--max-jump-ratio", type=float, default=0.1, help="轨迹最大跳变距离占对角线比例")
+    p.add_argument("--max-jump-ratio", type=float, default=0.15, help="轨迹最大跳变距离占对角线比例")
     p.add_argument("--match-algo", default="auto", choices=["auto", "hungarian", "greedy"],
                    help="track↔detection 关联算法")
     p.add_argument("--fx-level", default="normal", choices=["minimal", "normal", "max"],
@@ -1405,15 +1411,62 @@ def _estimate_slow_speed_threshold(ball_lookup, fps):
     if len(speeds) < 20:
         return 80.0
     speeds.sort()
-    p15 = speeds[int(len(speeds) * 0.15)]
+    p5 = speeds[int(len(speeds) * 0.05)]
     p50 = speeds[len(speeds) // 2]
-    return max(min(p15 * 0.6, p50 * 0.35), 80.0)
+    return max(min(p5 * 0.3, p50 * 0.1), 80.0)
+
+
+def compute_bounce_halves(filled_track, table_geo, fps):
+    """检测落点(bounce)并判定所在半台, 返回 {帧号: 'FAR'/'NEAR'}。
+
+    判定与 detect_events 一致: 局部 y 极大(图像坐标最低点, 落地弹起瞬间)
+    且位置在台面内视为落点; 半台按投影 y_mm 划分 (远台/近台)。"""
+    if not filled_track or table_geo is None or fps <= 0:
+        return {}
+    keys = sorted(filled_track.keys())
+    pts = [(k, filled_track[k][0], filled_track[k][1]) for k in keys]
+    n = len(pts)
+    if n < 5:
+        return {}
+    quad = table_geo.get("quad")
+    _TX_MAX = TABLE_WID_M * 1000
+    _TY_MAX = TABLE_LEN_M * 1000
+    _SURFACE_TOL = 80
+
+    def _in_table(x, y):
+        return True if quad is None else _point_in_corridor((x, y), quad)
+
+    def _on_table_surface(x, y):
+        txy = img_to_table(table_geo, (x, y))
+        if txy is None:
+            return False
+        tx, ty = txy
+        return (-_SURFACE_TOL <= tx <= _TX_MAX + _SURFACE_TOL and
+                -_SURFACE_TOL <= ty <= _TY_MAX + _SURFACE_TOL)
+
+    out = {}
+    last_bounce_frame = -10 ** 9
+    bounce_cooldown_frames = max(1, int(round(fps * 0.1)))
+    for i in range(2, n - 2):
+        f, x, y = pts[i]
+        is_local_y_max = (y >= pts[i - 1][2] and y >= pts[i + 1][2] and
+                          y > pts[i - 2][2] and y > pts[i + 2][2])
+        vy_prev, vy_next = y - pts[i - 1][2], pts[i + 1][2] - y
+        if is_local_y_max and vy_prev > 0.1 and vy_next < -0.1:
+            if (f - last_bounce_frame >= bounce_cooldown_frames and
+                    _in_table(x, y) and _on_table_surface(x, y)):
+                last_bounce_frame = f
+                txy = img_to_table(table_geo, (x, y))
+                if txy is not None:
+                    half = 'FAR' if txy[1] < TABLE_LEN_M * 1000 / 2.0 else 'NEAR'
+                    out[f] = half
+    return out
 
 
 def detect_rallies(filled_track, fps, total_frames, raw_log_path, table_geo=None,
                    rally_lost_timeout=1.0, rally_min_duration=0.6, pre_roll_sec=1.0,
                    slow_speed_window_sec=1.0, slow_speed_min_in_play_sec=0.8,
-                   out_of_table_timeout=1.0, debug=False):
+                   out_of_table_timeout=1.0, no_bounce_timeout=2.0, debug=False):
     if not filled_track or fps <= 0:
         return []
     ball_lookup = {f: ((x, y), not interp) for f, (x, y, interp) in filled_track.items()}
@@ -1437,6 +1490,10 @@ def detect_rallies(filled_track, fps, total_frames, raw_log_path, table_geo=None
     slow_thresh = _estimate_slow_speed_threshold(ball_lookup, fps)
     corridor = table_geo.get("corridor") if table_geo else None
     OUT_OF_TABLE_FRAMES = max(1, int(round(fps * out_of_table_timeout)))
+    NO_BOUNCE_FRAMES = max(1, int(round(fps * no_bounce_timeout)))
+    bounce_halves = compute_bounce_halves(filled_track, table_geo, fps) if table_geo else {}
+    if debug:
+        log(f"  落点半台检测: {len(bounce_halves)} 个落点")
     if debug:
         log(f"  慢速阈值: {slow_thresh:.0f} px/s")
     PRE_ROLL_FRAMES = int(round(fps * pre_roll_sec))
@@ -1452,6 +1509,9 @@ def detect_rallies(filled_track, fps, total_frames, raw_log_path, table_geo=None
     prev_side = None
     slow_run_frames = 0
     out_of_table_run = 0
+    same_half_count = 0
+    last_bounce_half = None
+    no_bounce_last_frame = None
     rallies = []
     traj_buffer = deque(maxlen=max(PRE_ROLL_FRAMES * 3, int(fps * 6)))
 
@@ -1495,6 +1555,8 @@ def detect_rallies(filled_track, fps, total_frames, raw_log_path, table_geo=None
                 current_rally = {"start_frame": start_frame, "end_frame": frame_idx, "crossed_net": True}
                 rally_state = RallyState.IN_PLAY
                 slow_run_frames = out_of_table_run = 0
+                same_half_count, last_bounce_half = 0, None
+                no_bounce_last_frame = frame_idx
                 while traj_buffer and traj_buffer[0][0] < start_frame:
                     traj_buffer.popleft()
             if entry is not None:
@@ -1525,26 +1587,51 @@ def detect_rallies(filled_track, fps, total_frames, raw_log_path, table_geo=None
                         out_of_table_run = 0
                     else:
                         out_of_table_run += 1
+                elif out_of_table_run > 0:
+                    # 球丢失前已在走廊外 → 视为朝走廊外飞走(出台), 丢失期间继续累计
+                    out_of_table_run += 1
                 if out_of_table_run >= OUT_OF_TABLE_FRAMES:
                     end_by_out = True
-            if end_by_lost or end_by_slow or end_by_out:
-                if end_by_lost:
-                    end_reason = "ball_lost"
-                elif end_by_slow:
-                    end_reason = "ball_too_slow"
-                else:
+            # 落点状态机: ① 同半台连续落点 3 次 → 结束; ② 球台连续无新落点超时 → 结束
+            end_by_same_half = False
+            end_by_no_bounce = False
+            if entry is not None:
+                bh = bounce_halves.get(frame_idx)
+                if bh is not None:
+                    no_bounce_last_frame = frame_idx
+                    if bh == last_bounce_half:
+                        same_half_count += 1
+                    else:
+                        same_half_count, last_bounce_half = 1, bh
+                    if same_half_count >= 3:
+                        end_by_same_half = True
+                elif (bounce_halves and no_bounce_last_frame is not None and
+                        frame_idx - no_bounce_last_frame >= NO_BOUNCE_FRAMES):
+                    end_by_no_bounce = True
+            if end_by_lost or end_by_slow or end_by_out or end_by_same_half or end_by_no_bounce:
+                if end_by_same_half:
+                    end_reason = "three_same_half"
+                elif end_by_no_bounce:
+                    end_reason = "no_bounce"
+                elif end_by_out:
                     end_reason = "ball_out_of_table"
-                if end_by_lost and missing_ball_frames > 0:
-                    end_f = current_rally["start_frame"]
-                    for f in range(frame_idx - missing_ball_frames, current_rally["start_frame"] - 1, -1):
-                        if ball_lookup.get(f) is not None:
-                            end_f = f
-                            break
+                elif end_by_lost:
+                    end_reason = "ball_lost"
+                else:
+                    end_reason = "ball_too_slow"
+                if end_by_same_half or end_by_no_bounce:
+                    end_f = frame_idx
                 elif end_by_out:
                     end_f = frame_idx
                     for f in range(frame_idx, current_rally["start_frame"] - 1, -1):
                         e = ball_lookup.get(f)
                         if e is not None and _point_in_corridor((e[0][0], e[0][1]), corridor):
+                            end_f = f
+                            break
+                elif end_by_lost and missing_ball_frames > 0:
+                    end_f = current_rally["start_frame"]
+                    for f in range(frame_idx - missing_ball_frames, current_rally["start_frame"] - 1, -1):
+                        if ball_lookup.get(f) is not None:
                             end_f = f
                             break
                 else:
@@ -1556,6 +1643,8 @@ def detect_rallies(filled_track, fps, total_frames, raw_log_path, table_geo=None
                 rally_state = RallyState.IDLE
                 current_rally = None
                 slow_run_frames = out_of_table_run = 0
+                same_half_count, last_bounce_half = 0, None
+                no_bounce_last_frame = None
                 prev_side = side
     if rally_state == RallyState.IN_PLAY and current_rally is not None:
         current_rally["start"] = current_rally["start_frame"] / fps
@@ -2685,7 +2774,8 @@ def main():
         ball_cands = filter_ball_by_corridor(
             ball_cands, corridor, max_drop_ratio=args.corridor_max_drop,
             geo_rebuilt=geo_rebuilt, debug=args.debug)
-    ball_cands = cluster_ball_by_court(ball_cands, in_w, in_h, debug=args.debug)
+    if not args.no_court_cluster:
+        ball_cands = cluster_ball_by_court(ball_cands, in_w, in_h, debug=args.debug)
     main_track = build_main_ball_track(
         ball_cands, fps, in_w, in_h, table_geo=table_geo, debug=args.debug,
         max_jump_ratio=args.max_jump_ratio, match_algo=args.match_algo)
@@ -2702,7 +2792,9 @@ def main():
     log("🎾 检测回合与落点/击球事件 ...")
     rallies = detect_rallies(filled, fps, total_frames, args.raw_detections,
                              table_geo=table_geo,
-                             out_of_table_timeout=args.out_of_table_timeout, debug=args.debug)
+                             out_of_table_timeout=args.out_of_table_timeout,
+                             rally_lost_timeout=args.rally_lost_timeout,
+                             no_bounce_timeout=args.no_bounce_timeout, debug=args.debug)
     events = detect_events(filled, table_geo, fps)
     log(f"   回合: {len(rallies)}, 事件: {len(events)}")
 
