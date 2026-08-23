@@ -86,6 +86,13 @@ TABLE_LEN_M = 2.74
 TABLE_WID_M = 1.525
 TABLE_RATIO = TABLE_LEN_M / TABLE_WID_M   # ≈ 1.797
 
+# 落点宽松采纳 (长边延长线放宽):
+# 弹跳点即使不在 quad/±80mm 台面内, 只要投影落在台面纵向两端各外延
+# _EDGE_EXTEND_RATIO×台长的延长带内 (横向仍限 ±80mm), 且与前一个已采纳落点
+# 在 _ALT_WINDOW_SEC 秒内、半台相反(交替), 也计为落点 (供回合结束/精彩球判定用)
+_EDGE_EXTEND_RATIO = 0.2
+_ALT_WINDOW_SEC = 2.0
+
 
 # =====================================================================
 #  CLI
@@ -97,7 +104,12 @@ def parse_args():
     p.add_argument("--raw-detections", "-r", required=True, help="raw_detections.jsonl 路径")
     p.add_argument("--output", "-o", default="highlight_output.mp4", help="输出 mp4 路径")
     p.add_argument("--output-height", type=int, default=None, help="输出高度像素 (默认原分辨率)")
-    p.add_argument("--min-rally-frames", type=int, default=None, help="有效回合最小帧数 (默认 0.6s)")
+    p.add_argument("--min-rally-frames", type=int, default=120, help="有效回合最小帧数")
+    p.add_argument("--min-rally-bounce-count", type=int, default=2,
+                   help="短回合豁免: 时长<--min-rally-frames 的回合, 若落点较少半台的"
+                        "落点数 >= 该值则不判无效 (与时长条件取或, 默认 2)")
+    p.add_argument("--min-rally-speed-top-n", type=int, default=10,
+                   help="球速豁免: 平均球速前 N 名的回合无条件视为有效 (0 关闭, 默认 10)")
     p.add_argument("--min-static-ball-count", type=int, default=20, help="静止球过滤最少静止检测数")
     p.add_argument("--pre-buffer", type=float, default=1.5, help="每个回合前缓冲秒数")
     p.add_argument("--post-buffer", type=float, default=2.5, help="每个回合后缓冲秒数")
@@ -1429,8 +1441,12 @@ def _estimate_slow_speed_threshold(ball_lookup, fps):
 def compute_bounce_halves(filled_track, table_geo, fps):
     """检测落点(bounce)并判定所在半台, 返回 {帧号: 'FAR'/'NEAR'}。
 
-    判定与 detect_events 一致: 局部 y 极大(图像坐标最低点, 落地弹起瞬间)
-    且位置在台面内视为落点; 半台按投影 y_mm 划分 (远台/近台)。"""
+    落点候选: 局部 y 极大(图像坐标最低点, 落地弹起瞬间) + vy 变号 + cooldown。
+    位置采纳分两级:
+      ① 严格: 图像域在 quad 内, 且投影 y_mm 落在台面 ±_SURFACE_TOL 内;
+      ② 宽松(长边延长线): 投影 y_mm 落在台面纵向两端延长带内(仍限 ±_SURFACE_TOL
+         横向), 且与前一个已采纳落点在 _ALT_WINDOW_SEC 秒内且半台相反(交替)。
+    半台按投影 y_mm 划分 (远台/近台)。"""
     if not filled_track or table_geo is None or fps <= 0:
         return {}
     keys = sorted(filled_track.keys())
@@ -1442,34 +1458,56 @@ def compute_bounce_halves(filled_track, table_geo, fps):
     _TX_MAX = TABLE_WID_M * 1000
     _TY_MAX = TABLE_LEN_M * 1000
     _SURFACE_TOL = 80
+    _TY_HALF = TABLE_LEN_M * 1000 / 2.0
+    _EDGE_EXTEND = _TY_MAX * _EDGE_EXTEND_RATIO   # 长边延长带深度 (mm)
+    _ALT_WIN_FRAMES = max(1, int(round(fps * _ALT_WINDOW_SEC)))
 
     def _in_table(x, y):
         return True if quad is None else _point_in_corridor((x, y), quad)
 
-    def _on_table_surface(x, y):
-        txy = img_to_table(table_geo, (x, y))
-        if txy is None:
-            return False
+    def _on_table_surface(txy):
         tx, ty = txy
         return (-_SURFACE_TOL <= tx <= _TX_MAX + _SURFACE_TOL and
                 -_SURFACE_TOL <= ty <= _TY_MAX + _SURFACE_TOL)
 
+    def _on_edge_band(txy):
+        """长边延长线区域: 纵向(长边方向)允许超出台面 _EDGE_EXTEND, 横向保持 ±_SURFACE_TOL。"""
+        tx, ty = txy
+        return (-_SURFACE_TOL <= tx <= _TX_MAX + _SURFACE_TOL and
+                -_EDGE_EXTEND <= ty <= _TY_MAX + _EDGE_EXTEND)
+
     out = {}
     last_bounce_frame = -10 ** 9
     bounce_cooldown_frames = max(1, int(round(fps * 0.1)))
+    last_ok_frame = None   # 最近一次已采纳落点帧号 (严格或宽松)
+    last_ok_half = None    # 其半台
     for i in range(2, n - 2):
         f, x, y = pts[i]
         is_local_y_max = (y >= pts[i - 1][2] and y >= pts[i + 1][2] and
                           y > pts[i - 2][2] and y > pts[i + 2][2])
         vy_prev, vy_next = y - pts[i - 1][2], pts[i + 1][2] - y
-        if is_local_y_max and vy_prev > 0.1 and vy_next < -0.1:
-            if (f - last_bounce_frame >= bounce_cooldown_frames and
-                    _in_table(x, y) and _on_table_surface(x, y)):
-                last_bounce_frame = f
-                txy = img_to_table(table_geo, (x, y))
-                if txy is not None:
-                    half = 'FAR' if txy[1] < TABLE_LEN_M * 1000 / 2.0 else 'NEAR'
-                    out[f] = half
+        if not (is_local_y_max and vy_prev > 0.1 and vy_next < -0.1):
+            continue
+        if f - last_bounce_frame < bounce_cooldown_frames:
+            continue
+        txy = img_to_table(table_geo, (x, y))
+        if txy is None:
+            continue
+        tx, ty = txy
+        half = 'FAR' if ty < _TY_HALF else 'NEAR'
+        accepted = False
+        if _in_table(x, y) and _on_table_surface(txy):
+            accepted = True                                   # ① 严格落点
+        elif _on_edge_band(txy):                              # ② 长边延长线放宽
+            if (last_ok_frame is not None
+                    and f - last_ok_frame <= _ALT_WIN_FRAMES
+                    and half != last_ok_half):                # 2s 内 + 半台交替
+                accepted = True
+        if accepted:
+            last_bounce_frame = f
+            last_ok_frame = f
+            last_ok_half = half
+            out[f] = half
     return out
 
 
@@ -1826,13 +1864,70 @@ def build_landing_rally_index(segments, rally_starts_by_seg, landing_all, debug=
 # =====================================================================
 #  6) 剪辑片段计算
 # =====================================================================
-def build_segments(rallies, fps, total_frames, args):
+def _min_side_bounce_count(r, bounce_far, bounce_near):
+    """回合 [start,end] 区间内两半台各自落点数, 取较少一侧; 无落点信息返回 0。"""
+    if not bounce_far and not bounce_near:
+        return 0
+    s, e = r["start_frame"], r["end_frame"]
+    return min(bisect.bisect_right(bounce_far, e) - bisect.bisect_left(bounce_far, s),
+               bisect.bisect_right(bounce_near, e) - bisect.bisect_left(bounce_near, s))
+
+
+def _rally_avg_speeds_px(rallies, ball_speed_table):
+    """计算每个回合的平均球速 (px/s, 仅非零帧), 返回 [(avg_sp, r)] 按球速降序。
+
+    效率: ball_speed_table 预展平为 numpy 数组 (按帧号索引), 每个回合切片+掩码求一次均值。
+    回合区间外/缺失速度数据帧不参与平均; 无速度数据的回合返回 0.0。"""
+    if ball_speed_table:
+        max_f = max(ball_speed_table.keys()) + 1
+        px_s_arr = np.zeros(max_f, dtype=np.float64)
+        for f, st in ball_speed_table.items():
+            v = st.get("px_s")
+            if v and v > 0:
+                px_s_arr[f] = v
+    else:
+        px_s_arr = np.zeros(0, dtype=np.float64)
+    arr_len = px_s_arr.shape[0]
+    out = []
+    for r in rallies:
+        s = r["start_frame"]
+        e = min(r["end_frame"] + 1, arr_len)
+        if s >= arr_len or e <= s:
+            out.append((0.0, r))
+            continue
+        slice_sp = px_s_arr[s:e]
+        mask = slice_sp > 0
+        out.append((float(slice_sp[mask].mean()) if mask.any() else 0.0, r))
+    out.sort(key=lambda x: x[0], reverse=True)
+    return out
+
+
+def build_segments(rallies, fps, total_frames, args, bounce_halves=None,
+                   min_bounce_count=0, ball_speed_table=None, speed_top_n=0):
     min_frames = args.min_rally_frames or int(fps * 2)
     pre = int(args.pre_buffer * fps)
     post = int(args.post_buffer * fps)
     merge_gap = int(args.merge_gap * fps)
-    valid_rallies = [r for r in rallies
-                     if (r["end_frame"] - r["start_frame"] + 1) >= min_frames]
+    # 落点半台索引 (短回合豁免用)
+    bounce_far = []
+    bounce_near = []
+    if bounce_halves:
+        bounce_far = sorted(f for f, h in bounce_halves.items() if h == "FAR")
+        bounce_near = sorted(f for f, h in bounce_halves.items() if h == "NEAR")
+    # 球速豁免: 平均球速前 speed_top_n 名的回合无条件视为有效
+    speed_top_ids = set()
+    if ball_speed_table and speed_top_n > 0 and rallies:
+        speed_top_ids = {id(r) for _, r in
+                         _rally_avg_speeds_px(rallies, ball_speed_table)[:speed_top_n]}
+    valid_rallies = []
+    for r in rallies:
+        dur_frames = r["end_frame"] - r["start_frame"] + 1
+        if dur_frames >= min_frames:
+            valid_rallies.append(r)                       # 时长达标
+        elif _min_side_bounce_count(r, bounce_far, bounce_near) >= min_bounce_count:
+            valid_rallies.append(r)                       # 短回合豁免: 落点充分
+        elif id(r) in speed_top_ids:
+            valid_rallies.append(r)                       # 球速 top-N 豁免
     if not valid_rallies:
         return [], {}
     buffed = []
@@ -1872,50 +1967,13 @@ def _pick_top_speed_segments(rallies, ball_speed_table, fps, total_frames,
         bounce_far = sorted(f for f, h in bounce_halves.items() if h == "FAR")
         bounce_near = sorted(f for f, h in bounce_halves.items() if h == "NEAR")
 
-    def _rally_min_side_bounces(r):
-        """回合 [start,end] 区间内两半台各自落点数, 取较少一侧。无落点信息返回 0。"""
-        if not bounce_far and not bounce_near:
-            return 0
-        s, e = r["start_frame"], r["end_frame"]
-
-        def _cnt(lst):
-            return bisect.bisect_right(lst, e) - bisect.bisect_left(lst, s)
-        return min(_cnt(bounce_far), _cnt(bounce_near))
-
     valid = [r for r in rallies if (r.get("duration", 0) >= min_duration
-                                    or _rally_min_side_bounces(r) > min_bounce_count)]
+                                    or _min_side_bounce_count(r, bounce_far, bounce_near) > min_bounce_count)]
     if not valid:
         return [], {}
 
-    # 预展平 ball_speed_table → numpy 数组 (按帧号索引, 缺失帧为 0)
-    if ball_speed_table:
-        max_f = max(ball_speed_table.keys()) + 1
-        px_s_arr = np.zeros(max_f, dtype=np.float64)
-        for f, st in ball_speed_table.items():
-            v = st.get("px_s")
-            if v and v > 0:
-                px_s_arr[f] = v
-    else:
-        px_s_arr = np.zeros(0, dtype=np.float64)
-
-    rally_speeds = []
-    arr_len = px_s_arr.shape[0]
-    for r in valid:
-        s = r["start_frame"]
-        e = min(r["end_frame"] + 1, arr_len)
-        if s >= arr_len or e <= s:
-            rally_speeds.append((0.0, r))
-            continue
-        slice_sp = px_s_arr[s:e]
-        # 仅对非零帧求均值 (零帧 = 无速度数据)
-        mask = slice_sp > 0
-        if mask.any():
-            avg_sp = float(slice_sp[mask].mean())
-        else:
-            avg_sp = 0.0
-        rally_speeds.append((avg_sp, r))
-
-    rally_speeds.sort(key=lambda x: x[0], reverse=True)
+    # 平均球速 (px/s, 非零帧) 降序 — 复用模块级实现
+    rally_speeds = _rally_avg_speeds_px(valid, ball_speed_table)
     top = rally_speeds[:top_n]
     pre = int(pre_buffer * fps)
     post = int(post_buffer * fps)
@@ -2851,7 +2909,14 @@ def main():
     events = detect_events(filled, table_geo, fps)
     log(f"   回合: {len(rallies)}, 事件: {len(events)}")
 
-    segments, rally_starts_by_seg = build_segments(rallies, fps, total_frames, args)
+    # 落点半台分布: 供"短回合豁免"与"精彩球少落点半台条件"共用
+    hl_bounce_halves = compute_bounce_halves(filled, table_geo, fps) if table_geo else {}
+    segments, rally_starts_by_seg = build_segments(
+        rallies, fps, total_frames, args,
+        bounce_halves=hl_bounce_halves,
+        min_bounce_count=args.min_rally_bounce_count,
+        ball_speed_table=ball_speed_table,
+        speed_top_n=args.min_rally_speed_top_n)
     if not segments:
         log("❌ 没有检测到有效回合, 无法生成高光。可尝试放宽 --min-rally-frames")
         sys.exit(2)
@@ -2866,8 +2931,6 @@ def main():
         top_segs, top_rally_starts = [], {}
         log("ℹ️ 已通过 --no-highlight-prepend 关闭前置精彩回合功能")
     else:
-        # 落点半台分布: 供精彩回合"少落点半台落点数 > m"条件使用 (独立重算, 不动 detect_rallies 内部逻辑)
-        hl_bounce_halves = compute_bounce_halves(filled, table_geo, fps) if table_geo else {}
         top_segs, top_rally_starts = _pick_top_speed_segments(
             rallies, ball_speed_table, fps, total_frames,
             top_n=args.highlight_top_n, min_duration=args.highlight_min_duration,
