@@ -15,9 +15,9 @@ python src/train_pingpong_v2.py     --data train_data/all18_split/data.yaml     
 
 python inference_video.py --video Videos/VID_20260527_214016.mp4 --model runs\all7_ft\weights\last.pt --output inference_output --batch-size 12 --half
 
-python src/train_pingpong_v2.py     --data train_data/all22_split/data.yaml     --pretrained models\m960n.pt    --name all22_ft --epochs 20 --batch 16 --lr0 0.00005 --optimizer AdamW
+python src/train_pingpong_v2.py     --data train_data/all22_split/data.yaml     --pretrained models\m960n.pt    --name all22_ft --epochs 20 --batch 12 --lr0 0.00005 --optimizer AdamW
 
-python src/train_pingpong_v2.py     --data train_data/all21_split/data.yaml     --pretrained yolo26m-seg.pt    --name all21_ft --epochs 300 --batch 16 --imgsz 960
+python src/train_pingpong_v2.py     --data train_data/all21_split/data.yaml     --pretrained yolo26m-seg.pt    --name all21_ft --epochs 300 --batch 12 --imgsz 960
 
 
 

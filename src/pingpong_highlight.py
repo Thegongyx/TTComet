@@ -104,7 +104,7 @@ def parse_args():
     p.add_argument("--raw-detections", "-r", required=True, help="raw_detections.jsonl 路径")
     p.add_argument("--output", "-o", default="highlight_output.mp4", help="输出 mp4 路径")
     p.add_argument("--output-height", type=int, default=None, help="输出高度像素 (默认原分辨率)")
-    p.add_argument("--min-rally-frames", type=int, default=120, help="有效回合最小帧数")
+    p.add_argument("--min-rally-frames", type=int, default=90, help="有效回合最小帧数")
     p.add_argument("--min-rally-bounce-count", type=int, default=2,
                    help="短回合豁免: 时长<--min-rally-frames 的回合, 若落点较少半台的"
                         "落点数 >= 该值则不判无效 (与时长条件取或, 默认 2)")
@@ -677,7 +677,7 @@ def _point_in_corridor(pt, corridor):
                                 (float(pt[0]), float(pt[1])), False) >= 0
 
 
-def extract_table_geometry(frames, img_hw, debug=False, persp_blend=0.5,
+def extract_table_geometry(frames, img_hw, debug=False, persp_blend=0.1,
                            corridor_margin=0.45, corridor_extend=1.2,
                            center_dist_ratio=0.3):
     """
