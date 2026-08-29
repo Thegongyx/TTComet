@@ -39,7 +39,7 @@ python src\pingpong_highlight.py `  --video inference_output\pipeline_VID_202607
 
 python src\pingpong_highlight.py `  --video inference_output\pipeline_VID_20260729_200332\video_cfr.mp4 `  --raw-detections inference_output\pipeline_VID_20260729_200332\raw_detections.jsonl `  --output inference_output\pipeline_VID_20260729_200332\VID_20260729_200332_highlight.mp4 --debug
 
-python src\pingpong_highlight.py `  --video inference_output\pipeline_VID_20260821_224602\video_cfr.mp4 `  --raw-detections inference_output\pipeline_VID_20260821_224602\raw_detections.jsonl `  --output inference_output\pipeline_VID_20260821_224602\VID_20260821_224602_highlight.mp4 --debug
+python src\pingpong_highlight.py `  --video inference_output\pipeline_VID_20260828_214109\video_cfr.mp4 `  --raw-detections inference_output\pipeline_VID_20260828_214109\raw_detections.jsonl `  --output inference_output\pipeline_VID_20260828_214109\VID_20260828_214109_highlight.mp4 --debug
 
 
 inference_video.py是使用yolo26对视频推理的脚本，输出raw_detections.jsonl，包含乒乓球&选手&球拍的矩形框和球台&球网的多边形边界框；
@@ -74,6 +74,7 @@ pingpong_highlight.py输出的日志中包含：
 
 python src/run_pipeline.py --video Videos  --model models\m960n.pt  --batch-size 16 --half
 
+python src\run_pipeline.py --video Videos  --model models\m960n.pt --batch-size 16 --half --skip-inference
 
 
 你看下C:\Users\xu352\yolo_frame_extractor\inference_output\pipeline_VID_20260627_222900\raw_detections.jsonl，真实的球台球网的坐标应该是接近球台四角: [[764.1644287109375, 156.6559600830078], [1172.48486328125, 185.72071838378906], [1117.652587890625, 956.0406494140625], [709.3321533203125, 926.9758911132812]]

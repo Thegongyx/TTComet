@@ -32,6 +32,9 @@ run_pipeline.py — 一键流水线: YOLO 推理 → 高光特效剪辑
     # 已有 JSONL, 跳过推理直接做高光
     python run_pipeline.py --video match.mp4 --skip-inference --raw-detections existing_log.jsonl
 
+    # 批量跳过推理 (目录中每个视频均已有 inference_output/pipeline_<名>/raw_detections.jsonl)
+    python run_pipeline.py --video ./videos/ --skip-inference
+
     # 运行后清理中间文件
     python run_pipeline.py --video match.mp4 --clean
 
@@ -383,6 +386,7 @@ def main():
   python run_pipeline.py --video ./videos/          # 批量处理目录中所有视频
   python run_pipeline.py --video match.mp4 --model best.pt --batch-size 8
   python run_pipeline.py --video match.mp4 --skip-inference --raw-detections log.jsonl
+  python run_pipeline.py --video ./videos/ --skip-inference   # 批量跳过推理, 直接做高光
         """,
     )
 
@@ -475,9 +479,9 @@ def main():
     parser.add_argument("--clean", action="store_true",
                         help="运行后清理中间检测视频 (默认保留)")
     parser.add_argument("--skip-inference", action="store_true",
-                        help="跳过推理步骤, 直接用已有 JSONL 做高光剪辑")
+                        help="跳过推理步骤, 直接用已有 JSONL 做高光剪辑 (单视频与批量模式均支持)")
     parser.add_argument("--raw-detections", "-r", default=None,
-                        help="已有检测日志路径 (配合 --skip-inference 使用)")
+                        help="已有检测日志路径 (配合 --skip-inference 使用, 单视频模式)")
     parser.add_argument("--conda-env", default=None,
                         help="conda 环境名 (默认使用当前 Python 解释器)")
 
@@ -584,11 +588,23 @@ def main():
         if args.amf_qp is not None:
             batch_infer_cmd += ["--amf-qp", str(args.amf_qp)]
 
-        # 执行批量推理
-        if not run_step(batch_infer_cmd,
-                         "Step 1/2: YOLO 推理 (批处理 via --video-list-file)",
-                         note=f"模型仅加载一次, 共 {len(videos)} 个视频..."):
-            print("⚠️ 批量推理部分失败, 将基于已有 jsonl 继续处理...")
+        # 执行批量推理 (--skip-inference 时跳过, 直接对已有 JSONL 的视频做高光)
+        if args.skip_inference:
+            infer_args_present = any([
+                args.model, args.batch_size is not None, args.imgsz is not None,
+                args.device, args.half, args.conf is not None, args.out_width is not None,
+                args.remove_cfr, args.iou is not None, args.log_flush_interval is not None,
+                args.writer_backend, args.no_polygon, args.empty_cache_every is not None,
+                args.conf_margin is not None, args.amf_quality, args.amf_qp is not None,
+            ])
+            if infer_args_present:
+                print("  ℹ️  --skip-inference 已指定, 推理参数将被忽略")
+            print(f"\n  ⏭️  跳过批量推理 (--skip-inference), 直接对已有 JSONL 的视频做高光剪辑")
+        else:
+            if not run_step(batch_infer_cmd,
+                            "Step 1/2: YOLO 推理 (批处理 via --video-list-file)",
+                            note=f"模型仅加载一次, 共 {len(videos)} 个视频..."):
+                print("⚠️ 批量推理部分失败, 将基于已有 jsonl 继续处理...")
 
         succeeded = 0
         failed_videos = []

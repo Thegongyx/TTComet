@@ -115,11 +115,13 @@ def parse_args():
     p.add_argument("--post-buffer", type=float, default=2.5, help="每个回合后缓冲秒数")
     p.add_argument("--merge-gap", type=float, default=2.0, help="相邻回合间隔小于该秒数则合并")
     p.add_argument("--corridor-margin", type=float, default=0.5, help="长边走廊横向容差")
+    p.add_argument("--table-edge-tol", type=float, default=30.0,
+                   help="球台四边等距带容差(px): 落点允许在 quad 四边形外该像素内通过 (排查用, 默认 30)")
     p.add_argument("--corridor-extend", type=float, default=5.0, help="走廊沿长轴向短边外延伸倍数")
     p.add_argument("--out-of-table-timeout", type=float, default=3.0,
                    help="持续出走廊该秒数则回合结束 (默认 3.0, 放宽以容忍放高球滞空时间)")
-    p.add_argument("--rally-lost-timeout", type=float, default=3.0,
-                   help="球连续丢失该秒数则回合以 ball_lost 结束 (默认 3.0, 高球漏检多可调大)")
+    p.add_argument("--rally-lost-timeout", type=float, default=1.5,
+                   help="球连续丢失该秒数则回合以 ball_lost 结束 (默认 1.5, 高球漏检多可调大)")
     p.add_argument("--no-bounce-timeout", type=float, default=3.0,
                    help="回合内球台连续该秒数无新落点则回合结束 (默认 3.0)")
     p.add_argument("--corridor-max-drop", type=float, default=0.55, help="走廊过滤单次剔除比例上限")
@@ -127,13 +129,13 @@ def parse_args():
                    help="关闭球台空间聚类过滤 (仅保留最大簇; 多球/高球误杀场景可关闭)")
     p.add_argument("--center-dist-ratio", type=float, default=0.2,
                    help="实例中心离画面中心超过该比例×长边时丢弃 (0=关闭)")
-    p.add_argument("--ball-conf", type=float, default=0.5,
+    p.add_argument("--ball-conf", type=float, default=0.55,
                    help="乒乓球检测最小置信度, 低于该值的球候选在收集阶段直接丢弃")
     p.add_argument("--no-audio", action="store_true", help="不保留原声")
     p.add_argument("--encoder", default="auto",
                    choices=["auto", "libx264", "h264_amf", "hevc_amf"],
                    help="输出编码器, auto=优先 AMD AMF 硬编")
-    p.add_argument("--max-jump-ratio", type=float, default=0.15, help="轨迹最大跳变距离占对角线比例")
+    p.add_argument("--max-jump-ratio", type=float, default=0.10, help="轨迹最大跳变距离占对角线比例")
     p.add_argument("--match-algo", default="auto", choices=["auto", "hungarian", "greedy"],
                    help="track↔detection 关联算法")
     p.add_argument("--fx-level", default="normal", choices=["minimal", "normal", "max"],
@@ -141,8 +143,8 @@ def parse_args():
     p.add_argument("--no-player-fx", action="store_true", help="关闭选手移动特效 (脚下光环)")
     p.add_argument("--highlight-top-n", type=int, default=7,
                    help="前置精彩回合数量 (按平均球速降序取前 N 个, 默认 7)")
-    p.add_argument("--highlight-min-duration", type=float, default=7.0,
-                   help="前置精彩回合的最小合并前时长 (秒, 默认 7.0)")
+    p.add_argument("--highlight-min-duration", type=float, default=6.0,
+                   help="前置精彩回合的最小合并前时长 (秒, 默认 6.0)")
     p.add_argument("--highlight-min-bounce-count", type=int, default=5,
                    help="前置精彩回合的落点条件: 落点较少半台的落点数 > 该值"
                         " (与时长条件取或, 满足任一即可入选, 默认 5)")
@@ -677,7 +679,7 @@ def _point_in_corridor(pt, corridor):
                                 (float(pt[0]), float(pt[1])), False) >= 0
 
 
-def extract_table_geometry(frames, img_hw, debug=False, persp_blend=0.1,
+def extract_table_geometry(frames, img_hw, debug=False, persp_blend=0.0,
                            corridor_margin=0.45, corridor_extend=1.2,
                            center_dist_ratio=0.3):
     """
@@ -868,15 +870,16 @@ def img_to_table(H_or_geo, pt):
         x_mm, y_mm = float(out[0, 0, 0]), float(out[0, 0, 1])
         net_line = geo.get("net_line")
         net_side_sign = geo.get("net_side_sign")
-        if net_line is not None and net_side_sign is not None:
-            (nx1, ny1), (nx2, ny2) = net_line
-            cross = (nx2 - nx1) * (pt[1] - ny1) - (ny2 - ny1) * (pt[0] - nx1)
-            is_near_side = (cross * net_side_sign > 0)
-            half_y = TABLE_LEN_M * 1000 / 2.0
-            if is_near_side and y_mm < half_y:
-                y_mm = half_y + (half_y - y_mm)
-            elif (not is_near_side) and y_mm > half_y:
-                y_mm = half_y - (y_mm - half_y)
+        # 网侧镜像校正暂时注释 (排查落点, 观察效果后决定恢复/删除)
+        # if net_line is not None and net_side_sign is not None:
+        #     (nx1, ny1), (nx2, ny2) = net_line
+        #     cross = (nx2 - nx1) * (pt[1] - ny1) - (ny2 - ny1) * (pt[0] - nx1)
+        #     is_near_side = (cross * net_side_sign > 0)
+        #     half_y = TABLE_LEN_M * 1000 / 2.0
+        #     if is_near_side and y_mm < half_y:
+        #         y_mm = half_y + (half_y - y_mm)
+        #     elif (not is_near_side) and y_mm > half_y:
+        #         y_mm = half_y - (y_mm - half_y)
         return (x_mm, y_mm)
     out = cv2.perspectiveTransform(np.array([[[pt[0], pt[1]]]], dtype=np.float32), H_or_geo)
     return float(out[0, 0, 0]), float(out[0, 0, 1])
@@ -1438,32 +1441,50 @@ def _estimate_slow_speed_threshold(ball_lookup, fps):
     return max(min(p5 * 0.3, p50 * 0.1), 80.0)
 
 
-def compute_bounce_halves(filled_track, table_geo, fps):
-    """检测落点(bounce)并判定所在半台, 返回 {帧号: 'FAR'/'NEAR'}。
+def detect_bounce_events(filled_track, table_geo, fps, table_edge_tol=30.0):
+    """统一落点/击球检测 (合并原 compute_bounce_halves + detect_events)。
 
-    落点候选: 局部 y 极大(图像坐标最低点, 落地弹起瞬间) + vy 变号 + cooldown。
-    位置采纳分两级:
-      ① 严格: 图像域在 quad 内, 且投影 y_mm 落在台面 ±_SURFACE_TOL 内;
-      ② 宽松(长边延长线): 投影 y_mm 落在台面纵向两端延长带内(仍限 ±_SURFACE_TOL
-         横向), 且与前一个已采纳落点在 _ALT_WINDOW_SEC 秒内且半台相反(交替)。
-    半台按投影 y_mm 划分 (远台/近台)。"""
-    if not filled_track or table_geo is None or fps <= 0:
-        return {}
+    落点 (bounce) 两级采纳 (保留原①语义):
+      strict: 图像在 quad 内 且 投影落在台面 ±_SURFACE_TOL 内;
+      edge:   投影在长边延长带 (纵向 ±_EDGE_EXTEND, 横向 ±_SURFACE_TOL)
+              且与前一个已采纳落点在 _ALT_WINDOW_SEC 秒内且半台相反(交替)。
+    击球 (hit): 当前帧未采纳为 bounce 时, vx 变号(|Δ|>2px) + 台面内
+                (保留原②语义, 且不受 bounce cooldown 限制)。
+    半台: 落点直接判定并携带 ('FAR'/'NEAR'); 无台面几何时 half=None。
+
+    几何缺失 (table_geo=None) 退化行为 (保留原②语义):
+      quad/台面判定恒真 → 候选门 + cooldown 通过即收 bounce, vx 变号即收 hit;
+      speed_kmh/table_xy/half/adopted 均为 None。
+
+    返回 (events, bounce_halves):
+      events: [{frame, x, y, type('bounce'/'hit'), half, adopted,
+                table_xy, speed_kmh}, ...]    # 按帧升序
+      bounce_halves: {frame: 'FAR'/'NEAR'}    # 仅含 half 非空的落点, 供回合逻辑
+    """
+    events = []
+    if not filled_track or fps <= 0:
+        return events, {}
     keys = sorted(filled_track.keys())
-    pts = [(k, filled_track[k][0], filled_track[k][1]) for k in keys]
+    pts = [(k, filled_track[k][0], filled_track[k][1], filled_track[k][2]) for k in keys]
     n = len(pts)
-    if n < 5:
-        return {}
-    quad = table_geo.get("quad")
+    if n < 3:
+        return events, {}
+    has_geo = table_geo is not None
+    quad = table_geo.get("quad") if has_geo else None
     _TX_MAX = TABLE_WID_M * 1000
     _TY_MAX = TABLE_LEN_M * 1000
     _SURFACE_TOL = 80
     _TY_HALF = TABLE_LEN_M * 1000 / 2.0
     _EDGE_EXTEND = _TY_MAX * _EDGE_EXTEND_RATIO   # 长边延长带深度 (mm)
     _ALT_WIN_FRAMES = max(1, int(round(fps * _ALT_WINDOW_SEC)))
+    _TABLE_EDGE_TOL = table_edge_tol   # 落点允许在 quad 四边形外该像素内 (CLI: --table-edge-tol)
 
     def _in_table(x, y):
-        return True if quad is None else _point_in_corridor((x, y), quad)
+        if quad is None:
+            return True
+        # 测距模式: 点在四边形外但距边界 ≤ _TABLE_EDGE_TOL 像素也算通过
+        return cv2.pointPolygonTest(quad.reshape(-1, 1, 2),
+                                    (float(x), float(y)), True) >= -_TABLE_EDGE_TOL
 
     def _on_table_surface(txy):
         tx, ty = txy
@@ -1476,50 +1497,87 @@ def compute_bounce_halves(filled_track, table_geo, fps):
         return (-_SURFACE_TOL <= tx <= _TX_MAX + _SURFACE_TOL and
                 -_EDGE_EXTEND <= ty <= _TY_MAX + _EDGE_EXTEND)
 
-    out = {}
+    def speed_kmh(k0, k1, p0, p1):
+        if table_geo is None:
+            return None
+        t0 = img_to_table(table_geo, (p0[1], p0[2]))
+        t1 = img_to_table(table_geo, (p1[1], p1[2]))
+        if t0 is None or t1 is None:
+            return None
+        d_mm = math.hypot(t1[0] - t0[0], t1[1] - t0[1])
+        dt = (k1 - k0) / fps
+        if dt <= 0:
+            return None
+        return (d_mm / 1000.0) / dt * 3.6
+
+    bounce_halves = {}
     last_bounce_frame = -10 ** 9
-    bounce_cooldown_frames = max(1, int(round(fps * 0.1)))
-    last_ok_frame = None   # 最近一次已采纳落点帧号 (严格或宽松)
-    last_ok_half = None    # 其半台
-    for i in range(2, n - 2):
-        f, x, y = pts[i]
-        is_local_y_max = (y >= pts[i - 1][2] and y >= pts[i + 1][2] and
-                          y > pts[i - 2][2] and y > pts[i + 2][2])
-        vy_prev, vy_next = y - pts[i - 1][2], pts[i + 1][2] - y
-        if not (is_local_y_max and vy_prev > 0.1 and vy_next < -0.1):
-            continue
-        if f - last_bounce_frame < bounce_cooldown_frames:
-            continue
-        txy = img_to_table(table_geo, (x, y))
-        if txy is None:
-            continue
-        tx, ty = txy
-        half = 'FAR' if ty < _TY_HALF else 'NEAR'
-        accepted = False
-        if _in_table(x, y) and _on_table_surface(txy):
-            accepted = True                                   # ① 严格落点
-        elif _on_edge_band(txy):                              # ② 长边延长线放宽
-            if (last_ok_frame is not None
-                    and f - last_ok_frame <= _ALT_WIN_FRAMES
-                    and half != last_ok_half):                # 2s 内 + 半台交替
-                accepted = True
-        if accepted:
-            last_bounce_frame = f
-            last_ok_frame = f
-            last_ok_half = half
-            out[f] = half
-    return out
+    bounce_cooldown_frames = max(1, int(round(fps * 0.01)))
+    last_ok_frame = None    # 最近一次已采纳落点帧号 (严格或宽松)
+    last_ok_half = None     # 其半台
+    for i in range(1, n - 1):
+        f, x, y, is_interp = pts[i]
+        f_p, x_p, y_p, _ = pts[i - 1]
+        f_n, x_n, y_n, _ = pts[i + 1]
+        ev_type = None
+        is_local_y_max = (y >= pts[i - 1][2] and y >= pts[i + 1][2])
+        vy_prev, vy_next = y - y_p, y_n - y
+        # vy 变号门槛: 插值帧(球漏检期间被填充, 平滑会压低帧间位移)用低门槛 0.01,
+        # 真实检测帧保持 0.1 以挡亚像素噪声
+        vy_gate = 0.01 if is_interp else 0.1
+        if is_local_y_max and vy_prev > vy_gate and vy_next < -vy_gate:
+            if f - last_bounce_frame >= bounce_cooldown_frames:
+                txy = img_to_table(table_geo, (x, y)) if has_geo else None
+                half = (None if (not has_geo or txy is None)
+                        else ('FAR' if txy[1] < _TY_HALF else 'NEAR'))
+                accepted = False
+                adopted = None
+                if not has_geo:
+                    accepted = True                     # 退化照收 (原②语义)
+                elif txy is not None:
+                    # _on_table_surface 过滤暂时注释 (排查落点丢失, 观察效果后决定恢复/删除)
+                    if _in_table(x, y):  # and _on_table_surface(txy):
+                        accepted = True                 # ① 严格落点
+                        adopted = 'strict'
+                    elif (_on_edge_band(txy)            # ② 长边延长线放宽
+                          and last_ok_frame is not None
+                          and f - last_ok_frame <= _ALT_WIN_FRAMES
+                          and half != last_ok_half):    # 2s 内 + 半台交替
+                        accepted = True
+                        adopted = 'edge'
+                if accepted:
+                    ev_type = "bounce"
+                    last_bounce_frame = f
+                    last_ok_frame = f
+                    last_ok_half = half
+                    spd = speed_kmh(f_p, f_n, pts[i - 1], pts[i + 1])
+                    events.append({"frame": f, "x": x, "y": y, "type": ev_type,
+                                   "half": half, "adopted": adopted,
+                                   "table_xy": txy, "speed_kmh": spd})
+                    if half is not None:
+                        bounce_halves[f] = half
+        if ev_type is None:
+            vx_prev, vx_next = x - x_p, x_n - x
+            if vx_prev * vx_next < 0 and abs(vx_prev) > 2.0 and abs(vx_next) > 2.0:
+                if _in_table(x, y):
+                    ev_type = "hit"
+                    spd = speed_kmh(f_p, f_n, pts[i - 1], pts[i + 1])
+                    txy = img_to_table(table_geo, (x, y)) if has_geo else None
+                    events.append({"frame": f, "x": x, "y": y, "type": ev_type,
+                                   "half": None, "adopted": None,
+                                   "table_xy": txy, "speed_kmh": spd})
+    return events, bounce_halves
 
 
 def detect_rallies(filled_track, fps, total_frames, raw_log_path, table_geo=None,
                    rally_lost_timeout=1.0, rally_min_duration=0.6, pre_roll_sec=1.0,
                    slow_speed_window_sec=1.0, slow_speed_min_in_play_sec=0.8,
-                   out_of_table_timeout=1.0, no_bounce_timeout=2.0, debug=False):
+                   out_of_table_timeout=1.0, no_bounce_timeout=2.0,
+                   bounce_halves=None, debug=False):
     if not filled_track or fps <= 0:
         return []
     ball_lookup = {f: ((x, y), not interp) for f, (x, y, interp) in filled_track.items()}
     sorted_frames = sorted(ball_lookup.keys())
-    bounce_halves = compute_bounce_halves(filled_track, table_geo, fps) if table_geo else {}
     net_line = table_geo.get("net_line") if table_geo else None
     net_center_x = _get_net_center_x(raw_log_path) if net_line is None else None
     if net_line is None and net_center_x is None and not bounce_halves:
@@ -1727,74 +1785,7 @@ def detect_rallies(filled_track, fps, total_frames, raw_log_path, table_geo=None
     return rallies
 
 
-def detect_events(filled_track, table_geo, fps):
-    events = []
-    if not filled_track:
-        return events
-    keys = sorted(filled_track.keys())
-    pts = [(k, filled_track[k][0], filled_track[k][1]) for k in keys]
-    n = len(pts)
-    if n < 5:
-        return events
 
-    def speed_kmh(k0, k1, p0, p1):
-        if table_geo is None:
-            return None
-        t0 = img_to_table(table_geo, (p0[1], p0[2]))
-        t1 = img_to_table(table_geo, (p1[1], p1[2]))
-        if t0 is None or t1 is None:
-            return None
-        d_mm = math.hypot(t1[0] - t0[0], t1[1] - t0[1])
-        dt = (k1 - k0) / fps
-        if dt <= 0:
-            return None
-        return (d_mm / 1000.0) / dt * 3.6
-
-    quad = table_geo.get("quad") if table_geo else None
-
-    def _in_table(x, y):
-        return True if quad is None else _point_in_corridor((x, y), quad)
-
-    _TX_MAX = TABLE_WID_M * 1000
-    _TY_MAX = TABLE_LEN_M * 1000
-    _SURFACE_TOL = 80
-
-    def _on_table_surface(x, y):
-        if table_geo is None:
-            return True
-        txy = img_to_table(table_geo, (x, y))
-        if txy is None:
-            return False
-        tx, ty = txy
-        return (-_SURFACE_TOL <= tx <= _TX_MAX + _SURFACE_TOL and
-                -_SURFACE_TOL <= ty <= _TY_MAX + _SURFACE_TOL)
-
-    last_bounce_frame = -10 ** 9
-    bounce_cooldown_frames = max(1, int(round(fps * 0.1)))
-    for i in range(2, n - 2):
-        f, x, y = pts[i]
-        f_p, x_p, y_p = pts[i - 1]
-        f_n, x_n, y_n = pts[i + 1]
-        ev_type = None
-        is_local_y_max = (y >= pts[i - 1][2] and y >= pts[i + 1][2] and
-                          y > pts[i - 2][2] and y > pts[i + 2][2])
-        vy_prev, vy_next = y - y_p, y_n - y
-        if is_local_y_max and vy_prev > 0.1 and vy_next < -0.1:
-            if (f - last_bounce_frame >= bounce_cooldown_frames and
-                    _in_table(x, y) and _on_table_surface(x, y)):
-                ev_type = "bounce"
-                last_bounce_frame = f
-        if ev_type is None:
-            vx_prev, vx_next = x - x_p, x_n - x
-            if vx_prev * vx_next < 0 and abs(vx_prev) > 2.0 and abs(vx_next) > 2.0:
-                if _in_table(x, y):
-                    ev_type = "hit"
-        if ev_type:
-            spd = speed_kmh(f_p, f_n, pts[i - 1], pts[i + 1])
-            txy = img_to_table(table_geo, (x, y)) if table_geo is not None else None
-            events.append({"frame": f, "x": x, "y": y, "type": ev_type,
-                           "speed_kmh": spd, "table_xy": txy})
-    return events
 
 
 # =====================================================================
@@ -1813,7 +1804,7 @@ def filter_alternating_landings(landings, debug=False):
     ordered = sorted(landings, key=lambda lp: lp["frame"])
     kept, last_half, n_drop = [], None, 0
     for lp in ordered:
-        half = _landing_half(lp)
+        half = lp.get("half") or _landing_half(lp)
         if half is None or half == last_half:
             n_drop += 1
             continue
@@ -2901,16 +2892,16 @@ def main():
         log(f"   球速基准: p50={p50:.0f}px/s  p95={p95:.0f}px/s  (共 {len(ball_speed_table)} 帧速度)")
 
     log("🎾 检测回合与落点/击球事件 ...")
+    # 统一落点/击球检测: 一次遍历产出渲染事件流 + 回合用落点半台分布
+    events, hl_bounce_halves = detect_bounce_events(filled, table_geo, fps,
+                                                    table_edge_tol=args.table_edge_tol)
     rallies = detect_rallies(filled, fps, total_frames, args.raw_detections,
-                             table_geo=table_geo,
+                             table_geo=table_geo, bounce_halves=hl_bounce_halves,
                              out_of_table_timeout=args.out_of_table_timeout,
                              rally_lost_timeout=args.rally_lost_timeout,
                              no_bounce_timeout=args.no_bounce_timeout, debug=args.debug)
-    events = detect_events(filled, table_geo, fps)
     log(f"   回合: {len(rallies)}, 事件: {len(events)}")
 
-    # 落点半台分布: 供"短回合豁免"与"精彩球少落点半台条件"共用
-    hl_bounce_halves = compute_bounce_halves(filled, table_geo, fps) if table_geo else {}
     segments, rally_starts_by_seg = build_segments(
         rallies, fps, total_frames, args,
         bounce_halves=hl_bounce_halves,
