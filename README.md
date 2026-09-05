@@ -15,6 +15,7 @@ yolo_frame_extractor/
 │   ├── run_pipeline.py                   #   一键流水线: 推理 → 高光
 │   ├── convert_yolo_to_labelstudio.py    #   YOLO 标注转 Label Studio 格式
 │   ├── train_pingpong_v2.py              #   YOLO 分割训练启动(bbox→polygon 自动转换)
+│   ├── export_onnx.py                    #   YOLO .pt → .onnx 导出
 │   ├── split_all1.py                     #   通用数据集拆分 train/val
 │   ├── split_all19.py                    #   数据集增量合并拆分(专用)
 │   └── track/                            #   目标追踪模式脚本
@@ -67,6 +68,7 @@ yolo_frame_extractor/
 | `run_pipeline.py` | 一键流水线: 推理 → 高光 | `src/` |
 | `convert_yolo_to_labelstudio.py` | YOLO 标注转 Label Studio 格式 | `src/` |
 | `train_pingpong_v2.py` | YOLO 分割训练启动 | `src/` |
+| `export_onnx.py` | YOLO .pt → .onnx 导出 | `src/` |
 | `split_all1.py` | 通用数据集拆分 train/val | `src/` |
 | `split_all19.py` | 数据集增量合并拆分(专用) | `src/` |
 | `inference_video_track.py` | track 追踪模式逐帧推理 | `src/track/` |

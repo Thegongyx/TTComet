@@ -71,6 +71,7 @@ YOLO 视频帧提取、推理与模型微调工具集。从检测日志中抽帧
 | 一键流水线（推理+高光） | `src/run_pipeline.py` | 最少只需 `--video`；支持批量目录模式 |
 | YOLO 分割模型训练 | `src/train_pingpong_v2.py` | bbox→polygon 自动转换, best_class AP/mAP50 双追踪 |
 | 数据集拆分 train/val | `src/split_all1.py` | `--src` / `--dst` CLI 参数 |
+| YOLO .pt→onnx 导出 | `src/export_onnx.py` | `--model` + 可选 `--imgsz`/`--half`/`--dynamic`/`--simplify`/`--nms`/`--opset` |
 | YOLO→Label Studio 转换 | `src/convert_yolo_to_labelstudio.py` | YOLO 标注格式转 Label Studio |
 | Track 逐帧推理 | `src/inference_video_track.py` | 带目标追踪的推理模式 |
 | Track 高光剪辑 | `src/pingpong_highlight_track.py` | 带目标追踪的高光模式 |
@@ -124,6 +125,15 @@ conda run -n yolo26 python src/random_sample_frames.py `
 conda run -n yolo26 python src/random_sample_frames.py `
     --video /path/to/video.mp4 `
     --no-log --count 20
+
+# YOLO .pt → onnx 导出
+conda run -n yolo26 python src/export_onnx.py `
+    --model models/m960n.pt `
+    --half --dynamic --simplify
+
+# YOLO .pt → onnx 批量导出 (递归扫描目录下所有 *.pt, 可加 --pattern / --no-recurse)
+conda run -n yolo26 python src/export_onnx.py `
+    --model-dir runs --pattern "*.pt" --output inference_output/
 
 # YOLO 逐帧推理
 conda run -n yolo26 python src/inference_video.py `
