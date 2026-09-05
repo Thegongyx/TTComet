@@ -5,12 +5,16 @@ __pycache__/
 
 # 预训练权重 (大文件, 可重新下载)
 *.pt
+*.onnx
 
 # 但 models/ 目录结构需要追踪
 !models/
 
 # npy 缓存 (大文件, 由外部工具生成)
 *.npy
+
+# ultralytics 标签缓存 (自动生成)
+*.cache
 
 # 训练输出 (大文件)
 runs/

@@ -1,31 +1,9 @@
 
-python train_pingpong_v2.py     --data train_data/all12_split/data.yaml     --pretrained models\m960n.pt    --name all12_ft --epochs 200 --batch 8 --lr0 0.0005
-
-python src/train_pingpong_v2.py     --data train_data/all8_split/data.yaml     --pretrained yolo26x-seg.pt    --name all9_ft --epochs 300 --batch 16 --imgsz 640
-
-python src/train_pingpong_v2.py     --data train_data/all9_split/data.yaml     --pretrained C:\Users\xu352\yolo_frame_extractor\runs\all8_ft\weights\best_class_0_map50.pt   --name all9_ft --epochs 300 --batch 8 --imgsz 640 --lr0 0.0005
-
-python src/train_pingpong_v2.py     --data train_data/all9_split/data.yaml     --pretrained yolo26x-seg.pt   --name all9_ft --epochs 300 --batch 16 --imgsz 640 
-
-python src/train_pingpong_v2.py     --data train_data/all11_split/data.yaml     --pretrained yolo26x-seg.pt   --name all11_ft --epochs 300 --batch 16
-
-python src/train_pingpong_v2.py     --data train_data/all16_split/data.yaml     --pretrained yolo26m-seg.pt    --name all16_ft --epochs 300 --batch 12 --imgsz 960
-
-python src/train_pingpong_v2.py     --data train_data/all18_split/data.yaml     --pretrained yolo26m-seg.pt    --name all18_ft --epochs 300 --batch 16 --imgsz 960
-
-python inference_video.py --video Videos/VID_20260527_214016.mp4 --model runs\all7_ft\weights\last.pt --output inference_output --batch-size 12 --half
-
 python src/train_pingpong_v2.py     --data train_data/all22_split/data.yaml     --pretrained models\m960n.pt    --name all22_ft --epochs 20 --batch 12 --lr0 0.00005 --optimizer AdamW
 
 python src/train_pingpong_v2.py     --data train_data/all21_split/data.yaml     --pretrained yolo26m-seg.pt    --name all21_ft --epochs 300 --batch 12 --imgsz 960
 
-
-
-这个文件/home/gongy/yolo26_frames/inference_output/detection_log.json 是 /home/gongy/yolo26_frames/inference_output/video_cfr.mp4 这个视频的学习后的结果，你能找到20帧 上一帧有球，下一帧也有球，只有当前帧没有球的帧，帮我抽出来20张这么样的帧图片，我要标注并重新用来训练，，，这个重视频里抽图片的脚本，你在/home/gongy/yolo26_frames/文件夹下新创建一个项目文件用来存储
-
-
-使用\\wsl.localhost\Ubuntu-24.04\home\gongy\yolo26_frames\yolo_frame_extractor\train_data\all1里边的yolo数据集，参考你刚才阅读的内容使用"\\wsl.localhost\Ubuntu-24.04\home\gongy\yolo26_frames\yolo_frame_extractor\train_pingpong_v2.py"，对"\\wsl.localhost\Ubuntu-24.04\home\gongy\yolo26_frames\pingpong_project_test\models\yolo26x-seg.pt"模型进行微调训练，，，训练之前一定要提前拆分训练集和测试集
-
+python src/train_pingpong_v2.py     --data train_data/all22_split/data.yaml     --pretrained yolo26s-seg.pt    --name all22s_ft --epochs 300 --batch 12 --imgsz 960
 
 
 python infer.py -v video.mp4 --half --batch-size 8 --writer-backend ffmpeg
@@ -42,8 +20,7 @@ python src\pingpong_highlight.py `  --video inference_output\pipeline_VID_202607
 python src\pingpong_highlight.py `  --video inference_output\pipeline_VID_20260828_214109\video_cfr.mp4 `  --raw-detections inference_output\pipeline_VID_20260828_214109\raw_detections.jsonl `  --output inference_output\pipeline_VID_20260828_214109\VID_20260828_214109_highlight.mp4 --debug
 
 
-inference_video.py是使用yolo26对视频推理的脚本，输出raw_detections.jsonl，包含乒乓球&选手&球拍的矩形框和球台&球网的多边形边界框；
-pingpong_highlight.py是根据raw_detections.jsonl的数据，对视频进行自动渲染和剪辑的脚本，现在已完成自动剪辑以及残影渲染，水花特效等工作；
+
 
 你的任务：在pingpong_highlight.py里新增脚本逻辑，用于在屏幕右上角（位置可调放到参数），放一个mini球台（大小可调放到参数），并且把乒乓球在真实球台的落点渲染在mini球台里，用来直观的给观众呈现每一球的落点；
 
@@ -59,24 +36,9 @@ pingpong_highlight.py是根据raw_detections.jsonl的数据，对视频进行自
 5.每次落台，统计从球拍触球到落台的真实世界的距离和所用时间，并在mini球台了渲染出以km/h为单位的速度
 
 
-
-
-inference_video.py是使用yolo26对视频推理的脚本，输出raw_detections.jsonl，包含乒乓球&选手&球拍的矩形框和球台&球网的多边形边界框；
-pingpong_highlight.py是根据raw_detections.jsonl的数据，对视频进行自动渲染和剪辑的脚本，现在已完成自动剪辑以及残影渲染，水花特效等工作；
-
-pingpong_highlight.py输出的日志中包含：  
-🏓 初始化 Mini 球台 overlay ...
-  ✅ Mini 球台几何就绪 | 近端=[786,582]→[921,600] 远端=[1140,546]→[1269,570] | 真实网线y=568.5
-  ✅ Mini 球台落点预计算: 269 个落点（近端0/远端0） | 261 个含速度 | 覆盖 19 个有效回合
-
-为什么这么多落点，但是一个都没有渲染到小球台上，你的任务是分析这个原因，并解决
-
-
 python src/run_pipeline.py --video Videos  --model models\m960n.pt  --batch-size 16 --half
 
 python src\run_pipeline.py --video Videos  --model models\m960n.pt --batch-size 16 --half --skip-inference
 
+python src/export_onnx.py --model-dir models --pattern "*.pt"
 
-你看下C:\Users\xu352\yolo_frame_extractor\inference_output\pipeline_VID_20260627_222900\raw_detections.jsonl，真实的球台球网的坐标应该是接近球台四角: [[764.1644287109375, 156.6559600830078], [1172.48486328125, 185.72071838378906], [1117.652587890625, 956.0406494140625], [709.3321533203125, 926.9758911132812]]
-  球网线: ((736.748291015625, 541.81591796875), (1145.0687255859375, 570.8806762695312)) ，但是C:\Users\xu352\yolo_frame_extractor\src\pingpong_highlight.py识别出来的是：球台四角: [[546.0, 592.0], [897.0, 502.0], [1186.0, 538.0], [950.0, 646.0]]
-  球网线: ((737.5322265625, 545.943115234375), (1145.5445556640625, 564.8370971679688)) ，是我取的帧太少了吗
