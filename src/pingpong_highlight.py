@@ -125,8 +125,10 @@ def parse_args():
     p.add_argument("--no-bounce-timeout", type=float, default=3.0,
                    help="回合内球台连续该秒数无新落点则回合结束 (默认 3.0)")
     p.add_argument("--corridor-max-drop", type=float, default=0.55, help="走廊过滤单次剔除比例上限")
-    p.add_argument("--no-court-cluster", action="store_true",
-                   help="关闭球台空间聚类过滤 (仅保留最大簇; 多球/高球误杀场景可关闭)")
+    p.add_argument("--court-cluster", action="store_true",
+                   help="启用球台空间聚类过滤 (DBSCAN 只保留最大簇)。"
+                        "实测会误删约 47%% 的真球检测 (被删点置信度与保留点同级, "
+                        "且只保留最大簇会让球台一侧完全无点), 默认关闭")
     p.add_argument("--center-dist-ratio", type=float, default=0.2,
                    help="实例中心离画面中心超过该比例×长边时丢弃 (0=关闭)")
     p.add_argument("--ball-conf", type=float, default=0.55,
@@ -2913,7 +2915,7 @@ def main():
         ball_cands = filter_ball_by_corridor(
             ball_cands, corridor, max_drop_ratio=args.corridor_max_drop,
             geo_rebuilt=geo_rebuilt, debug=args.debug)
-    if not args.no_court_cluster:
+    if args.court_cluster:
         ball_cands = cluster_ball_by_court(ball_cands, in_w, in_h, debug=args.debug)
     main_track = build_main_ball_track(
         ball_cands, fps, in_w, in_h, table_geo=table_geo, debug=args.debug,
