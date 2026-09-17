@@ -145,7 +145,7 @@ def parse_args():
                    help="前置精彩回合数量 (按平均球速降序取前 N 个, 默认 7)")
     p.add_argument("--highlight-min-duration", type=float, default=6.0,
                    help="前置精彩回合的最小合并前时长 (秒, 默认 6.0)")
-    p.add_argument("--highlight-min-bounce-count", type=int, default=5,
+    p.add_argument("--highlight-min-bounce-count", type=int, default=4,
                    help="前置精彩回合的落点条件: 落点较少半台的落点数 > 该值"
                         " (与时长条件取或, 满足任一即可入选, 默认 5)")
     p.add_argument("--highlight-black-gap", type=float, default=1.0,
@@ -2463,7 +2463,7 @@ def render(args, segments, rally_starts_by_seg, filled_track, events, table_geo,
         bmarker = BounceMarker()
         trail_renderer = SpeedTrailRenderer(intensity=fx_intensity)
         player_fx = PlayerFX(fps, out_w, out_h, intensity=fx_intensity) if enable_player_fx else None
-        TRAIL_LEN = max(12, int(fps * 0.5))
+        TRAIL_LEN = max(12, int(fps * 0.3))
 
         prepend_frame_count = sum(e - ps + 1 for ps, e in (prepend_segments or []))
         black_frame_count = int(round(fps * black_gap_sec)) if prepend_segments else 0
