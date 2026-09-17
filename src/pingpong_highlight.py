@@ -486,37 +486,61 @@ def _robust_median_quad(quad_list, img_hw, debug=False):
 
 
 def _fit_net_line_single(pts):
+    """
+    从球网分割轮廓拟合"球网与台面的接触线"(球网下边缘)。
+
+    旧实现靠"找连续 4 点 x 递增 / y 递减"猜左右角点, 在 66~80 点的密集轮廓上
+    极不稳定: 轮廓末端常有网柱/夹子的凸起, 会让右角点落在网的上边中段, 从而把
+    下边缘拟合成**对角线**(实测成功率仅 2.9%, 角度分布 -35°~+10° 双峰)。
+
+    改为下边缘包络拟合, 不依赖轮廓点序:
+      1) PCA 求网的长轴 u (朝右) 与垂直方向 v (朝下)
+      2) 沿 u 分箱, 每箱取 v 投影最大的点 → 下边缘采样点
+      3) 对采样点做 TLS 直线拟合
+      4) 端点取采样点在拟合方向上的投影极值
+    返回 ((x1, y1), (x2, y2)) 或 None。
+    """
     if pts is None or len(pts) < 4:
         return None
-    bl_idx = None
-    for i in range(1, min(len(pts) - 4, 30)):
-        if (pts[i + 1, 0] > pts[i, 0] and pts[i + 2, 0] > pts[i + 1, 0] and
-                pts[i + 3, 0] > pts[i + 2, 0]):
-            bl_idx = i
-            break
-    if bl_idx is None:
+    pts = np.asarray(pts, dtype=np.float64)
+    cen = pts.mean(axis=0)
+    X = pts - cen
+    try:
+        u = np.linalg.svd(X, full_matrices=False)[2][0]
+    except np.linalg.LinAlgError:
         return None
-    search_start = min(bl_idx + 10, len(pts) - 5)
-    br_idx = None
-    for i in range(search_start, len(pts) - 4):
-        if (pts[i + 1, 1] < pts[i, 1] and pts[i + 2, 1] < pts[i + 1, 1] and
-                pts[i + 3, 1] < pts[i + 2, 1]):
-            br_idx = i - 1
-            break
-    if br_idx is None or br_idx <= bl_idx:
+    if u[0] < 0:
+        u = -u
+    v = np.array([-u[1], u[0]], dtype=np.float64)
+    if v[1] < 0:
+        v = -v
+    t = X @ u
+    s = X @ v
+    span = float(t.max() - t.min())
+    if span < 10.0:
         return None
-    bl, br = pts[bl_idx], pts[br_idx]
-    net_vec = br - bl
-    net_len = float(np.linalg.norm(net_vec))
-    if net_len < 10.0:
+    n_bins = 20
+    bin_idx = np.clip(((t - t.min()) / span * n_bins).astype(int), 0, n_bins - 1)
+    env = [pts[bin_idx == b][int(np.argmax(s[bin_idx == b]))]
+           for b in range(n_bins) if (bin_idx == b).any()]
+    if len(env) < 3:
         return None
-    net_dir = net_vec / net_len
-    proj = (pts - bl) @ net_dir
-    p1 = bl + net_dir * proj.max()
-    p2 = bl + net_dir * proj.min()
+    env = np.array(env, dtype=np.float64)
+    ecen = env.mean(axis=0)
+    try:
+        d = np.linalg.svd(env - ecen, full_matrices=False)[2][0]
+    except np.linalg.LinAlgError:
+        return None
+    if d[0] < 0:
+        d = -d
+    proj = (env - ecen) @ d
+    p1 = ecen + d * float(proj.min())
+    p2 = ecen + d * float(proj.max())
+    if float(np.linalg.norm(p2 - p1)) < 10.0:
+        return None
     if p1[0] > p2[0]:
         p1, p2 = p2, p1
-    return (tuple(p1.astype(float).tolist()), tuple(p2.astype(float).tolist()))
+    return (tuple(p1.tolist()), tuple(p2.tolist()))
 
 
 def _median_net_line(line_list):
@@ -531,7 +555,16 @@ def _median_net_line(line_list):
 # =====================================================================
 #  几何校验 + 基于约束的重建
 # =====================================================================
+# [临时测试开关] True = 禁用全部约束重建。
+# 3 处调用点(validate_and_refine_quad / 网线二分失败 / 四边形过窄)都会拿到
+# None 并自动回退到检测到的中位数四角, 不再用球网线合成台面。
+# 改回 False 即恢复原有的"校验自愈"重建逻辑。
+DISABLE_QUAD_REBUILD = False
+
+
 def rebuild_quad_from_constraints(table_pts, net_line, img_hw, debug=False):
+    if DISABLE_QUAD_REBUILD:
+        return None
     if net_line is not None:
         net_start = np.array(net_line[0], dtype=np.float64)
         net_end = np.array(net_line[1], dtype=np.float64)
@@ -711,6 +744,8 @@ def extract_table_geometry(frames, img_hw, debug=False, persp_blend=0.0,
     if quad is None:
         log("⚠️ 球台四角中位数拟合失败")
         return None
+    if debug:
+        log(f"  检测中位数四角(调整前): {quad.tolist()}")
 
     net_lines = []
     for fr in sample_frames:
@@ -723,6 +758,8 @@ def extract_table_geometry(frames, img_hw, debug=False, persp_blend=0.0,
     net_line = _median_net_line(net_lines) if len(net_lines) >= 3 else None
 
     quad, was_rebuilt = validate_and_refine_quad(quad, table_pts_agg, net_line, img_hw, debug=debug)
+    if debug:
+        log(f"  关卡1校验后四角({'已重建' if was_rebuilt else '未改动'}): {quad.tolist()}")
 
     if net_line is not None and not was_rebuilt:
         bisects_ok, _ = _net_bisects_quad(quad, net_line, img_hw)
