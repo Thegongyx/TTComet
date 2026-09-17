@@ -19,7 +19,7 @@ python src\pingpong_highlight.py `  --video inference_output\pipeline_VID_202607
 
 python src\pingpong_highlight.py `  --video inference_output\pipeline_VID_20260828_214109\video_cfr.mp4 `  --raw-detections inference_output\pipeline_VID_20260828_214109\raw_detections.jsonl `  --output inference_output\pipeline_VID_20260828_214109\VID_20260828_214109_highlight.mp4 --debug
 
-
+python src\pingpong_highlight.py `  --video inference_output\pipeline_VID_20260916_201820\video_cfr.mp4 `  --raw-detections inference_output\pipeline_VID_20260916_201820\raw_detections.jsonl `  --output inference_output\pipeline_VID_20260916_201820\VID_20260916_201820_highlight.mp4 --debug
 
 
 你的任务：在pingpong_highlight.py里新增脚本逻辑，用于在屏幕右上角（位置可调放到参数），放一个mini球台（大小可调放到参数），并且把乒乓球在真实球台的落点渲染在mini球台里，用来直观的给观众呈现每一球的落点；
@@ -42,3 +42,4 @@ python src\run_pipeline.py --video Videos  --model models\m960n.pt --batch-size 
 
 python src/export_onnx.py --model-dir models --pattern "*.pt"
 
+python src/export_onnx.py --model models/n960n.pt
