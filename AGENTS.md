@@ -10,6 +10,7 @@
 - **Conda 环境**（Windows 原生，均已从 WSL2 迁移到 Windows）:
   - `yolo26` — YOLO 推理 / 训练 / ML 后端（`src_yls`）
   - `label-studio` — Label Studio 标注服务本体（Python 3.12，label-studio 1.23.0）
+  - `rfdetr` — RF-DETR 训练 / 推理 / 流水线（`src_detr`）。由 `yolo26` 克隆而来以复用 ROCm torch，再 `pip install rfdetr[train]==1.10.1`
 
 ## OVERVIEW
 YOLO 视频帧提取、推理与模型微调工具集。从检测日志中抽帧、运行 YOLO 推理、自动生成高光集锦、训练微调模型（支持 ROCm / CUDA）。
@@ -30,6 +31,12 @@ YOLO 视频帧提取、推理与模型微调工具集。从检测日志中抽帧
 │   ├── convert_yolo_to_labelstudio.py  #   YOLO 标注转 Label Studio 格式
 │   ├── train_pingpong_v2.py            #   YOLO 分割训练启动（bbox→polygon 转换）
 │   └── split_all1.py                   #   数据集拆分 train/val
+├── src_detr/                            # RF-DETR 队列（训练/推理/流水线, 复用 src/pingpong_highlight.py）
+│   ├── train_detr.py                    #   RF-DETR 微调（detect/seg; 自动搭 YOLO→RF-DETR 数据集视图）
+│   ├── inference_video_detr.py          #   RF-DETR 逐帧推理 → 与 YOLO 版同格式的 raw_detections.jsonl
+│   ├── run_pipeline_detr.py             #   一键流水线: RF-DETR 推理 + src/pingpong_highlight.py
+│   ├── download_weights.py              #   官方权重多连接下载器 (MD5 校验 + 断点续传)
+│   └── README.md                        #   环境搭建与用法
 ├── src_yls/                             # Label Studio ML 后端
 │   ├── model.py                         #   ML 后端模型入口
 │   ├── control_models/                  #   控制模型实现
@@ -45,12 +52,17 @@ YOLO 视频帧提取、推理与模型微调工具集。从检测日志中抽帧
 ├── yolo26m-seg.pt                       # YOLO medium 分割预训练权重
 ├── yolo26s-seg.pt                       # YOLO small 分割预训练权重
 ├── yolo26n.pt                           # YOLO nano 预训练权重
+├── rf-detr-seg-nano.pt                  # RF-DETR seg 预训练权重 (nano)
+├── rf-detr-seg-small.pt                 # RF-DETR seg 预训练权重 (small)
+├── rf-detr-seg-medium.pt                # RF-DETR seg 预训练权重 (medium)
+├── rf-detr-seg-2xlarge.pt               # RF-DETR seg 预训练权重 (2xlarge, 768²)
 ├── train_data/                          # 标注数据集 (images/ + labels/ + data.yaml)
 │   ├── all12_labelstudio/               #   从 WSL2 迁移的数据集 (labelstudio_tasks.json 导出)
 │   ├── all18/                           #   全量数据集 (最新版本)
 │   ├── all18_split/                     #   同上, 已拆分 80/20 train/val
 │   └── all17_split/                     #   历史版本, 已拆分
-├── runs/                                # 训练输出 (weights, metrics, plots)
+├── runs/                                # YOLO 训练输出 (weights, metrics, plots)
+├── runs_detr/                           # RF-DETR 训练输出 (checkpoint_*.pth)
 ├── Videos/                              # 原始输入视频
 ├── random_frames/                       # 输出: random_sample_frames.py 抽帧结果
 ├── missing_ball_frames/                 # 输出: extract_missing_ball.py 漏检帧结果
@@ -76,6 +88,10 @@ YOLO 视频帧提取、推理与模型微调工具集。从检测日志中抽帧
 | Track 逐帧推理 | `src/inference_video_track.py` | 带目标追踪的推理模式 |
 | Track 高光剪辑 | `src/pingpong_highlight_track.py` | 带目标追踪的高光模式 |
 | Track 一键流水线 | `src/run_pipeline_track.py` | track 模式推理+高光 |
+| RF-DETR 训练（detect/seg） | `src_detr/train_detr.py` | 复用 YOLO 数据集; 自动在 `tmp/` 搭 RF-DETR 数据集视图; 输出 `runs_detr/<name>/checkpoint_best_total.pth` |
+| RF-DETR 逐帧推理 | `src_detr/inference_video_detr.py` | 输出与 YOLO 版同 schema 的 `raw_detections.jsonl`（含 table/net polygon） |
+| RF-DETR 一键流水线 | `src_detr/run_pipeline_detr.py` | RF-DETR 推理 + 共用 `src/pingpong_highlight.py` |
+| RF-DETR 权重预下载 | `src_detr/download_weights.py` | 官方 GCS 源多连接分段 + MD5 校验; 缓存到 `~/.roboflow/models/` |
 | Label Studio ML 后端 | `src_yls/model.py` | Label Studio 集成，`src_yls/start.py` 启动 |
 | Label Studio 标注服务 | conda 环境 `label-studio` | Windows 原生运行, `http://localhost:8080`, 数据在 `%LOCALAPPDATA%\label-studio\label-studio\` |
 | 查找训练结果 | `runs/<name>/weights/best.pt` | 同时保存 best_class_*_ap.pt 和 best_class_*_map50.pt |
@@ -85,6 +101,7 @@ YOLO 视频帧提取、推理与模型微调工具集。从检测日志中抽帧
 - **项目内沟通和思考使用中文** — 所有文档、注释、交互均使用中文
 - **Shell 为 PowerShell** — 换行符用 `` ` ``（反引号），路径可用 `/` 或 `\`。不要用 bash 语法（`^`、`&&`、`\` 换行等）
 - **所有脚本在 conda 环境 `yolo26` 中运行**: `conda run -n yolo26 python src/<script>.py`
+- **`src_detr/` 脚本在 conda 环境 `rfdetr` 中运行**: `conda run -n rfdetr python src_detr/<script>.py`（`rfdetr` 由 `yolo26` 克隆，含相同 ROCm torch，可直接跑 `src/pingpong_highlight.py`）
 - **Windows 用 `python`，WSL/Linux 用 `python3`**
 - **Scripts are self-contained**: each has `main()` + `if __name__ == "__main__"`, no cross-file imports（`extract_rejected_ball_frames.py` 和 `run_pipeline.py` 除外 — 前者复制了 TableModel，后者通过子进程调其他脚本）
 - **Labels are YOLO format**: one `.txt` per image, each line: `class_id x_center y_center width height` (normalized [0,1])
@@ -165,6 +182,25 @@ conda run -n yolo26 python src/train_pingpong_v2.py `
     --pretrained yolo26x-seg.pt `
     --name my_run --epochs 100 --batch 4
 
+# RF-DETR 微调训练 (分割, 复用 YOLO 数据集; 输出 runs_detr/<name>/checkpoint_best_total.pth)
+conda run -n rfdetr python src_detr/train_detr.py `
+    --data train_data/all22_split/data.yaml `
+    --size medium --task seg --name pingpong_detr_v1
+
+# RF-DETR 官方权重预下载 (多连接加速 + MD5; 缓存到 ~/.roboflow/models/)
+conda run -n rfdetr python src_detr/download_weights.py --models seg-nano seg-small seg-medium
+
+# RF-DETR 逐帧推理 (输出与 YOLO 版同格式的 raw_detections.jsonl, 可被 pingpong_highlight.py 使用)
+conda run -n rfdetr python src_detr/inference_video_detr.py `
+    --model runs_detr/pingpong_detr_v1/checkpoint_best_total.pth `
+    --video Videos/match.mp4 `
+    --output inference_output/detr_match
+
+# RF-DETR 一键流水线: 推理 + 高光 (单视频 / 批量目录)
+conda run -n rfdetr python src_detr/run_pipeline_detr.py `
+    --model runs_detr/pingpong_detr_v1/checkpoint_best_total.pth `
+    --video Videos/
+
 # Label Studio 标注服务 (Windows 原生, conda 环境 label-studio)
 conda run -n label-studio label-studio start --port 8080
 
@@ -181,3 +217,5 @@ conda run -n yolo26 python src_yls/_wsgi.py --port 9090 --host 0.0.0.0
 - **OOM workaround**: reduce `--batch` (default 4) if GPU runs out of memory
 - **mAP@50-95 >0.60** is target for production models
 - Training results in `runs/<name>/results.csv` for post-hoc analysis
+- **RF-DETR (`src_detr/`)**: 用 RF-DETR (DINOv2 backbone, NMS-free) 替代 YOLO。数据集仍是 YOLO 格式，`train_detr.py` 在 `tmp/detr_dataset_<name>/` 用 **junction/软链接** 搭 `train/{images,labels}` + `valid/{images,labels}` 视图（不复制图片），RF-DETR 原生支持 YOLO 格式与 bbox/polygon 混合标签。推理输出的 `raw_detections.jsonl` 与 YOLO 版逐字段一致，`src/pingpong_highlight.py` 直接可用。分割 checkpoint 会输出 table/net 的 `polygon`。详见 `src_detr/README.md`
+- **RF-DETR 权重**: 官方权重在 Google Storage（非 HuggingFace；HF 上 `Roboflow/rf-detr-*` 是 transformers safetensors，与 pip 包不通用，且 hf-mirror 实测更慢）。用 `src_detr/download_weights.py` 多连接预下载（约 2 倍速 + MD5），缓存到 `~/.roboflow/models/`，之后训练/推理直接命中不再联网

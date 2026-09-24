@@ -51,3 +51,7 @@ desktop.ini
 .vscode/
 .idea/
 .qoder/
+
+# RF-DETR training output
+runs_detr/
+*.pth
