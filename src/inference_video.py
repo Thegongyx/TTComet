@@ -155,9 +155,10 @@ def parse_args():
     parser.add_argument("--cfr-contrast", type=float, default=10.0)
     parser.add_argument("--cfr-saturation", type=float, default=6.0)
     # [v8 PERF] 新增性能相关参数
-    parser.add_argument("--post-workers", type=int, default=8,
+    parser.add_argument("--post-workers", type=int, default=2,
                         help="[v8] CPU 后处理 worker 线程数 (绘图/resize/mask/JSON)。"
-                             "GPU 利用率低时调大 (4-8); CPU 核多可到物理核数-2")
+                             "实测 2 比 8 更快 (CPython GIL: 线程多了只是抢锁, 不增吞吐); "
+                             "后处理是瓶颈时可试 1~4")
     parser.add_argument("--reader-threads", type=int, default=1,
                         help="[v8] 视频解码线程数。大分辨率视频单线程 cap.read() "
                              "可能是瓶颈, 设 2-3 分段并行解码 (需 total_frames 已知)")
@@ -528,40 +529,33 @@ def extract_result_cpu(result, want_polygons, polygon_needed_cls_ids):
     张量搬到 CPU numpy。这样后处理 worker 线程里就不再触发任何 .cpu() 同步,
     GPU 不会因后处理线程的懒下载而 stall。
     返回一个纯 CPU 的轻量 dict, 可安全跨线程传递。
+
+    [perf] 只搬运下游真正会读的 mask (table/net, 即 polygon_needed_cls_ids)。
+    其余类别的 mask 既不参与叠加也不参与 polygon, 搬它们纯属浪费带宽/CPU;
+    注意: 所有检测的 bbox/confidence/class 依然一个不少地全部输出。
+    [perf] 轮廓提取 (masks.xy) 也从主线程挪到 worker, 见 process_payload_cpu。
     """
     boxes = result.boxes
     masks = result.masks
     payload = {"xyxy": None, "conf": None, "cls": None,
-               "masks_np": None, "polygons_by_idx": None}
+               "mask_np": None, "mask_cls": None, "mask_idx": None,
+               "mask_shape": None}
 
     if boxes is not None and len(boxes) > 0:
         payload["xyxy"] = boxes.xyxy.cpu().numpy()
         payload["conf"] = boxes.conf.cpu().numpy()
         payload["cls"]  = boxes.cls.cpu().numpy().astype(np.int32)
 
-        if masks is not None and masks.data is not None and len(masks.data) > 0:
-            payload["masks_np"] = masks.data.cpu().numpy()
-
-            # polygon 也在这里一次性取出 (masks.xy 内部也走 CPU)
-            if want_polygons:
-                all_cls = payload["cls"]
-                need_idx = [i for i in range(len(all_cls))
-                            if int(all_cls[i]) in polygon_needed_cls_ids]
-                if need_idx:
-                    polys = {}
-                    try:
-                        xy_list = masks.xy
-                        for i in need_idx:
-                            if i < len(xy_list):
-                                poly = xy_list[i]
-                                if poly is not None and len(poly) > 0:
-                                    polys[i] = [
-                                        [round(float(x), 1), round(float(y), 1)]
-                                        for x, y in poly
-                                    ]
-                    except Exception:
-                        pass
-                    payload["polygons_by_idx"] = polys
+        if masks is not None and getattr(masks, "data", None) is not None and len(masks.data) > 0:
+            all_cls = payload["cls"]
+            need_idx = [i for i in range(len(all_cls))
+                        if int(all_cls[i]) in polygon_needed_cls_ids]
+            if need_idx:
+                # 只搬这些 mask (通常 table/net 各 1 个), 而不是全部 N 个
+                payload["mask_np"] = masks.data[need_idx].cpu().numpy()
+                payload["mask_cls"] = all_cls[need_idx]
+                payload["mask_idx"] = need_idx
+                payload["mask_shape"] = tuple(getattr(masks, "orig_shape", ()))
     return payload
 
 
@@ -588,9 +582,28 @@ def process_payload_cpu(
     all_xyxy = payload["xyxy"]
     all_conf = payload["conf"]
     all_cls  = payload["cls"]
-    masks_np = payload["masks_np"]
-    polygons_by_idx = payload["polygons_by_idx"] or {}
-    cls_ids_np = all_cls
+    mask_np  = payload["mask_np"]
+    mask_cls = payload["mask_cls"]
+    mask_idx = payload["mask_idx"] or []
+    mask_shape = payload["mask_shape"]
+
+    # [perf] 轮廓提取从主线程挪到这里 (worker), 且只对已搬运的 mask (table/net) 做。
+    # 原实现是在主线程对"全部" mask 调 masks.xy, 既占了喂 GPU 的关键路径, 又白算了用不到的类别。
+    polygons_by_idx = {}
+    if want_polygons and mask_np is not None and len(mask_idx):
+        try:
+            from ultralytics.engine.results import Masks as _Masks
+            _xy = _Masks(torch.from_numpy(mask_np), mask_shape).xy
+            for _k, _orig_i in enumerate(mask_idx):
+                if _k < len(_xy):
+                    _poly = _xy[_k]
+                    if _poly is not None and len(_poly) > 0:
+                        polygons_by_idx[_orig_i] = [
+                            [round(float(x), 1), round(float(y), 1)]
+                            for x, y in _poly
+                        ]
+        except Exception:
+            pass
 
     if all_cls is not None:
         n = len(all_cls)
@@ -612,9 +625,9 @@ def process_payload_cpu(
                 best_detections[cls_id] = det
 
     # table/net mask overlay
-    if masks_np is not None and cls_ids_np is not None:
+    if mask_np is not None and mask_cls is not None:
         table_mask_u8, net_mask_u8 = mask_proc.resize_masks(
-            masks_np, cls_ids_np, (out_h, out_w), TABLE_CLASS_ID, NET_CLASS_ID)
+            mask_np, mask_cls, (out_h, out_w), TABLE_CLASS_ID, NET_CLASS_ID)
     else:
         table_mask_u8 = net_mask_u8 = None
 
