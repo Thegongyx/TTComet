@@ -51,7 +51,7 @@ import subprocess
 import argparse
 import torch
 import threading
-from queue import Queue
+from queue import Queue, Empty
 from datetime import datetime
 from collections import defaultdict
 from dataclasses import dataclass
@@ -164,6 +164,13 @@ def parse_args():
                              "可能是瓶颈, 设 2-3 分段并行解码 (需 total_frames 已知)")
     parser.add_argument("--prefetch-batches", type=int, default=6,
                         help="[v8] 预取批数 (read_queue 深度), 吸收解码/GPU 抖动")
+    # [perf] 双缓冲重叠
+    parser.add_argument("--overlap", action=argparse.BooleanOptionalAction, default=True,
+                        help="[perf] 双缓冲 (默认开启): 把 predict 放到专用线程专职喂 GPU, 主线程负责"
+                             "消费上一批的结果 (extract_result_cpu + 投递), 让 CPU 出结果的耗时可与 GPU "
+                             "前向重叠, 减少 GPU 空等。用 --no-overlap 关闭 (回退到原来的单线程串行)")
+    parser.add_argument("--overlap-queue", type=int, default=3,
+                        help="[perf] --overlap 下的结果队列深度 (批数)。越大越能吸收抖动, 但越占显存/内存")
     return parser.parse_args()
 
 
@@ -996,83 +1003,141 @@ def process_one_video(video_path, args, ctx, output_dir=None):
         finished_readers = 0
         n_readers = len(reader_threads)
 
+        use_overlap = bool(getattr(args, "overlap", False))
+        predict_kwargs = dict(
+            conf=ctx.min_conf_for_predict, iou=args.iou,
+            verbose=False, imgsz=ctx.IMGSZ, augment=False,
+            device=ctx.device, quantize=16 if ctx.use_half else None, stream=False,
+        )
+        results_q = (Queue(maxsize=max(2, int(getattr(args, "overlap_queue", 3))))
+                     if use_overlap else None)
+        infer_stop = threading.Event()
+        infer_threads = []
+
+        def _predict_batch(batch_item):
+            """只做 GPU 前向 (含 ultralytics 预处理/后处理), 不搬 CPU 结果。"""
+            frames_in_batch = [item[1] for item in batch_item]
+            actual_n = len(frames_in_batch)
+            pad_n = 0
+            if 0 < actual_n < ctx.BATCH_SIZE:
+                pad_n = ctx.BATCH_SIZE - actual_n
+                # 必须用与真实帧同 H,W 的零帧: 方形零帧 (IMGSZ,IMGSZ,3) 会让 ultralytics 的
+                # same_shapes=False → LetterBox auto=False → 补齐成方形 (如 960x960), 与正常批的
+                # 矩形 (如 544x960) 形状不同 → MIOpen 尾批重新编译内核 (卡很久) 且多算 1.76x 像素。
+                frames_in_batch = frames_in_batch + [np.zeros_like(frames_in_batch[0])] * pad_n
+            with torch.inference_mode():
+                results = ctx.model.predict(frames_in_batch, **predict_kwargs)
+            if pad_n > 0:
+                results = results[:actual_n]
+            return results
+
+        def _infer_loop():
+            """[perf] 专职喂 GPU 的线程: 只 predict, 结果 (含 GPU 张量) 丢进有界的 results_q。
+            队列满时自然阻塞 → 背压, 不会无限堆显存。"""
+            fin = 0
+            try:
+                while not infer_stop.is_set():
+                    batch_item = read_queue.get()
+                    if batch_item is None:
+                        fin += 1
+                        results_q.put(None)
+                        if fin >= n_readers:
+                            break
+                        continue
+                    results_q.put((batch_item, _predict_batch(batch_item)))
+            except Exception as e:
+                print(f"⚠️ infer_loop error: {e}")
+                import traceback
+                traceback.print_exc()
+                try:
+                    for _ in range(max(1, n_readers)):
+                        results_q.put(None, timeout=5)
+                except Exception:
+                    pass
+
+        def _consume_batch(batch_item, results):
+            """[perf] 主线程: 把一批结果搬回 CPU 并投递后处理 (不含 GPU 前向)。
+            --overlap 时它与推理线程的 GPU 前向并行发生。"""
+            nonlocal max_seq_seen, frame_idx, processed_count, batch_count
+            nonlocal last_log_time, last_log_idx, ewma_fps
+            for result, (orig_idx, frame_raw) in zip(results, batch_item):
+                payload = extract_result_cpu(
+                    result, ctx.want_polygons, ctx.POLYGON_NEEDED_CLASS_IDS)
+                post_in_q.put((orig_idx, payload, frame_raw))
+                if orig_idx > max_seq_seen:
+                    max_seq_seen = orig_idx
+                frame_idx = orig_idx
+                processed_count += 1
+
+            batch_count += 1
+            if args.empty_cache_every > 0 and ctx.device != "cpu" \
+               and batch_count % args.empty_cache_every == 0:
+                try:
+                    torch.cuda.empty_cache()
+                except Exception:
+                    pass
+
+            now = datetime.now()
+            if (now - last_log_time).total_seconds() >= 2.0 and processed_count > 0:
+                dt = (now - last_log_time).total_seconds()
+                instant_fps = (processed_count - last_log_idx) / max(dt, 1e-6)
+                ewma_fps = instant_fps if ewma_fps is None \
+                           else 0.7 * ewma_fps + 0.3 * instant_fps
+                total_dets_now = sum(state["total_class_counts"].values())
+
+                if total_frames > 0:
+                    pct = processed_count / total_frames * 100
+                    bar_len = 30
+                    filled = int(bar_len * processed_count / total_frames)
+                    bar = "█" * filled + "░" * (bar_len - filled)
+                    eta = (total_frames - processed_count) / max(ewma_fps, 1e-6)
+                    print(f"  [{bar}] {pct:5.1f}%  "
+                          f"帧 {processed_count:,}/{total_frames:,}  "
+                          f"{instant_fps:.1f} fps | ETA {eta:.0f}s  "
+                          f"| 检出(已写): {total_dets_now}", flush=True)
+                else:
+                    elapsed_total = (now - start_time).total_seconds()
+                    print(f"  帧 {processed_count:,}  "
+                          f"{instant_fps:.1f} fps (EWMA {ewma_fps:.1f})  "
+                          f"已耗时 {elapsed_total:.0f}s", flush=True)
+
+                last_log_time = now
+                last_log_idx  = processed_count
+
         try:
-            while True:
-                batch_item = read_queue.get()
-                if batch_item is None:
-                    finished_readers += 1
-                    # 所有 reader 都发了结束信号才退出
-                    if finished_readers >= n_readers:
-                        break
-                    continue
-
-                frames_in_batch = [item[1] for item in batch_item]
-                actual_n = len(frames_in_batch)
-                pad_n = 0
-                if 0 < actual_n < ctx.BATCH_SIZE:
-                    pad_n = ctx.BATCH_SIZE - actual_n
-                    # 必须用与真实帧同 H,W 的零帧: 方形零帧 (IMGSZ,IMGSZ,3) 会让 ultralytics 的
-                    # same_shapes=False → LetterBox auto=False → 补齐成方形 (如 960x960), 与正常批的
-                    # 矩形 (如 544x960) 形状不同 → MIOpen 尾批重新编译内核 (卡很久) 且多算 1.76x 像素。
-                    frames_in_batch = frames_in_batch + [np.zeros_like(frames_in_batch[0])] * pad_n
-
-                # [v8 PERF] 主线程只做 GPU 推理
-                with torch.inference_mode():
-                    results = ctx.model.predict(
-                        frames_in_batch,
-                        conf=ctx.min_conf_for_predict, iou=args.iou,
-                        verbose=False, imgsz=ctx.IMGSZ, augment=False,
-                        device=ctx.device, quantize=16 if ctx.use_half else None, stream=False,
-                    )
-                if pad_n > 0:
-                    results = results[:actual_n]
-
-                # [v8 PERF] 一次性把 GPU 结果搬到 CPU (在本线程完成同步),
-                # 然后把纯 CPU payload 丢给后处理线程池 → GPU 立刻去跑下一批
-                for result, (orig_idx, frame_raw) in zip(results, batch_item):
-                    payload = extract_result_cpu(
-                        result, ctx.want_polygons, ctx.POLYGON_NEEDED_CLASS_IDS)
-                    post_in_q.put((orig_idx, payload, frame_raw))
-                    if orig_idx > max_seq_seen:
-                        max_seq_seen = orig_idx
-                    frame_idx = orig_idx
-                    processed_count += 1
-
-                batch_count += 1
-                if args.empty_cache_every > 0 and ctx.device != "cpu" \
-                   and batch_count % args.empty_cache_every == 0:
+            if use_overlap:
+                t_infer = threading.Thread(target=_infer_loop, daemon=True)
+                infer_threads.append(t_infer)
+                t_infer.start()
+                fin_cons = 0
+                while True:
                     try:
-                        torch.cuda.empty_cache()
-                    except Exception:
-                        pass
-
-                now = datetime.now()
-                if (now - last_log_time).total_seconds() >= 2.0 and processed_count > 0:
-                    dt = (now - last_log_time).total_seconds()
-                    instant_fps = (processed_count - last_log_idx) / max(dt, 1e-6)
-                    ewma_fps = instant_fps if ewma_fps is None \
-                               else 0.7 * ewma_fps + 0.3 * instant_fps
-                    total_dets_now = sum(state["total_class_counts"].values())
-
-                    if total_frames > 0:
-                        pct = processed_count / total_frames * 100
-                        bar_len = 30
-                        filled = int(bar_len * processed_count / total_frames)
-                        bar = "█" * filled + "░" * (bar_len - filled)
-                        eta = (total_frames - processed_count) / max(ewma_fps, 1e-6)
-                        print(f"  [{bar}] {pct:5.1f}%  "
-                              f"帧 {processed_count:,}/{total_frames:,}  "
-                              f"{instant_fps:.1f} fps | ETA {eta:.0f}s  "
-                              f"| 检出(已写): {total_dets_now}", flush=True)
-                    else:
-                        elapsed_total = (now - start_time).total_seconds()
-                        print(f"  帧 {processed_count:,}  "
-                              f"{instant_fps:.1f} fps (EWMA {ewma_fps:.1f})  "
-                              f"已耗时 {elapsed_total:.0f}s", flush=True)
-
-                    last_log_time = now
-                    last_log_idx  = processed_count
+                        item = results_q.get(timeout=1.0)
+                    except Empty:
+                        # 防御: 推理线程异常退出且队列已空 → 不要无限等
+                        if not t_infer.is_alive():
+                            print("⚠️ 推理线程已退出且结果队列为空, 提前结束")
+                            break
+                        continue
+                    if item is None:
+                        fin_cons += 1
+                        if fin_cons >= n_readers:
+                            break
+                        continue
+                    batch_item, results = item
+                    _consume_batch(batch_item, results)
+            else:
+                while True:
+                    batch_item = read_queue.get()
+                    if batch_item is None:
+                        finished_readers += 1
+                        # 所有 reader 都发了结束信号才退出
+                        if finished_readers >= n_readers:
+                            break
+                        continue
+                    _consume_batch(batch_item, _predict_batch(batch_item))
         finally:
+            infer_stop.set()
             reader_stop.set()
 
             # [v8 PERF] 告诉 ordering 线程总共有多少帧 (= 已 dispatch 的最大 seq + 1)
@@ -1091,6 +1156,9 @@ def process_one_video(video_path, args, ctx, output_dir=None):
             # 收尾其余线程
             for wt in post_workers:
                 try: wt.join(timeout=10)
+                except Exception: pass
+            for t in infer_threads:
+                try: t.join(timeout=10)
                 except Exception: pass
             for t in reader_threads:
                 try: t.join(timeout=5)
