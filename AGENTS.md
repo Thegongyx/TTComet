@@ -83,7 +83,7 @@ YOLO 视频帧提取、推理与模型微调工具集。从检测日志中抽帧
 | 一键流水线（推理+高光） | `src/run_pipeline.py` | 最少只需 `--video`；支持批量目录模式 |
 | YOLO 分割模型训练 | `src/train_pingpong_v2.py` | bbox→polygon 自动转换, best_class AP/mAP50 双追踪 |
 | 数据集拆分 train/val | `src/split_all1.py` | `--src` / `--dst` CLI 参数 |
-| YOLO .pt→onnx 导出 | `src/export_onnx.py` | `--model` + 可选 `--imgsz`/`--half`/`--dynamic`/`--simplify`/`--nms`/`--opset` |
+| YOLO .pt→onnx 导出 | `src/export_onnx.py` | `--model` + 可选 `--imgsz`/`--half`/`--dynamic`/`--simplify`/`--nms`/`--opset`（`--half` 内部映射为 ultralytics `quantize=16`） |
 | YOLO→Label Studio 转换 | `src/convert_yolo_to_labelstudio.py` | YOLO 标注格式转 Label Studio |
 | Track 逐帧推理 | `src/inference_video_track.py` | 带目标追踪的推理模式 |
 | Track 高光剪辑 | `src/pingpong_highlight_track.py` | 带目标追踪的高光模式 |
@@ -210,6 +210,8 @@ conda run -n yolo26 python src_yls/_wsgi.py --port 9090 --host 0.0.0.0
 
 ## NOTES
 - **GPU**: AMD Radeon via ROCm (`device: "0"` in ultralytics) 或 NVIDIA CUDA 均可，ultralytics 自动检测
+- **yolo26 环境栈 (2026-10)**: torch `2.13.0+rocm10.1.0` / torchvision `0.28.0+rocm10.1.0` / torchaudio `2.11.0.3+rocm10.1.0` / ROCm SDK `10.1.0`，来自 AMD 预发布通道 `--index-url https://stable.repo.amd.com/rocm/whl-next/`（示例：`"torch[device-gfx1151]==2.13.0+rocm10.1.0"`）。注意 `rocm_is_available()` 只认 Linux，Windows+ROCm 仍被 ultralytics 误判为 CUDA。换 ROCm 版本会使 MIOpen 缓存整体失效，首次推理/训练需重建（ROCm 10.1 在 gfx1151 上首批实测约 14 分钟，7.14 约 4 分钟）。`HIP_PATH`（用户变量，指向独立的 `C:\xiangmu\lemonade\rocm-7.14`）与 pip 版 ROCm 10.1 并存未冲突，暂未改动。原 7.14 组合快照见历史记录；`rfdetr` 环境未升级（仍 torch 2.12.0+rocm7.14.0），`src_detr/` 不受影响
+- **ultralytics 版本**: `yolo26` 环境固定为 `8.4.173`（2026-10 升级，前为 8.4.60）。新版新增硬依赖 `nvidia-ml-py` / `ultralytics-platform` / `ultralytics-thop>=2.2.2`，并支持 AMD ROCm / MIGraphX 导出。API 上 `half`/`int8` 已废弃 → 用 `quantize`（`16`=FP16），`end2end` 已废弃 → 用 `nms`（`False`=NMS-free 头）。脚本已适配，勿再直接传 `half=`/`end2end=`（否则每次 `predict` 都会刷废弃警告）。`rfdetr` 环境仍为 8.4.60，`src_detr/` 不 import ultralytics，无需同步升级
 - **Python 命令**: Windows 用 `python`，WSL/Linux 用 `python3`
 - **Pre-trained weights**: `yolo26x-seg.pt` (26M params, segmentation)、`yolo26l-seg.pt`、`yolo26m-seg.pt`、`yolo26s-seg.pt` 和 `yolo26n.pt` (nano) 在项目根目录；`models/` 下有自定义训练权重 `m960n.pt`
 - **Label Studio 已从 WSL2 迁移到 Windows**: 2026-08-23 迁移。数据在 `%LOCALAPPDATA%\label-studio\label-studio\`（sqlite + media + .env）。`.env` 中的 `SECRET_KEY` 必须与 WSL2 原数据一致，否则用户密码/API token 无法解密。WSL2 原数据保留在 `~/.local/share/label-studio/` 作为备份

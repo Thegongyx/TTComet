@@ -651,13 +651,10 @@ def main():
         # 验证 / E2E
         "val":           True,
     }
-    # end2end 只在 ultralytics 支持时传递（兼容旧版本）
-    try:
-        import inspect
-        if "end2end" in inspect.signature(model.train).parameters or True:
-            TRAIN_ARGS["end2end"] = args.end2end
-    except Exception:
-        pass
+    # end2end 语义在新版 ultralytics 由 nms 承载 (旧 end2end 参数已废弃):
+    #   end2end=True  → nms=False (使用 NMS-free 头)
+    #   end2end=False → nms=None  (外部 NMS, 默认)
+    TRAIN_ARGS["nms"] = False if args.end2end else None
 
     print("=" * 70)
     print("🏓 YOLO26-seg 乒乓球训练 v3.3 - 启动")
@@ -721,6 +718,19 @@ def main():
     for k, v in TRAIN_ARGS.items():
         if k not in ("data", "model"):
             print(f"  {k:18s}: {v}")
+
+    # ultralytics 的 AMP 自检会去 WEIGHTS_DIR (= 项目下 weights/) 找 yolo26n.pt,
+    # 与根目录的 yolo26n.pt 不是同一路径; 若根目录已有则复制过去, 避免重复联网下载
+    # (网络受限时会卡很久)。
+    _amp_src = _PROJECT_ROOT / "yolo26n.pt"
+    _amp_dst = Path("weights") / "yolo26n.pt"  # WEIGHTS_DIR 相对 CWD (= 项目根)
+    if _amp_src.is_file() and not _amp_dst.is_file():
+        try:
+            _amp_dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(_amp_src, _amp_dst)
+            print(f"ℹ️  已复用根目录 yolo26n.pt → {_amp_dst} (跳过 AMP 自检联网下载)")
+        except Exception as e:
+            print(f"⚠️  复制 yolo26n.pt 失败 (不影响训练, 可能触发联网下载): {e}")
 
     print("\n" + "=" * 70)
     print("🚀 开始训练...")

@@ -679,7 +679,7 @@ class InferenceContext:
     IMGSZ: int
     args: argparse.Namespace
     mask_proc: 'MaskProcessor'
-    pad_frame_zero: 'np.ndarray'
+    # pad_frame_zero: 'np.ndarray'   # 已废弃: 方形零帧会破坏尾批 shape, 改用 np.zeros_like(frames_in_batch[0])
     min_conf_for_predict: float
 
 
@@ -765,7 +765,7 @@ def load_model_and_config(args):
         print(f"ℹ️ Polygon 仅对类别 {sorted(POLYGON_NEEDED_CLASS_IDS)} 提取")
 
     mask_proc = MaskProcessor()
-    pad_frame_zero = np.zeros((IMGSZ, IMGSZ, 3), dtype=np.uint8)
+    # pad_frame_zero = np.zeros((IMGSZ, IMGSZ, 3), dtype=np.uint8)  # 已废弃: 见 process_one_video 尾批 padding
     min_conf_for_predict = max(0.01,
                                min(CONF_THRESHOLDS.values()) - float(args.conf_margin))
 
@@ -777,7 +777,7 @@ def load_model_and_config(args):
         POLYGON_NEEDED_CLASS_IDS=POLYGON_NEEDED_CLASS_IDS,
         want_polygons=want_polygons, OUTPUT_DIR=OUTPUT_DIR,
         LOG_FILENAME=LOG_FILENAME, BATCH_SIZE=BATCH_SIZE, IMGSZ=IMGSZ,
-        args=args, mask_proc=mask_proc, pad_frame_zero=pad_frame_zero,
+        args=args, mask_proc=mask_proc,  # pad_frame_zero 已废弃
         min_conf_for_predict=min_conf_for_predict,
     )
 
@@ -998,7 +998,10 @@ def process_one_video(video_path, args, ctx, output_dir=None):
                 pad_n = 0
                 if 0 < actual_n < ctx.BATCH_SIZE:
                     pad_n = ctx.BATCH_SIZE - actual_n
-                    frames_in_batch = frames_in_batch + [ctx.pad_frame_zero] * pad_n
+                    # 必须用与真实帧同 H,W 的零帧: 方形零帧 (IMGSZ,IMGSZ,3) 会让 ultralytics 的
+                    # same_shapes=False → LetterBox auto=False → 补齐成方形 (如 960x960), 与正常批的
+                    # 矩形 (如 544x960) 形状不同 → MIOpen 尾批重新编译内核 (卡很久) 且多算 1.76x 像素。
+                    frames_in_batch = frames_in_batch + [np.zeros_like(frames_in_batch[0])] * pad_n
 
                 # [v8 PERF] 主线程只做 GPU 推理
                 with torch.inference_mode():
@@ -1006,7 +1009,7 @@ def process_one_video(video_path, args, ctx, output_dir=None):
                         frames_in_batch,
                         conf=ctx.min_conf_for_predict, iou=args.iou,
                         verbose=False, imgsz=ctx.IMGSZ, augment=False,
-                        device=ctx.device, half=ctx.use_half, stream=False,
+                        device=ctx.device, quantize=16 if ctx.use_half else None, stream=False,
                     )
                 if pad_n > 0:
                     results = results[:actual_n]

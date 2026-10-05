@@ -22,9 +22,12 @@ YOLO .pt → .onnx 导出脚本 (支持单文件 / 目录批量)
         --pattern "best*.pt" --no-recurse --output inference_output/
 
 说明:
-  - 首次导出可能自动安装 onnx / onnxslim（ultralytics 自带 auto-install）。
+  - 依赖需手动预装: pip install onnx onnxslim（脚本默认设 YOLO_AUTOINSTALL=false,
+    避免 Windows+ROCm 下 ultralytics 误判为 CUDA 并联网装 CUDA 版 onnxruntime-gpu）。
   - YOLO26 默认是 NMS-free (end2end) 模型；--nms 会把后处理 NMS 内嵌进模型，
     便于不支持端到端的推理框架直接使用。
+  - 新版 ultralytics (>=8.4.80/8.4.142) 已废弃 half/int8/end2end 参数,
+    统一为 quantize 与 nms；本脚本已适配 (--half → quantize=16)。
   - 批量模式下单个模型失败不影响其余, 末尾统一汇总成功/失败列表。
 """
 
@@ -51,6 +54,13 @@ os.environ.setdefault("MIOPEN_CUSTOM_CACHE_DIR",   _DEF_MIOPEN_CACHE)
 os.environ.setdefault("MIOPEN_FIND_MODE",          "FAST")
 os.environ.setdefault("MIOPEN_FIND_ENFORCE",       "NONE")
 os.environ.setdefault("PYTORCH_HIP_ALLOC_CONF",    "expandable_segments:True")
+
+# 关闭 ultralytics 的自动依赖安装 (必须在 import ultralytics 之前设置)。
+# 原因: Windows + ROCm 下 ultralytics 的 rocm_is_available() 只认 Linux
+# (sys.platform == "linux"), 会被误判为 CUDA; 于是 FP16 ONNX 导出时它要求
+# onnxruntime-gpu (CUDA 专用, 数百 MB) 并联网 AutoUpdate, 网络受限时会长时间卡死。
+# 依赖请手动预装: pip install onnx onnxslim
+os.environ.setdefault("YOLO_AUTOINSTALL", "false")
 
 from ultralytics import YOLO
 import torch
@@ -90,7 +100,8 @@ def parse_args():
     parser.add_argument("--opset", type=int, default=17,
                         help="ONNX opset 版本 (YOLO26 推荐 17-19)")
     parser.add_argument("--half", action="store_true",
-                        help="导出 FP16 模型 (GPU 部署加速; CPU 需 FP32)")
+                        help="导出 FP16 模型 (GPU 部署加速; CPU 需 FP32)。"
+                             "内部映射为 ultralytics 的 quantize=16 (新版 half/int8 已废弃)")
     parser.add_argument("--dynamic", action="store_true",
                         help="导出动态 batch/输入尺寸 (部署时更灵活)")
     parser.add_argument("--simplify", action="store_true",
@@ -178,7 +189,7 @@ def export_one(model_path: Path, out_path: Path, args, device: str,
         "format":   "onnx",
         "imgsz":    args.imgsz,
         "opset":    args.opset,
-        "half":     args.half,
+        "quantize": 16 if args.half else None,
         "dynamic":  args.dynamic,
         "simplify": args.simplify,
         "nms":      args.nms,
@@ -186,7 +197,7 @@ def export_one(model_path: Path, out_path: Path, args, device: str,
         "batch":    args.batch,
     }
 
-    print("🚀 开始导出... (首次可能自动安装 onnx/onnxslim, 请稍候)")
+    print("🚀 开始导出... (依赖 onnx/onnxslim 需已预装)")
     try:
         exported = model.export(**export_args)
     except Exception as e:
