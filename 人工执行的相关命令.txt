@@ -16,7 +16,7 @@ python src\pingpong_highlight.py `  --video inference_output\pipeline_VID_202607
 
 python src\pingpong_highlight.py `  --video inference_output\pipeline_VID_20260729_200332\video_cfr.mp4 `  --raw-detections inference_output\pipeline_VID_20260729_200332\raw_detections.jsonl `  --output inference_output\pipeline_VID_20260729_200332\VID_20260729_200332_highlight.mp4 --debug
 
-python src\pingpong_highlight.py `  --video inference_output\pipeline_VID_20260828_214109\video_cfr.mp4 `  --raw-detections inference_output\pipeline_VID_20260828_214109\raw_detections.jsonl `  --output inference_output\pipeline_VID_20260828_214109\VID_20260828_214109_highlight.mp4 --debug
+python src\pingpong_highlight.py `  --video C:\xiangmu\yolo_frame_extractor\inference_output\pipeline_VID_20261005_211745\video_cfr.mp4 --raw-detections C:\xiangmu\yolo_frame_extractor\inference_output\pipeline_VID_20261005_211745\raw_detections.jsonl --output C:\xiangmu\yolo_frame_extractor\inference_output\pipeline_VID_20261005_211745\VID_20261005_211745_highlight.mp4 --debug
 
 高球王的参数
 python src\pingpong_highlight.py `  --video inference_output\pipeline_VID_20260923_194905\video_cfr.mp4 `  --raw-detections inference_output\pipeline_VID_20260923_194905\raw_detections.jsonl `  --output inference_output\pipeline_VID_20260923_194905\VID_20260923_194905_highlight.mp4 --debug --out-of-table-timeout 4  --corridor-margin 0.7 --no-bounce-timeout 4

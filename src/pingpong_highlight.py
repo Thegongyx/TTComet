@@ -131,7 +131,7 @@ def parse_args():
                         "且只保留最大簇会让球台一侧完全无点), 默认关闭")
     p.add_argument("--center-dist-ratio", type=float, default=0.2,
                    help="实例中心离画面中心超过该比例×长边时丢弃 (0=关闭)")
-    p.add_argument("--ball-conf", type=float, default=0.55,
+    p.add_argument("--ball-conf", type=float, default=0.50,
                    help="乒乓球检测最小置信度, 低于该值的球候选在收集阶段直接丢弃")
     p.add_argument("--no-audio", action="store_true", help="不保留原声")
     p.add_argument("--encoder", default="auto",
