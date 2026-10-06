@@ -612,16 +612,20 @@ def process_payload_cpu(
     polygons_by_idx = {}
     if want_polygons and mask_np is not None and len(mask_idx):
         try:
-            from ultralytics.engine.results import Masks as _Masks
-            _xy = _Masks(torch.from_numpy(mask_np), mask_shape).xy
+            # [perf] 直接在 uint8 numpy 上调 ultralytics 的同一对函数 (masks2segments +
+            # scale_coords), 跳过 Masks 包装里的 torch 往返 (int()->byte()->cpu()->numpy(),
+            # 每帧白搬约 10MB)。输出与 Masks.xy 逐点等价 (已在进程内 A/B 断言验证)。
+            from ultralytics.utils import ops as _uops
+            _segs = _uops.masks2segments(mask_np)
             for _k, _orig_i in enumerate(mask_idx):
-                if _k < len(_xy):
-                    _poly = _xy[_k]
+                if _k < len(_segs):
+                    _poly = _segs[_k]
                     if _poly is not None and len(_poly) > 0:
-                        polygons_by_idx[_orig_i] = [
-                            [round(float(x), 1), round(float(y), 1)]
-                            for x, y in _poly
-                        ]
+                        _poly = _uops.scale_coords(
+                            mask_np.shape[1:], _poly, mask_shape, normalize=False)
+                        # [perf] 向量化取 1 位小数 (与逐点 round(float(x), 1) 同舍入规则)
+                        polygons_by_idx[_orig_i] = np.round(
+                            np.asarray(_poly, dtype=np.float64), 1).tolist()
         except Exception:
             pass
 
