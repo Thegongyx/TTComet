@@ -171,6 +171,11 @@ def parse_args():
                              "前向重叠, 减少 GPU 空等。用 --no-overlap 关闭 (回退到原来的单线程串行)")
     parser.add_argument("--overlap-queue", type=int, default=3,
                         help="[perf] --overlap 下的结果队列深度 (批数)。越大越能吸收抖动, 但越占显存/内存")
+    # [perf] 跳过检测可视化视频
+    parser.add_argument("--no-detection-video", action="store_true",
+                        help="[perf] 不生成 pingpong_detection.mp4 (可视化视频)。raw_detections.jsonl "
+                             "仍完整输出 (含所有类别与 table/net polygon)。run_pipeline 的高光步骤只用 "
+                             "video_cfr.mp4, 用不到它, 故可整段跳过 resize/mask叠加/画框/编码")
     return parser.parse_args()
 
 
@@ -409,22 +414,30 @@ def draw_detections(frame, detections_list, colors):
     return frame
 
 
-def draw_mask_overlay_inplace(frame, bool_mask, color, alpha=0.4):
-    if bool_mask is None or not bool_mask.any():
+def draw_mask_overlay_inplace(frame, mask_u8, color, alpha=0.4):
+    """[perf] 用 cv2 做半透明叠加。
+
+    cv2 调用会释放 GIL, 比 "np.where + 布尔索引赋值" 更适合多线程; 后者会产出
+    巨大的索引数组且大量走 Python 层, 是 GIL 争用的一大来源。
+    mask_u8: 单通道 uint8 (非 0 即选中); 也兼容 bool 数组。
+    """
+    if mask_u8 is None:
         return frame
-    ys, xs = np.where(bool_mask)
-    if ys.size == 0:
+    if mask_u8.dtype != np.uint8:
+        mask_u8 = mask_u8.astype(np.uint8)
+    if cv2.countNonZero(mask_u8) == 0:
         return frame
-    y0, y1 = int(ys.min()), int(ys.max()) + 1
-    x0, x1 = int(xs.min()), int(xs.max()) + 1
-    sub_frame = frame[y0:y1, x0:x1]
-    sub_mask  = bool_mask[y0:y1, x0:x1]
-    if sub_frame.size == 0 or not sub_mask.any():
+    x, y, w, h = cv2.boundingRect(mask_u8)
+    if w <= 0 or h <= 0:
+        return frame
+    sub_frame = frame[y:y + h, x:x + w]
+    sub_mask  = mask_u8[y:y + h, x:x + w]
+    if sub_frame.size == 0:
         return frame
     color_img = np.empty_like(sub_frame)
     color_img[:] = color
     blended = cv2.addWeighted(sub_frame, 1.0 - alpha, color_img, alpha, 0.0)
-    sub_frame[sub_mask] = blended[sub_mask]
+    cv2.copyTo(blended, sub_mask, sub_frame)
     return frame
 
 
@@ -571,7 +584,7 @@ def process_payload_cpu(
     payload, frame_raw, frame_idx, fps,
     CLASS_CONFIG, CONF_THRESHOLDS, CLASS_NAMES, COLORS,
     BALL_CLASS_ID, TABLE_CLASS_ID, NET_CLASS_ID,
-    mask_proc, out_w, out_h, want_polygons
+    mask_proc, out_w, out_h, want_polygons, want_video=True
 ):
     """
     纯 CPU 后处理: 由 extract_result_cpu 产出的 payload (已在 CPU) 出发,
@@ -631,13 +644,6 @@ def process_payload_cpu(
             if cls_id not in best_detections or conf > best_detections[cls_id]["confidence"]:
                 best_detections[cls_id] = det
 
-    # table/net mask overlay
-    if mask_np is not None and mask_cls is not None:
-        table_mask_u8, net_mask_u8 = mask_proc.resize_masks(
-            mask_np, mask_cls, (out_h, out_w), TABLE_CLASS_ID, NET_CLASS_ID)
-    else:
-        table_mask_u8 = net_mask_u8 = None
-
     ball_det = best_detections.get(BALL_CLASS_ID)
     bx = by = 0.0
     ball_pos = None
@@ -645,19 +651,28 @@ def process_payload_cpu(
         bx, by = get_bbox_center(ball_det["bbox"])
         ball_pos = (bx, by)
 
-    out_frame = cv2.resize(frame_raw, (out_w, out_h))
-    if table_mask_u8 is not None:
-        draw_mask_overlay_inplace(out_frame, table_mask_u8.astype(bool),
-                                   (255, 0, 255), alpha=0.3)
-    if net_mask_u8 is not None:
-        draw_mask_overlay_inplace(out_frame, net_mask_u8.astype(bool),
-                                   (255, 255, 255), alpha=0.4)
+    out_frame = None
+    if want_video:
+        # 只有需要可视化视频时才做 resize/mask 叠加/画框
+        # (run_pipeline 的高光步骤只用 video_cfr.mp4, 用不到 pingpong_detection.mp4
+        #  → 传 --no-detection-video 可整段跳过, 省掉 CPU 与编码开销)
+        if mask_np is not None and mask_cls is not None:
+            table_mask_u8, net_mask_u8 = mask_proc.resize_masks(
+                mask_np, mask_cls, (out_h, out_w), TABLE_CLASS_ID, NET_CLASS_ID)
+        else:
+            table_mask_u8 = net_mask_u8 = None
 
-    scaled_dets = []
-    for det in frame_detections:
-        b = det["bbox"]
-        scaled_dets.append({**det, "bbox": [b[0]*sx, b[1]*sy, b[2]*sx, b[3]*sy]})
-    draw_detections(out_frame, scaled_dets, COLORS)
+        out_frame = cv2.resize(frame_raw, (out_w, out_h))
+        if table_mask_u8 is not None:
+            draw_mask_overlay_inplace(out_frame, table_mask_u8, (255, 0, 255), alpha=0.3)
+        if net_mask_u8 is not None:
+            draw_mask_overlay_inplace(out_frame, net_mask_u8, (255, 255, 255), alpha=0.4)
+
+        scaled_dets = []
+        for det in frame_detections:
+            b = det["bbox"]
+            scaled_dets.append({**det, "bbox": [b[0]*sx, b[1]*sy, b[2]*sx, b[3]*sy]})
+        draw_detections(out_frame, scaled_dets, COLORS)
 
     timestamp = frame_idx / fps
     log_obj = {
@@ -803,10 +818,12 @@ def load_model_and_config(args):
 
 
 # ==================== [v8 PERF] 后处理 worker + 排序写盘 ====================
-def _post_worker(ctx, fps, out_w, out_h, in_q, done_dict, done_lock, done_cv):
+def _post_worker(ctx, fps, out_w, out_h, in_q, done_dict, done_lock, done_cv,
+                 want_video=True):
     """
     后处理 worker: 从 in_q 取 (seq, payload, frame_raw), 做 CPU 后处理,
     结果连同 seq 存进 done_dict, 由 ordering 线程按 seq 顺序取出写盘。
+    want_video=False 时跳过 resize/mask叠加/画框 (只出 JSONL)。
     """
     while True:
         item = in_q.get()
@@ -818,7 +835,7 @@ def _post_worker(ctx, fps, out_w, out_h, in_q, done_dict, done_lock, done_cv):
             payload, frame_raw, seq, fps,
             ctx.CLASS_CONFIG, ctx.CONF_THRESHOLDS, ctx.CLASS_NAMES, ctx.COLORS,
             ctx.BALL_CLASS_ID, ctx.TABLE_CLASS_ID, ctx.NET_CLASS_ID,
-            ctx.mask_proc, out_w, out_h, ctx.want_polygons
+            ctx.mask_proc, out_w, out_h, ctx.want_polygons, want_video
         )
         with done_lock:
             done_dict[seq] = (out_frame, log_line, counts, any_det, ts)
@@ -826,7 +843,7 @@ def _post_worker(ctx, fps, out_w, out_h, in_q, done_dict, done_lock, done_cv):
 
 
 def _ordering_writer(write_queue, log_queue, done_dict, done_lock, done_cv,
-                     total_expected_holder, state):
+                     total_expected_holder, state, want_video=True):
     """
     按 seq 递增顺序从 done_dict 取结果 → 保证视频帧写入顺序正确。
     total_expected_holder[0] 为总帧数 (推理结束后由主线程写入; -1 表示未知/未完)。
@@ -846,7 +863,8 @@ def _ordering_writer(write_queue, log_queue, done_dict, done_lock, done_cv,
                     continue
             out_frame, log_line, counts, any_det, ts = done_dict.pop(next_seq)
 
-        write_queue.put(out_frame)
+        if want_video:
+            write_queue.put(out_frame)
         log_queue.put(log_line)
         for cls_id, c in counts.items():
             if c > 0:
@@ -890,7 +908,11 @@ def process_one_video(video_path, args, ctx, output_dir=None):
             out_height += 1
 
         output_video_path = os.path.join(output_dir_or_ctx, "pingpong_detection.mp4")
-        if args.writer_backend == "ffmpeg" and shutil.which("ffmpeg"):
+        want_video = not getattr(args, "no_detection_video", False)
+        if not want_video:
+            out_video = None
+            print("🎬 已跳过检测可视化视频 (--no-detection-video): 只产出 raw_detections.jsonl")
+        elif args.writer_backend == "ffmpeg" and shutil.which("ffmpeg"):
             out_video = FFmpegWriter(output_video_path, out_width, out_height, fps,
                                      prefer=args.encoder, amf_quality=args.amf_quality,
                                      amf_qp=args.amf_qp)
@@ -957,8 +979,10 @@ def process_one_video(video_path, args, ctx, output_dir=None):
                                  daemon=True)
             reader_threads.append(t)
 
-        t_writer = threading.Thread(target=frame_writer,
-                                    args=(out_video, write_queue), daemon=True)
+        t_writer = None
+        if want_video:
+            t_writer = threading.Thread(target=frame_writer,
+                                        args=(out_video, write_queue), daemon=True)
         t_logger = threading.Thread(target=log_writer,
                                     args=(raw_log_f, log_queue, args.log_flush_interval),
                                     daemon=True)
@@ -968,18 +992,21 @@ def process_one_video(video_path, args, ctx, output_dir=None):
         for _ in range(max(1, args.post_workers)):
             wt = threading.Thread(target=_post_worker,
                                   args=(ctx, fps, out_width, out_height,
-                                        post_in_q, done_dict, done_lock, done_cv),
+                                        post_in_q, done_dict, done_lock, done_cv,
+                                        want_video),
                                   daemon=True)
             post_workers.append(wt)
         t_order = threading.Thread(target=_ordering_writer,
                                    args=(write_queue, log_queue, done_dict,
                                          done_lock, done_cv,
-                                         total_expected_holder, state),
+                                         total_expected_holder, state, want_video),
                                    daemon=True)
 
         for t in reader_threads:
             t.start()
-        t_writer.start(); t_logger.start(); t_order.start()
+        if t_writer is not None:
+            t_writer.start()
+        t_logger.start(); t_order.start()
         for wt in post_workers:
             wt.start()
 
@@ -1164,10 +1191,12 @@ def process_one_video(video_path, args, ctx, output_dir=None):
                 try: t.join(timeout=5)
                 except Exception: pass
 
-            write_queue.put(None)
+            if t_writer is not None:
+                write_queue.put(None)
             log_queue.put(None)
-            try: t_writer.join(timeout=300)
-            except Exception: pass
+            if t_writer is not None:
+                try: t_writer.join(timeout=300)
+                except Exception: pass
             try: t_logger.join(timeout=10)
             except Exception: pass
             try: raw_log_f.close()
@@ -1175,8 +1204,9 @@ def process_one_video(video_path, args, ctx, output_dir=None):
             if cap is not None:
                 try: cap.release()
                 except Exception: pass
-            try: out_video.release()
-            except Exception: pass
+            if out_video is not None:
+                try: out_video.release()
+                except Exception: pass
 
         if video_input_path != video_path and os.path.exists(video_input_path) \
            and args.remove_cfr:
@@ -1196,7 +1226,8 @@ def process_one_video(video_path, args, ctx, output_dir=None):
 
         print(f"✅ Inference Complete! Output: {output_dir_or_ctx}")
         print(f"📄 raw_detections.jsonl: {raw_log_path}")
-        print(f"🎬 pingpong_detection.mp4: {output_video_path}")
+        if want_video:
+            print(f"🎬 pingpong_detection.mp4: {output_video_path}")
         return True, raw_log_path
     except Exception as e:
         print(f"❌ process_one_video error: {e}")

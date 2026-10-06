@@ -287,6 +287,9 @@ def _process_one_video(args, python_cmd, has_ffmpeg, video_index=None, video_tot
             infer_cmd += ["--amf-quality", args.amf_quality]
         if args.amf_qp is not None:
             infer_cmd += ["--amf-qp", str(args.amf_qp)]
+        # 高光步骤只用 video_cfr.mp4, 用不到 pingpong_detection.mp4 → 默认跳过, 省 resize/叠加/画框/编码
+        if not args.keep_detection_video:
+            infer_cmd += ["--no-detection-video"]
 
         if not run_step(infer_cmd,
                          "Step 1/2: YOLO 推理 (inference_video.py)",
@@ -446,6 +449,10 @@ def main():
                         help="AMF -quality 参数 (默认 quality)")
     parser.add_argument("--amf-qp", type=int, default=None,
                         help="AMF CQP 量化参数 (默认 24)")
+    parser.add_argument("--keep-detection-video", action="store_true",
+                        help="保留推理阶段的检测可视化视频 pingpong_detection.mp4。"
+                             "默认跳过 (高光步骤只用 video_cfr.mp4, 用不到它; 跳过可省掉 "
+                             "resize/mask叠加/画框/编码, 明显提速)")
 
     # === 高光参数 (传给 pingpong_highlight.py) ===
     parser.add_argument("--output-height", type=int, default=None,
@@ -587,6 +594,8 @@ def main():
             batch_infer_cmd += ["--amf-quality", args.amf_quality]
         if args.amf_qp is not None:
             batch_infer_cmd += ["--amf-qp", str(args.amf_qp)]
+        if not args.keep_detection_video:
+            batch_infer_cmd += ["--no-detection-video"]
 
         # 执行批量推理 (--skip-inference 时跳过, 直接对已有 JSONL 的视频做高光)
         if args.skip_inference:
