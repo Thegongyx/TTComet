@@ -1,8 +1,48 @@
 #!/usr/bin/env python3
 """
-pingpong_highlight.py  (优化版 v4.9 - 精彩回合前置 + 提速)
+pingpong_highlight.py  (优化版 v4.15 - 残影更透明更细)
 =====================================================================
 乒乓球比赛 → 自动特效精华集锦
+
+v4.15 在 v4.14 基础上的改动:
+  ★ 残影 (球拖尾) 透明度与粗细整体 ×0.77:
+    TRAIL_ALPHA_SCALE = 0.77  (alpha = (0.15+0.55a) · (0.85+0.15·intensity) · 0.77)
+    TRAIL_THICK_SCALE = 0.77  (thick_scale = (1+1.8·snorm) · 2/3 · 0.77)
+    只缩放整体浓淡/粗细, 尾部淡 → 球头浓的渐变形状与颜色插值保持不变;
+    想再调只需改这两个常数 (1.0 = v4.14 及以前的观感)。
+
+v4.14 在 v4.13 基础上的改动:
+  ★ 补帧视野由 0.2s 放宽到 0.3s (interpolate_track):
+    max_gap = max(1, int(fps * 0.3))    (30fps → 9 帧, 60fps → 18 帧)
+    (v4.13 曾收到 0.2s; 0.3s 回收一部分中等缺口, 保留"超长缺口不猜"的原则)
+    关联阶段的 max_gap_frames 仍是 0.5s, 不受影响。
+
+v4.13 在 v4.12 基础上的改动:
+  ★ 补帧视野由 0.5s 收窄到 0.2s (interpolate_track):
+    max_gap = max(1, int(fps * 0.2))    (30fps → 6 帧, 60fps → 12 帧)
+    0.2s 以上的缺口不再用曲线猜 (0.2s 高速球可飞出数米, 平滑曲线注定是错的),
+    这些缺口留空; 关联阶段的 max_gap_frames 仍是 0.5s, 不受影响。
+
+v4.12 在 v4.11 基础上的改动:
+  ★ 球拖尾 (残影) 时长由 0.15s 调回 0.2s:
+    TRAIL_LEN = max(4, int(fps * 0.2))
+    (30fps → 6 帧, 60fps → 12 帧; 下限 4 帧用于极低 fps 场景)
+
+v4.11 在 v4.10 基础上的改动:
+  ★ 补帧算法升级 (interpolate_track): 无约束多项式拟合 → 端点钉死的弹道插值
+    - x 取缺口两端点连线 (静止机位下 x(t) 近似线性, 避免二次项横向过冲)
+    - y 取 y0 + v0'·τ + ½·a·τ², a 由缺口两侧实测速度 v0/v1 反解后取均值,
+      v0' 再反解一次 → 曲线严格过两端真实检测点
+    - 效果: 缺口边界不再有台阶/折角 (旧 polyfit 不过端点),
+      只在两端点之间取值 → 无窗口外过冲/跑飞 (旧法用 4 点撑 15 帧窗口)
+    - 退化保护: 取不到速度 / a 非有限 / a<=0 (反重力) → 该缺口 y 退回线性弦
+    - 调试输出新增: 走弹道的缺口数与退化为弦的缺口数
+
+v4.10 在 v4.9 基础上的改动:
+  ★ 球拖尾 (残影) 时长由 0.3s 缩短为 0.15s:
+    TRAIL_LEN = max(4, int(fps * 0.15))
+    (原为 max(12, int(fps * 0.3)), 12 帧下限使 30fps 下实际为 0.4s,
+     现下限降为 4 帧以保证 0.15s 真正生效, 同时仍够 smooth_trail 平滑)
 
 v4.9 在 v4.8 基础上的改动:
   ★ 精彩回合候选池增加"或"条件:
@@ -1304,11 +1344,89 @@ def build_main_ball_track(ball_cands, fps, frame_w, frame_h, table_geo=None, deb
 # =====================================================================
 #  4) 补帧
 # =====================================================================
+def _local_diff_velocity(frames, vals, idx, direction, span=3):
+    """用 idx 一侧 (含 idx, 且与 idx **帧号连续**) 最多 span 个点做中值差分, 返回 px/帧。
+
+    direction=-1 取缺口左侧 (idx 及之前), direction=+1 取缺口右侧 (idx 及之后)。
+    只使用连续帧, 避免把"另一个缺口两端"的位移当成速度; 取多个一阶差分的中值以
+    抑制单帧检测抖动。点不足 2 个返回 None。
+    """
+    n = len(frames)
+    js = [idx]
+    j = idx
+    for _ in range(span - 1):
+        j += direction
+        if not (0 <= j < n):
+            break
+        if abs(frames[js[-1]] - frames[j]) != 1:   # 跨缺口 → 不再向外扩
+            break
+        js.append(j)
+    js.sort()
+    if len(js) < 2:
+        return None
+    dv = []
+    for a, b in zip(js, js[1:]):
+        df = frames[b] - frames[a]
+        if df > 0:
+            dv.append((vals[b] - vals[a]) / df)
+    return float(np.median(dv)) if dv else None
+
+
+def _ballistic_fill_gap(seg_f, seg_x, seg_y, i, frame_w, frame_h):
+    """缺口 (seg_f[i], seg_f[i+1]) 的内部插值点: x 走弦, y 走端点钉死的弹道抛物线。
+
+    模型 (图像坐标 y 向下, 重力使 a > 0):
+        x(τ) = x0 + (x1 - x0)·τ/D                    静止机位下 x(t) 本就近似线性
+        y(τ) = y0 + v0'·τ + ½·a·τ²
+    其中加速度 a 由缺口两侧实测速度分别反解后取均值:
+        a_v = 2·(y1 - y0 - v·D) / D²        (由"初速 v 且必须过 y1"反解)
+    再由 a 反解等效初速, 保证曲线**严格过两端点**:
+        v0' = (y1 - y0 - ½·a·D²) / D
+
+    这样补出的点: ① 过真实检测点 → 缺口边界无台阶; ② 两端切线速度与实测一致 →
+    无折角; ③ 只在窗口内取值 → 不存在多项式那样的窗口外过冲/跑飞。
+    退化保护: 两侧都取不到速度 / a 非有限 / a <= 0 (反重力) → 该缺口 y 退回线性弦。
+
+    返回 (pts, mode): pts 为 [[x, y], ...] 对应帧 seg_f[i]+1 ... seg_f[i+1]-1,
+    mode ∈ {"ballistic", "chord"}。
+    """
+    f0, f1 = int(seg_f[i]), int(seg_f[i + 1])
+    x0, y0 = float(seg_x[i]), float(seg_y[i])
+    x1, y1 = float(seg_x[i + 1]), float(seg_y[i + 1])
+    D = float(f1 - f0)
+    if D <= 0:
+        return [], "chord"
+
+    v0 = _local_diff_velocity(seg_f, seg_y, i, -1)
+    v1 = _local_diff_velocity(seg_f, seg_y, i + 1, +1)
+    a_cands = []
+    if v0 is not None:
+        a_cands.append(2.0 * (y1 - y0 - v0 * D) / (D * D))
+    if v1 is not None:
+        a_cands.append(2.0 * (y0 - y1 + v1 * D) / (D * D))
+    a = (sum(a_cands) / len(a_cands)) if a_cands else 0.0
+
+    mode = "ballistic"
+    if not math.isfinite(a) or a <= 0.0:
+        mode, a = "chord", 0.0      # 反重力/无速度 → 退化为直线
+    vy0 = (y1 - y0 - 0.5 * a * D * D) / D
+
+    pts = []
+    for f in range(f0 + 1, f1):
+        t = f - f0
+        xi = x0 + (x1 - x0) * t / D
+        yi = y0 + vy0 * t + 0.5 * a * t * t
+        pts.append([_clamp(xi, 0, frame_w - 1), _clamp(yi, 0, frame_h - 1)])
+    return pts, mode
+
+
 def interpolate_track(main_track, fps, frame_w, frame_h, debug=False):
     if not main_track:
         return {}
     keys = sorted(main_track.keys())
-    max_gap = int(fps * 0.5)
+    # 补帧视野: 只补 ≤0.3s 的缺口; 更长的缺口物理上无法可靠恢复, 直接留空
+    # (注意: 关联阶段的 max_gap_frames 仍是 0.5s, 在 build_main_ball_track 内, 不受此处影响)
+    max_gap = max(1, int(fps * 0.3))
     segments = []
     cur = [keys[0]]
     for k in keys[1:]:
@@ -1319,39 +1437,28 @@ def interpolate_track(main_track, fps, frame_w, frame_h, debug=False):
             cur = [k]
     segments.append(cur)
     filled = {k: (main_track[k][0], main_track[k][1], False) for k in keys}
+    n_ballistic = n_chord = 0
     for seg in segments:
         if len(seg) < 2:
             continue
-        fs = np.array(seg, dtype=np.float64)
-        xs = np.array([main_track[k][0] for k in seg], dtype=np.float64)
-        ys = np.array([main_track[k][1] for k in seg], dtype=np.float64)
+        seg_f = np.array(seg, dtype=np.float64)
+        seg_x = np.array([main_track[k][0] for k in seg], dtype=np.float64)
+        seg_y = np.array([main_track[k][1] for k in seg], dtype=np.float64)
         for i in range(len(seg) - 1):
-            f0, f1 = seg[i], seg[i + 1]
-            if f1 - f0 <= 1:
+            gs, ge = seg[i], seg[i + 1]
+            if ge - gs <= 1:
                 continue
-            lo, hi = max(0, i - 1), min(len(seg), i + 3)
-            wf, wx, wy = fs[lo:hi], xs[lo:hi], ys[lo:hi]
-            deg = min(2, len(wf) - 1)
-            try:
-                px = np.polyfit(wf, wx, deg)
-                # y: 二次项系数必须为正 (图像坐标系 y 轴向下, 重力使轨迹开口向上)
-                if deg == 2 and len(wf) >= 3:
-                    py = np.polyfit(wf, wy, 2)
-                    if py[0] <= 0:  # 开口向下或平直 → 反重力, 回退线性
-                        py = np.polyfit([f0, f1],
-                                        [main_track[f0][1], main_track[f1][1]], 1)
-                else:
-                    py = np.polyfit(wf, wy, deg)
-            except Exception:
-                px = np.polyfit([f0, f1], [main_track[f0][0], main_track[f1][0]], 1)
-                py = np.polyfit([f0, f1], [main_track[f0][1], main_track[f1][1]], 1)
-            for f in range(f0 + 1, f1):
-                xi = _clamp(float(np.polyval(px, f)), 0, frame_w - 1)
-                yi = _clamp(float(np.polyval(py, f)), 0, frame_h - 1)
-                filled[f] = (xi, yi, True)
+            pts, mode = _ballistic_fill_gap(seg_f, seg_x, seg_y, i, frame_w, frame_h)
+            if mode == "ballistic":
+                n_ballistic += 1
+            else:
+                n_chord += 1
+            for k, (xi, yi) in zip(range(gs + 1, ge), pts):
+                filled[k] = (xi, yi, True)
     if debug:
         n_interp = sum(1 for v in filled.values() if v[2])
-        log(f"  补帧: 原始 {len(main_track)} 帧 -> 填充后 {len(filled)} 帧 (插值 {n_interp})")
+        log(f"  补帧(端点钉死弹道): 原始 {len(main_track)} 帧 -> 填充后 {len(filled)} 帧 "
+            f"(插值 {n_interp}; 缺口 {n_ballistic} 个走弹道, {n_chord} 个退化为弦)")
     return filled
 
 
@@ -2283,6 +2390,12 @@ class BounceMarker:
         self.marks = alive
 
 
+# 残影 (球拖尾) 整体浓淡/粗细系数
+# 1.0 = v4.14 及以前的观感; <1 表示整体更透明 / 更细 (形状与渐变比例不变)
+TRAIL_ALPHA_SCALE = 0.77
+TRAIL_THICK_SCALE = 0.77
+
+
 class SpeedTrailRenderer:
     """速度自适应彗星拖尾 (细/淡/偏白)。"""
     def __init__(self, intensity=1.0):
@@ -2309,10 +2422,10 @@ class SpeedTrailRenderer:
         alpha_mask[y0:y1, x0:x1] = 0.0
         overlay[y0:y1, x0:x1] = frame[y0:y1, x0:x1]
         trail_col = speed_to_color(speed_norm)
-        thick_scale = (1.0 + speed_norm * 1.8) * (2.0 / 3.0)
+        thick_scale = (1.0 + speed_norm * 1.8) * (2.0 / 3.0) * TRAIL_THICK_SCALE
         for i in range(1, n):
             a = i / n
-            alpha = (0.15 + 0.55 * a) * (0.85 + 0.15 * self.intensity)
+            alpha = (0.15 + 0.55 * a) * (0.85 + 0.15 * self.intensity) * TRAIL_ALPHA_SCALE
             thick = max(1, int((1 + 4 * a) * thick_scale))
             p0 = (int(trail_pts[i - 1][0]), int(trail_pts[i - 1][1]))
             p1 = (int(trail_pts[i][0]), int(trail_pts[i][1]))
@@ -2502,7 +2615,8 @@ def render(args, segments, rally_starts_by_seg, filled_track, events, table_geo,
         bmarker = BounceMarker()
         trail_renderer = SpeedTrailRenderer(intensity=fx_intensity)
         player_fx = PlayerFX(fps, out_w, out_h, intensity=fx_intensity) if enable_player_fx else None
-        TRAIL_LEN = max(12, int(fps * 0.3))
+        # 残影 (球拖尾) 时长 ≈ 0.2s; 下限 4 帧保证可平滑/绘制
+        TRAIL_LEN = max(4, int(fps * 0.2))
 
         prepend_frame_count = sum(e - ps + 1 for ps, e in (prepend_segments or []))
         black_frame_count = int(round(fps * black_gap_sec)) if prepend_segments else 0
