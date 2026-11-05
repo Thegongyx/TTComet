@@ -597,11 +597,17 @@ def _median_net_line(line_list):
 # =====================================================================
 #  几何校验 + 基于约束的重建
 # =====================================================================
-# [临时测试开关] True = 禁用全部约束重建。
+# [默认关闭约束重建] True = 禁用全部约束重建。
 # 3 处调用点(validate_and_refine_quad / 网线二分失败 / 四边形过窄)都会拿到
 # None 并自动回退到检测到的中位数四角, 不再用球网线合成台面。
-# 改回 False 即恢复原有的"校验自愈"重建逻辑。
-DISABLE_QUAD_REBUILD = False
+#
+# 关闭原因(2026-11 实测 VID_20261104_223026): 重建基于两个不成立的假设 ——
+#   ① 球网投影长度 ≈ 台面短边投影长度; ② 台面长轴 ⊥ 球网投影方向。
+# 平视机位下二者都失真(网投影 180px vs 台面短边投影 76px), 会把正确的台面
+# 四角重建到台面下方并旋转 ~65°, 走廊随之变成一条竖直窄条, 真球被判出台。
+# 同一份日志: 启用重建 = 2 片段/10.3s, 关闭重建 = 28 片段/196.5s。
+# 需要恢复原来的"校验自愈"行为时改回 False。
+DISABLE_QUAD_REBUILD = True
 
 
 def rebuild_quad_from_constraints(table_pts, net_line, img_hw, debug=False):
@@ -675,6 +681,10 @@ def validate_and_refine_quad(quad, table_pts, net_line, img_hw, debug=False):
         if debug:
             log(f"  ✓ 球台四角校验通过: 长宽比={qual['ratio']:.2f} "
                 f"面积占比={qual['area_frac']:.3f} 最短边={qual['min_edge']:.0f}px")
+        return order_quad(quad), False
+    if DISABLE_QUAD_REBUILD:
+        log(f"  ⚠️ 球台四角校验告警 ({qual['reason']}, 长宽比={qual['ratio']:.2f}, "
+            f"面积占比={qual['area_frac']:.4f}) → 约束重建已禁用, 沿用检测四角")
         return order_quad(quad), False
     log(f"  ⚠️ 球台四角不合理 ({qual['reason']}, 长宽比={qual['ratio']:.2f}, "
         f"面积占比={qual['area_frac']:.4f}) → 启动约束重建")
@@ -803,7 +813,7 @@ def extract_table_geometry(frames, img_hw, debug=False, persp_blend=0.0,
     if debug:
         log(f"  关卡1校验后四角({'已重建' if was_rebuilt else '未改动'}): {quad.tolist()}")
 
-    if net_line is not None and not was_rebuilt:
+    if net_line is not None and not was_rebuilt and not DISABLE_QUAD_REBUILD:
         bisects_ok, _ = _net_bisects_quad(quad, net_line, img_hw)
         if not bisects_ok:
             if debug:
@@ -812,7 +822,7 @@ def extract_table_geometry(frames, img_hw, debug=False, persp_blend=0.0,
             if rebuilt is not None:
                 quad, was_rebuilt = rebuilt, True
 
-    if net_line is not None and not was_rebuilt:
+    if net_line is not None and not was_rebuilt and not DISABLE_QUAD_REBUILD:
         net_len = float(np.hypot(net_line[1][0] - net_line[0][0], net_line[1][1] - net_line[0][1]))
         q = order_quad(quad).astype(np.float64)
         edge_lens = [float(np.linalg.norm(q[(i + 1) % 4] - q[i])) for i in range(4)]
@@ -850,10 +860,12 @@ def extract_table_geometry(frames, img_hw, debug=False, persp_blend=0.0,
         return end_edge_list[1][3], end_edge_list[1][4], end_edge_list[0][3], end_edge_list[0][4]
 
     found_end_edges = False
+    long_edge_idx = None          # 脚本判定的长边（网线穿过的两条边）索引, 仅用于 debug 输出
     if net_line is not None:
         inter_idx = _net_quad_intersections(quad, net_line, img_hw)
         if len(inter_idx) == 2 and not _edges_are_adjacent(inter_idx[0], inter_idx[1]):
             found_end_edges = True
+            long_edge_idx = inter_idx
             non_inter_idx = [i for i in range(4) if i not in inter_idx]
             near_a, near_b, far_a, far_b = _pick_near_far([edge_info[i] for i in non_inter_idx])
         elif debug:
@@ -924,6 +936,15 @@ def extract_table_geometry(frames, img_hw, debug=False, persp_blend=0.0,
     if debug:
         log(f"  球台四角: {quad.tolist()}")
         log(f"  球网线: {net_line}")
+        if long_edge_idx:
+            long_desc = " | ".join(
+                f"e{i} ({edges[i][0][0]:.0f},{edges[i][0][1]:.0f})-"
+                f"({edges[i][1][0]:.0f},{edges[i][1][1]:.0f})" for i in long_edge_idx)
+            log(f"  长边: {long_desc}")
+        log(f"  短边: near ({near_left[0]:.0f},{near_left[1]:.0f})-"
+            f"({near_right[0]:.0f},{near_right[1]:.0f})  "
+            f"far ({far_left[0]:.0f},{far_left[1]:.0f})-"
+            f"({far_right[0]:.0f},{far_right[1]:.0f})")
 
     return {"quad": quad, "net_line": net_line, "homography": H,
             "net_side_sign": net_side_sign, "corridor": corridor, "rebuilt": was_rebuilt,
