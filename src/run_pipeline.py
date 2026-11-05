@@ -329,6 +329,8 @@ def _process_one_video(args, python_cmd, has_ffmpeg, video_index=None, video_tot
         hl_cmd += ["--min-rally-frames", str(args.min_rally_frames)]
     if args.min_static_ball_count is not None:
         hl_cmd += ["--min-static-ball-count", str(args.min_static_ball_count)]
+    if args.ball_conf is not None:
+        hl_cmd += ["--ball-conf", str(args.ball_conf)]
     if args.pre_buffer is not None:
         hl_cmd += ["--pre-buffer", str(args.pre_buffer)]
     if args.post_buffer is not None:
@@ -419,8 +421,8 @@ def main():
                         help="检测置信度阈值 (默认 0.30)")
     parser.add_argument("--iou", type=float, default=None,
                         help="NMS IoU 阈值 (默认 0.45)")
-    parser.add_argument("--conf-ball", type=float, default=None,
-                        help="乒乓球独立置信度阈值")
+    parser.add_argument("--conf-ball", type=float, default=0.10,
+                        help="乒乓球独立置信度阈值 (默认 0.10)")
     parser.add_argument("--conf-player", type=float, default=None,
                         help="球员独立置信度阈值")
     parser.add_argument("--conf-racket", type=float, default=None,
@@ -467,6 +469,9 @@ def main():
                         help="有效回合最小帧数 (默认按 fps 自动)")
     parser.add_argument("--min-static-ball-count", type=int, default=None,
                         help="静止球过滤最少检测数 (默认 10)")
+    parser.add_argument("--ball-conf", type=float, default=None,
+                        help="高光阶段球检测置信度下限 (pingpong_highlight.py 的 --ball-conf, "
+                             "默认 0.50)。注意: --conf-ball 是推理阶段的阈值, 二者不同")
     parser.add_argument("--pre-buffer", type=float, default=None,
                         help="每个回合前缓冲秒数 (默认 0.5)")
     parser.add_argument("--post-buffer", type=float, default=None,
@@ -605,6 +610,8 @@ def main():
                 args.remove_cfr, args.iou is not None, args.log_flush_interval is not None,
                 args.writer_backend, args.no_polygon, args.empty_cache_every is not None,
                 args.conf_margin is not None, args.amf_quality, args.amf_qp is not None,
+                args.conf_player is not None, args.conf_racket is not None,
+                args.conf_table is not None, args.conf_net is not None,
             ])
             if infer_args_present:
                 print("  ℹ️  --skip-inference 已指定, 推理参数将被忽略")

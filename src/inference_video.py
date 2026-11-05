@@ -111,9 +111,8 @@ def _default_model():
     return "/home/gongy/yolo26_frames/runs/train_pingpong_v2/pingpong_x_v1/weights/best.pt"
 
 def _default_output():
-    if _IS_WINDOWS:
-        return os.path.join(os.path.expanduser("~"), "yolo26_frames", "inference_output")
-    return "/home/gongy/yolo26_frames/inference_output"
+    # 默认输出到当前工作目录下的 inference_output/
+    return os.path.join(".", "inference_output")
 
 
 def parse_args():
@@ -122,13 +121,14 @@ def parse_args():
     parser.add_argument("--video-list-file", type=str, default=None,
                         help="批处理模式: UTF-8 文本文件, 每行一个视频绝对路径")
     parser.add_argument("--model", "-m", type=str, default=_default_model())
-    parser.add_argument("--output", "-o", type=str, default=_default_output())
+    parser.add_argument("--output", "-o", type=str, default=_default_output(),
+                        help="输出目录, 默认 ./inference_output (当前目录下)")
     parser.add_argument("--device", type=str, default="0")
     parser.add_argument("--half", action="store_true", help="FP16 推理 (ROCm/CUDA 加速)")
     parser.add_argument("--imgsz", type=int, default=960, help="推理分辨率, 默认 960")
     parser.add_argument("--conf", type=float, default=0.30)
     parser.add_argument("--iou",  type=float, default=0.45)
-    parser.add_argument("--conf-ball",   type=float, default=0.30)
+    parser.add_argument("--conf-ball",   type=float, default=0.10, help="乒乓球置信度阈值, 默认 0.10")
     parser.add_argument("--conf-player", type=float, default=None)
     parser.add_argument("--conf-racket", type=float, default=None)
     parser.add_argument("--conf-table",  type=float, default=None)
