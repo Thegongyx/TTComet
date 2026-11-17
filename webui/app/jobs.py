@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import gzip
+import json
 import os
 import queue
 import shutil
@@ -97,6 +98,20 @@ class VideoItem:
             "video_url": (f"/api/jobs/{self.result.get('job_id')}/videos/{self.index}"
                           if out else None),
         }
+
+    # ---- 持久化 ----
+    def to_persist(self) -> dict:
+        return {"index": self.index, "name": self.name, "src_path": self.src_path,
+                "out_dir": self.out_dir, "status": self.status,
+                "error": self.error, "result": self.result}
+
+    @classmethod
+    def from_persist(cls, d: dict) -> "VideoItem":
+        item = cls(index=int(d.get("index", 0)), name=d.get("name", ""),
+                   src_path=d.get("src_path", ""), out_dir=d.get("out_dir", ""),
+                   status=d.get("status", "done"), error=d.get("error", ""))
+        item.result = d.get("result") or {}
+        return item
 
 
 class Job:
@@ -194,6 +209,38 @@ class Job:
             snap = [v.brief() for v in self.videos]
         self._broadcast({"type": "videos", "data": snap})
 
+    # ---- 持久化 ----
+    def to_persist(self) -> dict:
+        return {
+            "id": self.id,
+            "source": self.source,
+            "params": self.params,
+            "status": self.status,
+            "stage": self.stage,
+            "progress": dict(self.progress),
+            "result": self.result,
+            "error": self.error,
+            "created_at": self.created_at,
+            "started_at": self.started_at,
+            "finished_at": self.finished_at,
+            "videos": [v.to_persist() for v in self.videos],
+        }
+
+    @classmethod
+    def from_persist(cls, d: dict) -> "Job":
+        videos = [VideoItem.from_persist(v) for v in (d.get("videos") or [])]
+        job = cls(videos, d.get("params") or {}, d.get("source") or "",
+                  job_id=d.get("id") or uuid.uuid4().hex[:12])
+        job.status = d.get("status") or "done"
+        job.stage = d.get("stage") or "done"
+        job.progress = d.get("progress") or {}
+        job.result = d.get("result") or {}
+        job.error = d.get("error") or ""
+        job.created_at = float(d.get("created_at") or time.time())
+        job.started_at = d.get("started_at")
+        job.finished_at = d.get("finished_at")
+        return job
+
 
 class JobManager:
     """串行任务队列；模型按档位分别常驻，批量视频共用。"""
@@ -209,6 +256,9 @@ class JobManager:
         self._detectors: dict[str, OnnxDetector] = {}
         self._worker = threading.Thread(target=self._loop, name="job-worker", daemon=True)
         self._worker.start()
+        restored = self._restore_jobs()
+        if restored:
+            print(f"[jobs] 已从磁盘恢复 {restored} 条历史记录（{self.workspace}）")
 
     @property
     def model_loaded(self) -> bool:
@@ -222,6 +272,114 @@ class JobManager:
         """是否有排队中或正在跑的任务（退程序前要拦一下）。"""
         with self._lock:
             return any(j.status in ("queued", "running") for j in self.jobs.values())
+
+    # ---- 历史持久化 ----
+    MAX_RESTORE = 80
+
+    def _meta_path(self, job_id: str) -> str:
+        return os.path.join(self.workspace, job_id, "job.json")
+
+    def _persist(self, job: Job) -> None:
+        """把任务快照写到 <workspace>/<job_id>/job.json：刷新页面、重启程序后都能恢复记录。"""
+        path = self._meta_path(job.id)
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(job.to_persist(), f, ensure_ascii=False)
+            os.replace(tmp, path)
+        except Exception:
+            pass
+
+    def _restore_jobs(self) -> int:
+        """启动时从 workspace 恢复历史任务（只读，不重新排队）。"""
+        try:
+            entries = [e for e in os.scandir(self.workspace) if e.is_dir()]
+        except OSError:
+            return 0
+        try:
+            entries.sort(key=lambda e: e.stat().st_mtime, reverse=True)
+        except OSError:
+            pass
+        n = 0
+        for e in entries[:self.MAX_RESTORE]:
+            try:
+                job = self._job_from_disk(e.path)
+            except Exception:
+                job = None
+            if job is None:
+                continue
+            with self._lock:
+                self.jobs[job.id] = job
+            n += 1
+        return n
+
+    def _job_from_disk(self, job_dir: str) -> Job | None:
+        meta = os.path.join(job_dir, "job.json")
+        if not os.path.exists(meta):
+            return self._job_from_legacy_dirs(job_dir)
+        with open(meta, encoding="utf-8") as f:
+            job = Job.from_persist(json.load(f))
+
+        was_live = job.status in ("queued", "running")
+
+        # 成品在 = 这个视频确实跑完了；成品没了就不假装能播放
+        for v in job.videos:
+            out = v.result.get("output") or {}
+            if out and os.path.exists(out.get("path") or ""):
+                v.status, v.error = "done", ""
+            elif out:
+                v.result.pop("output", None)
+                if v.status == "done":
+                    v.status, v.error = "failed", "成品文件已不存在"
+            elif v.status in ("pending", "running"):
+                v.status = "interrupted"
+                v.error = v.error or "程序重启，任务被中断"
+            elif v.status == "done":
+                v.status, v.error = "failed", "成品文件已不存在"
+
+        # 上次没跑完（进程被关掉）→ 不要显示成"进行中"
+        if was_live:
+            unfinished = any(v.status in ("pending", "running", "interrupted")
+                             for v in job.videos)
+            job.status = "interrupted" if unfinished else "done"
+            job.stage = "done"
+            if unfinished:
+                job.error = job.error or "程序重启，任务已中断"
+                job.add_log("⚠️ 程序重启，该任务被中断（未完成的视频需重新处理）")
+
+        job.result["summary"] = job.summary()
+        return job
+
+    @staticmethod
+    def _job_from_legacy_dirs(job_dir: str) -> Job | None:
+        """老任务目录（没有 job.json）：从 00_xxx/highlight.mp4 反推一条记录。"""
+        try:
+            subs = [d for d in os.scandir(job_dir) if d.is_dir()]
+        except OSError:
+            return None
+        subs.sort(key=lambda d: d.name)
+        items: list[VideoItem] = []
+        for d in subs:
+            out = os.path.join(d.path, "highlight.mp4")
+            if not os.path.exists(out):
+                continue
+            name = d.name.split("_", 1)[1] if "_" in d.name else d.name
+            item = VideoItem(index=len(items), name=name, src_path="", out_dir=d.path,
+                             status="done")
+            item.result["output"] = {
+                "path": out,
+                "size_mb": round(os.path.getsize(out) / 1024 / 1024, 1)}
+            items.append(item)
+        if not items:
+            return None
+        job = Job(items, {}, "（历史记录）", job_id=os.path.basename(job_dir))
+        job.status = "done"
+        job.stage = "done"
+        job.created_at = os.path.getmtime(job_dir)
+        job.finished_at = job.created_at
+        job.result = {"summary": job.summary()}
+        return job
 
     # ---- 提交 ----
     def create(self, source: str, params: dict) -> Job:
@@ -260,6 +418,7 @@ class JobManager:
             job.add_log(f"  [{v.index + 1}/{len(items)}] {v.name}")
         with self._lock:
             self.jobs[job.id] = job
+        self._persist(job)
         self._q.put(job)
         return job
 
@@ -310,6 +469,7 @@ class JobManager:
                 job.set_status("failed", "done")
                 job.finished_at = _now()
             finally:
+                self._persist(job)
                 job._broadcast({"type": "done", "data": job.to_dict()})
 
     @staticmethod
@@ -363,6 +523,7 @@ class JobManager:
     def _run(self, job: Job) -> None:
         job.started_at = _now()
         job.set_status("running", "inference")
+        self._persist(job)          # 一开始就把"进行中"落盘，崩溃后能看出是被中断的
         detector, model_id = self._ensure_detector(job)
         total = len(job.videos)
 
@@ -434,6 +595,7 @@ class JobManager:
                 item.error = hl.get("error") or f"高光脚本返回码 {hl['returncode']}"
                 job.add_log(f"❌ {item.name} 高光失败: {item.error}")
             job.video_changed(item.index)
+            self._persist(job)      # 每完成一个视频就落盘，程序意外退出也能保住已完成的
 
         s = job.summary()
         job.result = {"summary": s,

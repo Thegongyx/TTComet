@@ -67,6 +67,13 @@
       'status.done': '已完成',
       'status.failed': '失败',
       'status.cancelled': '已取消',
+      'status.interrupted': '已中断',
+      'history.title': '处理记录',
+      'history.count': '共 {n} 条',
+      'history.view': '查看',
+      'history.empty': '还没有处理记录',
+      'history.toggleShow': '展开',
+      'history.toggleHide': '收起',
 
       // stage / meta
       'stage.inference': '推理中',
@@ -367,6 +374,13 @@
       'status.done': 'Done',
       'status.failed': 'Failed',
       'status.cancelled': 'Cancelled',
+      'status.interrupted': 'Interrupted',
+      'history.title': 'History',
+      'history.count': '{n} runs',
+      'history.view': 'Open',
+      'history.empty': 'No runs yet',
+      'history.toggleShow': 'Show',
+      'history.toggleHide': 'Hide',
 
       'stage.inference': 'Detecting',
       'stage.highlight': 'Rendering highlight',

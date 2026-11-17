@@ -284,6 +284,26 @@
   .st.done { color:var(--ok); border-color:var(--ok); }
   .st.failed { color:var(--bad); border-color:var(--bad); }
   .st.cancelled { color:var(--warn); border-color:var(--warn); }
+  .st.interrupted { color:var(--warn); border-color:var(--warn); }
+
+  /* ---------- 处理记录 ---------- */
+  .hist { margin-bottom:12px; border:1px solid var(--line); border-radius:10px;
+          background:rgba(8,14,26,.35); }
+  .hist-head { display:flex; align-items:center; gap:10px; padding:8px 12px;
+               font-size:12px; color:var(--muted); }
+  .hist-head .hist-title { color:var(--text); font-weight:600; }
+  .hist-head .hint { flex:1; }
+  .hist-list { border-top:1px solid var(--line); max-height:196px; overflow:auto; }
+  .hist-list.hidden { display:none; }
+  .hist-row { display:flex; align-items:center; gap:10px; padding:7px 12px;
+              font-size:12px; border-top:1px solid rgba(255,255,255,.045); }
+  .hist-row:first-child { border-top:0; }
+  .hist-row.active { background:rgba(114,135,254,.13); }
+  .hist-row .when { color:var(--muted); font-family:Consolas,"Cascadia Mono",monospace; }
+  .hist-row .src { flex:1; min-width:80px; overflow:hidden; text-overflow:ellipsis;
+                   white-space:nowrap; color:var(--text); }
+  .hist-empty { padding:12px; color:var(--muted); font-size:12px; }
+
   pre.log { background:rgba(8,14,26,.62); border:1px solid var(--line); border-radius:12px;
             padding:12px; height:230px; overflow:auto; font-size:12px; line-height:1.5;
             color:#a9b8d1; white-space:pre-wrap; margin:12px 0 0;
@@ -452,6 +472,14 @@
   <!-- ============ 任务 ============ -->
   <div class="panel">
     <h2 data-i18n="panel.run">③ 处理</h2>
+    <div class="hist" id="hist">
+      <div class="hist-head">
+        <span class="hist-title" data-i18n="history.title">处理记录</span>
+        <span class="hint" id="histCount"></span>
+        <button class="ghost sm" id="btnHistToggle" data-i18n="history.toggleHide">收起</button>
+      </div>
+      <div class="hist-list" id="histList"></div>
+    </div>
     <div class="row">
       <button id="btnRun" style="min-width:160px" data-i18n="run.start">开始处理</button>
       <button id="btnCancel" class="ghost" data-i18n="run.cancel" disabled>取消</button>
@@ -780,6 +808,7 @@ function applyLang(lang) {
     if (currentJob.progress) applyProgress(currentJob.progress);
     $('mStage').textContent = statusText(currentJob.status);
   }
+  if (typeof histJobs !== 'undefined') renderHistory();
   loadPresets($('presetSel').value);
   loadModels(true);
   loadHealth();
@@ -1274,6 +1303,7 @@ let currentJob = null;
 const STATUS_KEY = {
   queued: 'status.queued', running: 'status.running',
   done: 'status.done', failed: 'status.failed', cancelled: 'status.cancelled',
+  interrupted: 'status.interrupted',
 };
 
 function statusText(s) { return T(STATUS_KEY[s] || s); }
@@ -1408,6 +1438,7 @@ function subscribe(jobId) {
       setBarActive(false);
       sceneMode('full');
       es.close();
+      loadHistory(false);
       const produced = msg.data.status === 'done'
         && (msg.data.result?.output || (msg.data.videos || []).some((v) => v.video_url));
       if (produced) maybeShowSupportToast();
@@ -1463,6 +1494,105 @@ $('btnReset').onclick = () => {
 
 $('btnHidePlayer').onclick = closePlayer;
 
+/* ==================== 处理记录（刷新/重启后恢复） ==================== */
+let histJobs = [];
+
+function fmtTime(ts) {
+  if (!ts) return '-';
+  const d = new Date(ts * 1000);
+  const p = (n) => String(n).padStart(2, '0');
+  return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
+function shortSource(src) {
+  if (!src) return '-';
+  const parts = src.replace(/\\/g, '/').split('/').filter(Boolean);
+  return parts[parts.length - 1] || src;
+}
+
+function renderHistory() {
+  const box = $('histList');
+  box.innerHTML = '';
+  if (!histJobs.length) {
+    box.innerHTML = `<div class="hist-empty">${T('history.empty')}</div>`;
+    $('histCount').textContent = '';
+    return;
+  }
+  $('histCount').textContent = T('history.count', { n: histJobs.length });
+  for (const j of histJobs) {
+    const sum = j.summary || {};
+    const row = document.createElement('div');
+    row.className = 'hist-row' + (currentJob && currentJob.id === j.id ? ' active' : '');
+    const when = document.createElement('span');
+    when.className = 'when';
+    when.textContent = fmtTime(j.created_at);
+    const src = document.createElement('span');
+    src.className = 'src';
+    src.textContent = shortSource(j.source);
+    src.title = j.source || '';
+    const meta = document.createElement('span');
+    meta.className = 'hint';
+    meta.textContent = T('run.summary', {
+      total: sum.total || 0, done: sum.done || 0, failed: sum.failed || 0,
+    });
+    const st = document.createElement('span');
+    st.className = 'st ' + j.status;
+    st.textContent = statusText(j.status);
+    const btn = document.createElement('button');
+    btn.className = 'ghost sm';
+    btn.textContent = T('history.view');
+    btn.onclick = () => showJob(j.id);
+    row.append(when, src, meta, st, btn);
+    box.appendChild(row);
+  }
+}
+
+/** 把某个历史任务铺到结果区（不重新处理） */
+async function showJob(id) {
+  try {
+    const job = await api('/api/jobs/' + id);
+    currentJob = job;
+    currentJob._summary = (job.result && job.result.summary) || job.summary;
+    closePlayer();
+    clearLog();
+    api('/api/jobs/' + id + '/logs').then((d) => {
+      (d.logs || []).slice(-400).forEach(appendLog);
+    }).catch(() => {});
+    renderVideos(job.videos || []);
+    renderRunMeta(currentJob._summary, job.status);
+    applyProgress(job.progress);
+    $('mStage').textContent = statusText(job.status);
+    const live = job.status === 'running' || job.status === 'queued';
+    $('btnRun').disabled = false;
+    $('btnCancel').disabled = !live;
+    setBarActive(live);
+    if (live) subscribe(id);
+    renderHistory();
+  } catch (e) {
+    alert(e.message);
+  }
+}
+
+/** 拉历史列表；autoOpen=true 时自动把最近一条铺到结果区（刷新后无缝续上） */
+async function loadHistory(autoOpen) {
+  try {
+    const d = await api('/api/jobs');
+    histJobs = (d.jobs || []).slice(0, 30);
+    renderHistory();
+    if (autoOpen && histJobs.length) {
+      const newest = histJobs[0];
+      const live = newest.status === 'running' || newest.status === 'queued';
+      if (live || !currentJob) await showJob(newest.id);
+    }
+  } catch (e) { /* 历史加载失败不影响主流程 */ }
+}
+
+$('btnHistToggle').onclick = () => {
+  const list = $('histList');
+  const hidden = list.classList.toggle('hidden');
+  $('btnHistToggle').textContent = hidden ? T('history.toggleShow') : T('history.toggleHide');
+};
+
 /* ==================== 自检 ==================== */
 function loadHealth() {
   api('/api/health').then((h) => {
@@ -1489,6 +1619,7 @@ applyLang(window.I18N.lang);
 loadModels();
 loadPresets();
 loadHealth();
+loadHistory(true);
 </script>
 <script type="module" src="/static/pingpong-scene.js"></script>
 </body>
