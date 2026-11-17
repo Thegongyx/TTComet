@@ -1,4 +1,4 @@
-# WebUI 工程 —— ONNX 推理引擎
+# 乒乓彗星 TTComet —— WebUI 与 ONNX 推理引擎
 
 把 `src/inference_video.py`（torch + ultralytics）的推理链路替换为纯
 `onnxruntime` 实现，输出与其**同 schema** 的检测日志，供 `src/pingpong_highlight.py`
@@ -18,7 +18,7 @@
 | `static/index.html` | 单页界面 |
 | `static/pingpong-scene.js` | three.js 场景：两只小动物打乒乓球（纯程序化建模） |
 | `static/vendor/three.module.min.js` | three.js 0.160.0（本地化，离线可用，655 KB） |
-| `../run_server.py` | 启动器：本地起服务 + 打开浏览器 |
+| `../run_server.py` | 启动器：本地起服务 + 打开浏览器（`ttComet.exe` 的入口） |
 | `../models/m960n_fp16_nonms.onnx` | 高精度档（fp16、稠密输出、batch=1，45.2 MB） |
 | `../models/s960n_fp16_nonms.onnx` | 高速档（同上格式，20.1 MB） |
 
@@ -29,7 +29,7 @@
 $env:PPT_DEV="1"; $env:PPT_PORT="8123"
 webui\.venv\Scripts\python.exe webui\run_server.py
 
-# 正常模式（工作目录在 %LOCALAPPDATA%\PingPongStudio\jobs\）
+# 正常模式（工作目录在 %LOCALAPPDATA%\TTComet\jobs\）
 webui\.venv\Scripts\python.exe webui\run_server.py
 ```
 
@@ -263,8 +263,8 @@ cd webui
 .\packaging\build.ps1 -WithFFmpeg -Clean
 ```
 
-产物：`webui/dist/PingPongStudio/`（onedir，整个文件夹一起分发），
-内含 `PingPongStudio.exe`、`使用说明.txt`、`_internal/`（运行时、模型、静态页、ffmpeg）。
+产物：`webui/dist/ttComet/`（onedir，整个文件夹一起分发），
+内含 `ttComet.exe`、`使用说明.txt`、`_internal/`（运行时、模型、静态页、ffmpeg）。
 
 打包相关说明：
 
@@ -276,8 +276,8 @@ cd webui
 | 静态页/模型 | `webui/app/static`、`webui/models` 一并打进 `_internal/` |
 | ffmpeg | 内置时放到 `_internal/ffbin/`，启动时前置到 PATH |
 | 控制台编码 | 打包后默认 GBK，启动即把 stdout 切 UTF-8（否则日志 emoji 会抛异常） |
-| 单实例 | Windows 命名互斥量，重复双击会提示"已在运行" |
-| 工作目录 | `%LOCALAPPDATA%\PingPongStudio\jobs`（不放安装目录，避免无写权限） |
+| 单实例 | Windows 命名互斥量 `TTComet_SingleInstance`，重复双击会提示"已在运行" |
+| 工作目录 | `%LOCALAPPDATA%\TTComet\jobs`（不放安装目录，避免无写权限） |
 | 默认浏览起点 | 打包后回落到用户"视频"目录（不是 `_internal`） |
 
 ### 打包实测（本机）

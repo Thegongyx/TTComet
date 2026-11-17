@@ -8,7 +8,7 @@ PyInstaller 打包配置（onedir）
     webui\\.venv\\Scripts\\pyinstaller.exe webui\\packaging\\app.spec --noconfirm ^
         --distpath webui\\dist --workpath webui\\build
 
-产物：webui\dist\\PingPongStudio\\PingPongStudio.exe
+产物：webui\dist\\ttComet\\ttComet.exe
 
 说明：
   - 用 onedir 而不是 onefile：onefile 每次启动都要把 ~300MB 解压到临时目录，冷启动几十秒。
@@ -94,7 +94,8 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
-    name="PingPongStudio",
+    name="ttComet",
+    icon=os.path.join(WEBUI, "packaging", "ttComet.ico"),
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -114,5 +115,5 @@ coll = COLLECT(
     strip=False,
     upx=False,
     upx_exclude=[],
-    name="PingPongStudio",
+    name="ttComet",
 )

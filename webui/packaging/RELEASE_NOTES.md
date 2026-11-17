@@ -1,11 +1,15 @@
-## PingPong Studio v0.0.1
+## 乒乓彗星 TTComet v0.0.2
 
-首个可分发版本：**本地运行的乒乓球视频自动高光剪辑工具**。
+> **品牌更名**：v0.0.1 名为 PingPong Studio，从本版起正式命名为 **乒乓彗星 TTComet**
+> （TT = table tennis，"彗星"取自产品最具辨识度的球速残影拖尾）。
+
+**本地运行的乒乓球视频自动高光剪辑工具**，无需安装 Python 或任何运行环境。
 
 ### 主要功能
 
 - **自动高光剪辑**：逐帧推理 → 球轨迹分析 → 回合检测 → 切片输出，自带球轨迹彗尾、落点标记、迷你球台、球员光环等特效
 - **本地网页界面**：选择单个视频或整个文件夹批量处理，实时进度与日志，结果在线播放/下载
+- **中英双语界面**：右上角切换 中文 / English，参数说明与提示全部翻译
 - **两档精度模型**：高精度（识别更准）/ 低精度（快约 2.8 倍），可随时切换
 - **参数可调**：按业务分 8 组共 35 项，每项都标注"调高/调低"的效果；支持保存多套预设并重命名
 - **不剪辑模式**：可只给视频加特效、保留完整时长（不剔除捡球与空档）
@@ -17,32 +21,58 @@
 - **已内置 ffmpeg**，目标机不需要安装 Python 或任何运行环境
 - 安装完成后自动启动，浏览器会自动打开操作界面
 
-### 📦 安装包下载（重要）
+### ⚠️ 关于数字签名（请先看这段）
+
+本程序**未做代码签名**（代码签名证书需付费购买并实名审核），因此首次运行 Windows 可能提示：
+
+> "Windows 已保护你的电脑" / "未知发布者"
+
+这是未签名程序的正常现象，**不是病毒**。处理方法：
+
+1. 点提示框里的 **"更多信息"** → **"仍要运行"**
+2. 或在杀毒软件里把安装目录加入白名单
+
+如果你介意，可以先用下面的 SHA256 校验值核对下载文件是否完整、未被篡改：
+
+```powershell
+# 在下载目录执行，把输出与下方 SHA256 对比
+certutil -hashfile ttComet-0.0.2-setup.exe SHA256
+```
+
+### 📦 安装包下载
 
 **Gitee 附件单个限制 100 MB**，所以安装包分成了 3 个分卷，需要下载后合并：
 
-1. 把 `PingPongStudio-0.0.1-setup.exe.part1 / .part2 / .part3` 三个文件下载到**同一目录**
+1. 把 `ttComet-0.0.2-setup.exe.part1 / .part2 / .part3` 下载到**同一目录**
 2. 在该目录打开命令行（地址栏输入 `cmd` 回车），执行：
 
 ```
-copy /b PingPongStudio-0.0.1-setup.exe.part1 + PingPongStudio-0.0.1-setup.exe.part2 + PingPongStudio-0.0.1-setup.exe.part3 PingPongStudio-0.0.1-setup.exe
+copy /b ttComet-0.0.2-setup.exe.part1 + ttComet-0.0.2-setup.exe.part2 + ttComet-0.0.2-setup.exe.part3 ttComet-0.0.2-setup.exe
 ```
 
-3. 得到完整的 `PingPongStudio-0.0.1-setup.exe`（239 MB），双击安装
+3. 得到完整的 `ttComet-0.0.2-setup.exe`，双击安装
 
 > **更省事的方式**：直接从 GitHub 下载完整安装包（不用合并）
-> https://github.com/Thegongyx/tt_ylov/releases/download/v0.0.1/PingPongStudio-0.0.1-setup.exe
+> https://github.com/Thegongyx/ttComet/releases/download/v0.0.2/ttComet-0.0.2-setup.exe
 
 ### 环境要求
 
 - Windows 10 / 11（64 位）
 - 推荐带独立显卡（AMD / NVIDIA 均可，走 DirectML 加速）；无独显也能运行，但速度明显更慢
 
+### 变更内容（相对 v0.0.1）
+
+- 应用更名为 **乒乓彗星 TTComet**，可执行文件改名 `ttComet.exe`
+- 全新设计图标（球速残影主题，16–256px 多尺寸，小尺寸使用简化版保证清晰）
+- **界面支持中英双语**，右上角切换，语言记忆到本地
+- 安装目录改为 `%LOCALAPPDATA%\Programs\TTComet`，数据目录改为 `%LOCALAPPDATA%\TTComet\jobs`
+- 浏览器标签页图标同步更新
+
 ### 已知限制
 
-- 程序**未做代码签名**，首次运行 Windows Defender / 杀软可能拦截，选"仍要运行"即可
+- 程序**未做代码签名**（见上方说明）
 - 同一时间只允许运行一个实例（避免抢占 GPU）
-- 处理数据保存在 `%LOCALAPPDATA%\PingPongStudio\jobs\`，卸载不会删除
+- **v0.0.1 的用户数据不会自动迁移**（目录名变了），如需保留请手动把 `%LOCALAPPDATA%\PingPongStudio\jobs` 内容拷到 `%LOCALAPPDATA%\TTComet\jobs`
 
 ### 技术说明
 

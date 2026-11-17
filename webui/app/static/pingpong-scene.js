@@ -8,7 +8,7 @@
  *   2. 落点标记（球落台时环形扩散 + 中心点）
  *   3. 速度数值标签（跟随球浮动）
  *
- * 对外接口（挂在 window.PingPongScene）：
+ * 对外接口（挂在 window.TTCometScene）：
  *   setMode('full' | 'calm' | 'pause')  推理时降到低帧率，避免和 DirectML 抢 GPU
  *   shuffle()                           换一组对手
  */
@@ -538,7 +538,7 @@ function spawnPair(i, j) {
   scene.add(animals.right.group);
   try {
     window.dispatchEvent(new CustomEvent('pp:pair', {
-      detail: { left: PROFILES[leftKey].name, right: PROFILES[rightKey].name },
+      detail: { left: leftKey, right: rightKey },   // 传 key，由前端按语言翻译
     }));
   } catch (e) { /* 事件失败不影响渲染 */ }
 }
@@ -765,7 +765,7 @@ function boot() {
   }
 }
 
-window.PingPongScene = { setMode, shuffle };
+window.TTCometScene = { setMode, shuffle };
 
 if (document.readyState === 'loading') {
   document.addEventListener('DOMContentLoaded', boot);

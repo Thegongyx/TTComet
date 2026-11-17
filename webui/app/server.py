@@ -63,7 +63,7 @@ def _resolve_workspace() -> str:
         return p
     local = os.environ.get("LOCALAPPDATA")
     if local and not os.environ.get("PPT_DEV"):
-        return os.path.join(local, "PingPongStudio", "jobs")
+        return os.path.join(local, "TTComet", "jobs")
     return os.path.join(PROJECT_ROOT, "webui", "workspace")
 
 
@@ -101,7 +101,7 @@ def _resolve_models() -> tuple[dict[str, str], list[dict], str]:
 
 MODELS, MODEL_META, DEFAULT_MODEL = _resolve_models()
 
-app = FastAPI(title="PingPong Studio")
+app = FastAPI(title="TTComet")
 manager = JobManager(_resolve_workspace(), MODELS, DEFAULT_MODEL)
 # three.js 与场景脚本走静态目录（已本地化，不依赖 CDN）
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")

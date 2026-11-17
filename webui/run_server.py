@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""
+r"""
 启动器：本地起服务 + 打开默认浏览器
 ====================================
 只监听 127.0.0.1（随机空闲端口），不对外网开放。
 打包成 exe 后，这个脚本就是入口。
 
 用法:
-    webui\.venv\Scripts\python.exe webui\run_server.py            # 用 %LOCALAPPDATA% 作工作目录
-    set PPT_DEV=1 && webui\.venv\Scripts\python.exe webui\run_server.py   # 用 webui/workspace
+    webui\.venv\Scripts\python.exe webui\run_server.py                   # 工作目录 %LOCALAPPDATA%\TTComet
+    set PPT_DEV=1 && webui\.venv\Scripts\python.exe webui\run_server.py  # 工作目录 webui/workspace
 """
 
 from __future__ import annotations
@@ -47,13 +47,23 @@ def ensure_ffmpeg_path() -> str | None:
     return None
 
 
+def set_console_title(title: str) -> None:
+    """设置控制台窗口标题（任务栏悬停能看到品牌名）。"""
+    if os.name != "nt":
+        return
+    try:
+        ctypes.windll.kernel32.SetConsoleTitleW(title)
+    except Exception:
+        pass
+
+
 def single_instance() -> bool:
     """Windows 命名互斥量：避免重复启动抢 GPU。非 Windows 直接放行。"""
     global _MUTEX
     if os.name != "nt":
         return True
     kernel32 = ctypes.windll.kernel32
-    _MUTEX = kernel32.CreateMutexW(None, False, "PingPongStudio_SingleInstance")
+    _MUTEX = kernel32.CreateMutexW(None, False, "TTComet_SingleInstance")
     ERROR_ALREADY_EXISTS = 183
     return kernel32.GetLastError() != ERROR_ALREADY_EXISTS
 
@@ -69,7 +79,7 @@ def main() -> int:
 
     if not single_instance():
         print("=" * 60)
-        print("  PingPong Studio 已经在运行了")
+        print("  乒乓彗星 TTComet 已经在运行了")
         print("  请使用已打开的那个窗口/浏览器标签页。")
         print("=" * 60)
         try:
@@ -78,6 +88,7 @@ def main() -> int:
             pass
         return 1
 
+    set_console_title("乒乓彗星 TTComet")
     ff = ensure_ffmpeg_path()
 
     port = int(os.environ.get("PPT_PORT", "0")) or _free_port()
@@ -88,7 +99,7 @@ def main() -> int:
 
     threading.Timer(1.2, open_browser).start()
     print("=" * 60)
-    print("  PingPong Studio")
+    print("  乒乓彗星 TTComet")
     print("=" * 60)
     print(f"  地址: {url}")
     if ff:

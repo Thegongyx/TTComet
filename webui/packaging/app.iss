@@ -1,22 +1,22 @@
 ; ============================================================
-;  PingPong Studio 安装包（Inno Setup 6）
+;  乒乓彗星 TTComet 安装包（Inno Setup 6）
 ; ============================================================
 ;  编译：
 ;      "C:\Users\<你>\AppData\Local\Programs\Inno Setup 6\ISCC.exe" packaging\app.iss
 ;  或：
 ;      .\packaging\build.ps1 -WithFFmpeg -Installer
 ;
-;  产物：dist\installer\PingPongStudio-0.0.1-setup.exe
+;  产物：dist\installer\ttComet-0.0.2-setup.exe
 ; ============================================================
 
-#define MyAppName "PingPong Studio"
-#define MyAppVersion "0.0.1"
+#define MyAppName "乒乓彗星"
+#define MyAppVersion "0.0.2"
 #define MyAppPublisher "Thegongyx"
-#define MyAppExeName "PingPongStudio.exe"
-#define SrcDir "..\dist\PingPongStudio"
+#define MyAppExeName "ttComet.exe"
+#define SrcDir "..\dist\ttComet"
 
 [Setup]
-AppId={{8F3C2A61-7B4D-4E19-9A2C-5D6E7F8091A2}
+AppId={{C41B7E52-9A3D-4F68-B0E7-2D5A8C41F390}
 AppName={#MyAppName}
 AppVersion={#MyAppVersion}
 AppVerName={#MyAppName} {#MyAppVersion}
@@ -26,13 +26,13 @@ VersionInfoVersion={#MyAppVersion}
 ; 按用户安装，不需要管理员权限（避免 UAC 劝退）
 PrivilegesRequired=lowest
 PrivilegesRequiredOverridesAllowed=dialog
-DefaultDirName={localappdata}\Programs\PingPongStudio
+DefaultDirName={localappdata}\Programs\TTComet
 DisableProgramGroupPage=yes
 AllowNoIcons=yes
 
 ; 输出
 OutputDir=..\dist\installer
-OutputBaseFilename=PingPongStudio-{#MyAppVersion}-setup
+OutputBaseFilename=ttComet-{#MyAppVersion}-setup
 Compression=lzma2/normal
 SolidCompression=yes
 WizardStyle=modern
@@ -49,6 +49,7 @@ RestartApplications=no
 
 UninstallDisplayIcon={app}\{#MyAppExeName}
 UninstallDisplayName={#MyAppName} {#MyAppVersion}
+SetupIconFile=ttComet.ico
 
 ; 中文界面
 [Languages]
@@ -72,5 +73,5 @@ Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; WorkingDi
 Filename: "{app}\{#MyAppExeName}"; Description: "立即启动 {#MyAppName}"; Flags: nowait postinstall skipifsilent
 
 [UninstallDelete]
-; 只删程序目录；用户数据在 %LOCALAPPDATA%\PingPongStudio\jobs，保留
+; 只删程序目录；用户数据在 %LOCALAPPDATA%\TTComet\jobs，保留
 Type: filesandordirs; Name: "{app}"

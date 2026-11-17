@@ -1,0 +1,599 @@
+/**
+ * TTComet 界面文案（中 / 英）
+ * ===========================
+ * 用法：
+ *   t('app.name')               取当前语言文案
+ *   t('meta.frames', {n: 100})  带占位符插值（文案里写 {n}）
+ *   setLang('en')               切换语言（会重建参数区并记忆到 localStorage）
+ *
+ * 约定：
+ *   p.<key>.label / .up / .dn / .note   参数项的文案
+ *   g.<key>.title / .desc               参数分组
+ *   opt.<key>.<value>                   下拉选项
+ */
+
+(function () {
+  const DICT = {
+    zh: {
+      'app.name': '乒乓彗星',
+      'app.brand': 'TTComet',
+      'app.subtitle': '自动高光剪辑 · 本地运行',
+      'app.title': '乒乓彗星 TTComet · 自动高光',
+
+      'lang.zh': '中文',
+      'lang.en': 'EN',
+
+      // hero
+      'hero.playing': '正在热桌',
+      'hero.shuffle': '换一组对手',
+      'hero.trail': '速度残影',
+      'hero.bounce': '落点标记',
+      'hero.speed': '球速显示',
+      'animal.panda': '熊猫',
+      'animal.rabbit': '小兔',
+      'animal.penguin': '企鹅',
+      'animal.shiba': '柴犬',
+
+      // panels
+      'panel.input': '① 选择视频',
+      'panel.params': '② 参数（按业务分组，默认全部折叠，保持默认即可）',
+      'panel.run': '③ 处理',
+
+      // input
+      'input.placeholder': '未选择（可手动粘贴路径）',
+      'input.pickFile': '选择视频文件',
+      'input.pickDir': '选择文件夹',
+      'input.hint': '支持 mp4 / mov / mkv / avi / webm 等；选文件夹时会扫描该目录下所有视频批量处理',
+      'input.notSelected': '未选择',
+      'input.pickedFile': '已选视频：',
+      'input.pickedDir': '已选文件夹：',
+      'input.dirNote': '（目录下所有视频按文件名顺序批量处理，模型只加载一次）',
+
+      // run
+      'run.start': '开始处理',
+      'run.cancel': '取消',
+      'run.waiting': '等待开始',
+      'run.submitting': '提交中…',
+      'run.queuePos': '排队中（第 {n} 位）',
+      'run.summary': '共 {total} 个 · 成功 {done} · 失败 {failed}',
+
+      // status
+      'status.queued': '排队中',
+      'status.running': '处理中',
+      'status.done': '已完成',
+      'status.failed': '失败',
+      'status.cancelled': '已取消',
+
+      // stage / meta
+      'stage.inference': '推理中',
+      'stage.highlight': '高光剪辑中',
+      'meta.video': '[{i}/{n}] {name}',
+      'meta.frames': '{a} / {b} 帧',
+      'meta.fps': '{n} fps',
+      'meta.eta': '剩余约 {n} 秒',
+      'meta.framesShort': '{n} 帧 / {fps} fps',
+
+      // results
+      'result.play': '▶ 播放',
+      'result.download': '下载当前视频',
+
+      // health
+      'health.backend': '后端',
+      'health.models': '精度档位 {n} 档可选',
+      'health.ffmpeg': 'ffmpeg',
+      'health.ffmpegOk': '可用',
+      'health.ffmpegMissing': '缺失',
+      'health.disk': '可用磁盘 {n} GB',
+      'health.modelLoaded': '模型 已加载',
+      'health.modelIdle': '模型 未加载',
+      'health.fail': '自检失败: {msg}',
+
+      // presets
+      'preset.label': '预设',
+      'preset.none': '— 未选择 —',
+      'preset.apply': '应用',
+      'preset.save': '保存当前参数',
+      'preset.rename': '重命名',
+      'preset.delete': '删除',
+      'preset.applied': '已应用：{name}（{n} 项）',
+      'preset.saved': '已保存：{name}',
+      'preset.renamed': '已重命名为：{name}',
+      'preset.deleted': '已删除：{name}',
+      'preset.option': '{name}（{n} 项）',
+      'preset.saveTitle': '保存参数预设',
+      'preset.saveHint': '将保存当前生效的 {n} 项参数（当前模式下不生效的参数不会被保存）',
+      'preset.defaultName': '预设 {stamp}',
+      'preset.renameTitle': '重命名预设',
+      'preset.renameHint': '当前保存了 {n} 项参数',
+      'preset.deleteTitle': '删除预设',
+      'preset.deleteMsg': '确定删除「{name}」吗？此操作不可撤销。',
+      'preset.confirm': '保存',
+      'preset.saveFail': '保存失败: {msg}',
+      'preset.renameFail': '重命名失败: {msg}',
+      'preset.deleteFail': '删除失败: {msg}',
+
+      // dialogs
+      'dlg.cancel': '取消',
+      'dlg.ok': '确定',
+      'dlg.delete': '删除',
+      'dlg.emptyName': '请输入名称',
+      'dlg.tooLong': '名称最多 40 个字',
+      'dlg.dupName': '已存在同名预设，换个名字',
+
+      // file browser
+      'fs.up': '上一级',
+      'fs.go': '跳转',
+      'fs.pickDir': '选择此文件夹',
+      'fs.loading': '加载中…',
+      'fs.empty': '（空目录，没有子目录或视频）',
+      'fs.readFail': '读取失败：{msg}',
+      'fs.hintFile': '此目录下 {n} 个视频，点击文件名选择',
+      'fs.hintDir': '此目录下 {n} 个视频，点下方按钮按文件夹批量处理',
+
+      // params common
+      'params.changed': '已修改 {n} 项（只统计当前模式下生效的参数）',
+      'params.reset': '恢复默认',
+      'params.count': '{n} 项',
+      'params.changedShort': '已改 {n} 项',
+      'params.inactive': '当前模式不生效',
+      'tips.up': '',
+      'tips.dn': '',
+
+      // model options
+      'model.m960': '高精度',
+      'model.s960': '低精度',
+      'model.m960.note': '识别更准，速度较慢（推荐正式成片）',
+      'model.s960.note': '速度快约 2.8 倍，识别略粗（适合快速预览）',
+      'model.loading': '加载中…',
+
+      // options
+      'opt.encoder.auto': '自动（优先 AMD AMF 硬编）',
+      'opt.encoder.libx264': 'libx264（兼容性最好）',
+      'opt.encoder.h264_amf': 'h264_amf',
+      'opt.encoder.hevc_amf': 'hevc_amf',
+      'opt.fx.minimal': '极简',
+      'opt.fx.normal': '常规',
+      'opt.fx.max': '最强',
+      'opt.algo.auto': 'auto（自动选择）',
+      'opt.algo.hungarian': 'hungarian（更准更慢）',
+      'opt.algo.greedy': 'greedy（更快）',
+
+      // groups
+      'g.model.title': '模型精度',
+      'g.model.desc': '高精度识别更准但慢一些；低精度快约 2.8 倍。切换档位会自动换模型，不用重启',
+      'g.output.title': '剪辑与输出',
+      'g.output.desc': '成片形态：剪不剪、分辨率、编码器、声音',
+      'g.detect.title': '检测阈值',
+      'g.detect.desc': '模型识别各类目标的置信度下限，低于阈值的检测直接丢弃',
+      'g.track.title': '球轨迹与回合判定',
+      'g.track.desc': '轨迹的鲁棒性，以及一个回合什么时候开始、什么时候结束（两种模式都生效）',
+      'g.valid.title': '回合有效性（仅剪辑模式）',
+      'g.valid.desc': '哪些回合值得剪进成片。关闭“按回合剪辑”后整组不生效',
+      'g.segment.title': '片段边界（仅剪辑模式）',
+      'g.segment.desc': '回合前后留多少画面、相邻片段什么时候合并',
+      'g.prepend.title': '前置精彩集锦（仅剪辑模式）',
+      'g.prepend.desc': '在成片开头按球速挑选精彩回合做集锦，再放正片',
+      'g.fx.title': '视觉效果',
+      'g.fx.desc': '球轨迹彗尾、迷你球台、落点与击球标记、球员光环',
+      'g.adv.title': '高级 · 几何与调试',
+      'g.adv.desc': '球台几何、走廊过滤、轨迹关联的精细调节。不确定时请保持默认',
+
+      // ---- 参数：模型/剪辑输出 ----
+      'p.model.label': '精度档位',
+      'p.model.note': '两个档位的模型会各自缓存，来回切换不会重复加载',
+      'p.cut.label': '按回合剪辑',
+      'p.cut.note': '勾选：只保留判定的有效回合，剪掉捡球/走动的空档。取消勾选：整段视频加特效，一个镜头都不删（此时下面三个“仅剪辑模式”的组失效）',
+      'p.output_height.label': '输出高度 px（留空 = 原分辨率）',
+      'p.output_height.up': '调高：画面更清晰，但渲染更慢、文件更大',
+      'p.output_height.dn': '调低：渲染更快、文件更小，720p 左右通常够用',
+      'p.encoder.label': '编码器',
+      'p.encoder.note': 'auto 会自动挑硬编，速度最快；若出现花屏/播放器不兼容，改 libx264',
+      'p.no_audio.label': '去掉原声',
+      'p.no_audio.note': '勾选：渲染更快（省掉音频重建），输出无声视频',
+
+      // ---- 检测阈值 ----
+      'p.conf_ball.label': '乒乓球 置信度',
+      'p.conf_ball.up': '调高：只记录很有把握的球，误检少但轨迹容易断，回合可能变少',
+      'p.conf_ball.dn': '调低：召回更多球（含误检），轨迹更连续，回合更容易连起来',
+      'p.conf_table.label': '球桌 置信度（留空 = 0.30）',
+      'p.conf_table.up': '调高：球台只保留最确定的那个，几何更稳但可能一帧都检不到',
+      'p.conf_table.dn': '调低：更容易检到球台，但可能把别的矩形当球台',
+      'p.conf_net.label': '球网 置信度（留空 = 0.30）',
+      'p.conf_net.up': '调高：球网更严格，远处小球网可能漏检',
+      'p.conf_net.dn': '调低：更容易检到球网，但可能误检',
+      'p.conf_player.label': '球员 置信度（留空 = 0.40）',
+      'p.conf_player.up': '调高：只给确定的球员加光环',
+      'p.conf_player.dn': '调低：更多球员被识别，可能把观众也标上',
+      'p.conf_player.note': '只影响球员光环特效，不影响回合与剪辑',
+      'p.iou.label': 'NMS 重叠抑制阈值',
+      'p.iou.up': '调高：重叠的框更少被合并，同一目标可能出现重复框',
+      'p.iou.dn': '调低：更激进地合并重叠框，球拍/球员紧挨时可能漏检',
+
+      // ---- 轨迹与回合 ----
+      'p.ball_conf.label': '高光阶段球置信度下限',
+      'p.ball_conf.up': '调高：只用更可信的球参与轨迹，轨迹更干净但可能断开、回合变少',
+      'p.ball_conf.dn': '调低：轨迹更连续、回合更容易成立，但杂点会增多',
+      'p.ball_conf.note': '这是第二道球筛选（算轨迹用），与上面“检测阈值”里的乒乓球是两个环节',
+      'p.min_static_ball_count.label': '静止球过滤（最少检测数）',
+      'p.min_static_ball_count.up': '调高：更狠地剔除位置几乎不变的球（捡球时地上的球），但慢速对拉也可能被误删',
+      'p.min_static_ball_count.dn': '调低：静止球更容易混进轨迹，导致回合判断被带偏',
+      'p.max_jump_ratio.label': '轨迹最大跳变（占对角线比例）',
+      'p.max_jump_ratio.up': '调高：允许球一帧跳更远，适合快球或低帧率素材',
+      'p.max_jump_ratio.dn': '调低：轨迹更保守，快球容易被判为跳变而丢弃',
+      'p.rally_lost_timeout.label': '球丢失多久判回合结束（秒）',
+      'p.rally_lost_timeout.up': '调高：球丢了还继续等，回合更长、不容易被切碎，但可能把捡球算进来',
+      'p.rally_lost_timeout.dn': '调低：一丢球就结束，回合更多也更碎',
+      'p.out_of_table_timeout.label': '持续出台多久判结束（秒）',
+      'p.out_of_table_timeout.up': '调高：容忍放高球/远台，回合更完整',
+      'p.out_of_table_timeout.dn': '调低：球一出球台范围就结束，回合变短',
+      'p.no_bounce_timeout.label': '连续无落点多久判结束（秒）',
+      'p.no_bounce_timeout.up': '调高：允许更长时间没有落点（比如长回合对拉），回合变长',
+      'p.no_bounce_timeout.dn': '调低：久不落点就收尾，回合变少变短',
+
+      // ---- 回合有效性 ----
+      'p.min_rally_frames.label': '有效回合最小帧数',
+      'p.min_rally_frames.up': '调高：门槛更高，只留长回合，成片更短更精、回合数变少',
+      'p.min_rally_frames.dn': '调低：短回合也能入选，成片更长、回合变多（可能混入无效来回）',
+      'p.min_rally_bounce_count.label': '短回合豁免：落点数',
+      'p.min_rally_bounce_count.up': '调高：短回合要求更多落点才豁免，回合变少',
+      'p.min_rally_bounce_count.dn': '调低：短回合更容易被保留，回合变多',
+      'p.min_rally_speed_top_n.label': '球速前 N 名无条件保留',
+      'p.min_rally_speed_top_n.up': '调高：更多“球速快”的回合被强行保留（即使很短），回合变多',
+      'p.min_rally_speed_top_n.dn': '调低：只靠时长/落点条件筛选，回合变少',
+      'p.min_rally_speed_top_n.note': '填 0 = 关闭该豁免',
+
+      // ---- 片段边界 ----
+      'p.pre_buffer.label': '回合前缓冲（秒）',
+      'p.pre_buffer.up': '调高：回合前多留，能看到发球准备动作，成片更长',
+      'p.pre_buffer.dn': '调低：开场更干脆，成片更紧凑',
+      'p.post_buffer.label': '回合后缓冲（秒）',
+      'p.post_buffer.up': '调高：回合后多留，能看到捡球开头，成片更长',
+      'p.post_buffer.dn': '调低：结束更干脆',
+      'p.merge_gap.label': '相邻片段合并间隔（秒）',
+      'p.merge_gap.up': '调高：间隔较远的回合也会连成一段，成片更连贯、片段数变少',
+      'p.merge_gap.dn': '调低：片段切得更碎、跳转更频繁',
+
+      // ---- 前置集锦 ----
+      'p.no_highlight_prepend.label': '关闭前置集锦',
+      'p.no_highlight_prepend.note': '勾选：不生成开头集锦，只输出正片顺序。勾选后本组其余参数失效',
+      'p.highlight_top_n.label': '取球速最快的 N 个回合',
+      'p.highlight_top_n.up': '调高：集锦包含更多回合，开头更长',
+      'p.highlight_top_n.dn': '调低：集锦更短；填 0 = 不做集锦',
+      'p.highlight_min_duration.label': '入选最小时长（秒）',
+      'p.highlight_min_duration.up': '调高：只有较长的回合能进集锦，集锦更少',
+      'p.highlight_min_duration.dn': '调低：短回合也能进集锦，集锦更多',
+      'p.highlight_min_bounce_count.label': '入选落点数条件',
+      'p.highlight_min_bounce_count.up': '调高：需要更多落点才能进集锦，入选更少',
+      'p.highlight_min_bounce_count.dn': '调低：更容易入选',
+      'p.highlight_black_gap.label': '集锦与正片间黑幕（秒）',
+      'p.highlight_black_gap.up': '调高：黑屏过渡更久，段落感更强',
+      'p.highlight_black_gap.dn': '调低：直接切换，节奏更紧凑',
+
+      // ---- 视觉 ----
+      'p.fx_level.label': '特效强度',
+      'p.fx_level.note': '极简最省性能（关闭部分叠加效果）；最强特效最丰富但渲染更慢',
+      'p.no_player_fx.label': '关闭球员脚下光环',
+      'p.no_player_fx.note': '勾选：画面更干净、渲染略快，也不再需要球员检测结果',
+
+      // ---- 高级 ----
+      'p.corridor_margin.label': '长边走廊横向容差',
+      'p.corridor_margin.up': '调高：走廊更宽，能保留更多贴边的球，但误检也更容易混进来',
+      'p.corridor_margin.dn': '调低：过滤更狠，靠近球台边线的真球可能被删',
+      'p.corridor_extend.label': '走廊纵向延伸倍数',
+      'p.corridor_extend.up': '调高：走廊向球台外延伸更远，容忍远离球台的球',
+      'p.corridor_extend.dn': '调低：只认球台附近的球，远处击球会被丢',
+      'p.corridor_max_drop.label': '走廊单次剔除比例上限',
+      'p.corridor_max_drop.up': '调高：允许一次剔除更多球，过滤更彻底但可能删光真球',
+      'p.corridor_max_drop.dn': '调低：更保守，保护真球不被过滤（过滤不足时轨迹会脏）',
+      'p.center_dist_ratio.label': '离画面中心丢弃比例',
+      'p.center_dist_ratio.up': '调高：允许离画面中心更远的目标',
+      'p.center_dist_ratio.dn': '调低：更偏向画面中央的球台',
+      'p.center_dist_ratio.note': '填 0 = 关闭该过滤（多球台场景可关掉）',
+      'p.table_edge_tol.label': '落点出台容差 px',
+      'p.table_edge_tol.up': '调高：落点判定更宽容，擦边球也算落在台上',
+      'p.table_edge_tol.dn': '调低：判定更严格，擦边球会被判为出台',
+      'p.match_algo.label': '轨迹关联算法',
+      'p.match_algo.note': '球多、轨迹混乱时可试 hungarian；想更快就 greedy',
+      'p.debug.label': '输出调试信息',
+      'p.debug.note': '勾选：日志里额外输出球台几何、长边/短边坐标、落点等，排查问题时用',
+    },
+
+    en: {
+      'app.name': 'TTComet',
+      'app.brand': '',            // 英文下品牌已在名称里，避免重复
+      'app.subtitle': 'Automatic highlight editor · runs locally',
+      'app.title': 'TTComet · Ping-pong highlight editor',
+
+      'lang.zh': '中文',
+      'lang.en': 'EN',
+
+      'hero.playing': 'warming up',
+      'hero.shuffle': 'New opponents',
+      'hero.trail': 'Speed trail',
+      'hero.bounce': 'Bounce marks',
+      'hero.speed': 'Ball speed',
+      'animal.panda': 'Panda',
+      'animal.rabbit': 'Rabbit',
+      'animal.penguin': 'Penguin',
+      'animal.shiba': 'Shiba',
+
+      'panel.input': '1. Choose video',
+      'panel.params': '2. Parameters (grouped by purpose, collapsed by default — defaults are fine)',
+      'panel.run': '3. Process',
+
+      'input.placeholder': 'Nothing selected (you can paste a path)',
+      'input.pickFile': 'Choose video file',
+      'input.pickDir': 'Choose folder',
+      'input.hint': 'mp4 / mov / mkv / avi / webm supported. Choosing a folder processes every video in it.',
+      'input.notSelected': 'Nothing selected',
+      'input.pickedFile': 'Video: ',
+      'input.pickedDir': 'Folder: ',
+      'input.dirNote': ' (all videos in the folder are processed in filename order, the model loads only once)',
+
+      'run.start': 'Start',
+      'run.cancel': 'Cancel',
+      'run.waiting': 'Ready',
+      'run.submitting': 'Submitting…',
+      'run.queuePos': 'Queued (#{n})',
+      'run.summary': '{total} total · {done} done · {failed} failed',
+
+      'status.queued': 'Queued',
+      'status.running': 'Running',
+      'status.done': 'Done',
+      'status.failed': 'Failed',
+      'status.cancelled': 'Cancelled',
+
+      'stage.inference': 'Detecting',
+      'stage.highlight': 'Rendering highlight',
+      'meta.video': '[{i}/{n}] {name}',
+      'meta.frames': '{a} / {b} frames',
+      'meta.fps': '{n} fps',
+      'meta.eta': '~{n}s left',
+      'meta.framesShort': '{n} frames / {fps} fps',
+
+      'result.play': '▶ Play',
+      'result.download': 'Download this video',
+
+      'health.backend': 'Backend',
+      'health.models': '{n} quality levels',
+      'health.ffmpeg': 'ffmpeg',
+      'health.ffmpegOk': 'ok',
+      'health.ffmpegMissing': 'missing',
+      'health.disk': '{n} GB free',
+      'health.modelLoaded': 'model loaded',
+      'health.modelIdle': 'model idle',
+      'health.fail': 'Self-check failed: {msg}',
+
+      'preset.label': 'Preset',
+      'preset.none': '— none —',
+      'preset.apply': 'Apply',
+      'preset.save': 'Save current',
+      'preset.rename': 'Rename',
+      'preset.delete': 'Delete',
+      'preset.applied': 'Applied: {name} ({n} items)',
+      'preset.saved': 'Saved: {name}',
+      'preset.renamed': 'Renamed to: {name}',
+      'preset.deleted': 'Deleted: {name}',
+      'preset.option': '{name} ({n})',
+      'preset.saveTitle': 'Save parameter preset',
+      'preset.saveHint': 'Saves the {n} parameters that are active right now (inactive ones are skipped)',
+      'preset.defaultName': 'Preset {stamp}',
+      'preset.renameTitle': 'Rename preset',
+      'preset.renameHint': 'Currently stores {n} parameters',
+      'preset.deleteTitle': 'Delete preset',
+      'preset.deleteMsg': 'Delete “{name}”? This cannot be undone.',
+      'preset.confirm': 'Save',
+      'preset.saveFail': 'Save failed: {msg}',
+      'preset.renameFail': 'Rename failed: {msg}',
+      'preset.deleteFail': 'Delete failed: {msg}',
+
+      'dlg.cancel': 'Cancel',
+      'dlg.ok': 'OK',
+      'dlg.delete': 'Delete',
+      'dlg.emptyName': 'Please enter a name',
+      'dlg.tooLong': 'Name is limited to 40 characters',
+      'dlg.dupName': 'A preset with this name already exists',
+
+      'fs.up': 'Parent folder',
+      'fs.go': 'Go',
+      'fs.pickDir': 'Use this folder',
+      'fs.loading': 'Loading…',
+      'fs.empty': '(empty folder)',
+      'fs.readFail': 'Cannot read: {msg}',
+      'fs.hintFile': '{n} video(s) here — click a file to select',
+      'fs.hintDir': '{n} video(s) here — use the button below to process the whole folder',
+
+      'params.changed': '{n} modified (only counting parameters active in the current mode)',
+      'params.reset': 'Reset to defaults',
+      'params.count': '{n} items',
+      'params.changedShort': '{n} changed',
+      'params.inactive': 'not used in current mode',
+      'tips.up': '',
+      'tips.dn': '',
+
+      'model.m960': 'High accuracy',
+      'model.s960': 'Fast',
+      'model.m960.note': 'More accurate, slower (recommended for final output)',
+      'model.s960.note': 'About 2.8× faster, slightly less accurate (good for previews)',
+      'model.loading': 'Loading…',
+
+      'opt.encoder.auto': 'Auto (prefer AMD AMF hardware)',
+      'opt.encoder.libx264': 'libx264 (best compatibility)',
+      'opt.encoder.h264_amf': 'h264_amf',
+      'opt.encoder.hevc_amf': 'hevc_amf',
+      'opt.fx.minimal': 'Minimal',
+      'opt.fx.normal': 'Normal',
+      'opt.fx.max': 'Maximum',
+      'opt.algo.auto': 'auto (choose automatically)',
+      'opt.algo.hungarian': 'hungarian (more accurate, slower)',
+      'opt.algo.greedy': 'greedy (faster)',
+
+      'g.model.title': 'Model quality',
+      'g.model.desc': 'High accuracy is more precise but slower; Fast is ~2.8× faster. Switching loads the other model automatically.',
+      'g.output.title': 'Editing & output',
+      'g.output.desc': 'Shape of the result: cut or not, resolution, encoder, audio',
+      'g.detect.title': 'Detection thresholds',
+      'g.detect.desc': 'Minimum confidence per class; detections below the threshold are dropped',
+      'g.track.title': 'Ball track & rally rules',
+      'g.track.desc': 'Track robustness plus when a rally starts and ends (applies in both modes)',
+      'g.valid.title': 'Which rallies count (cutting mode only)',
+      'g.valid.desc': 'Decides which rallies are worth keeping. Disabled when “cut by rally” is off.',
+      'g.segment.title': 'Segment boundaries (cutting mode only)',
+      'g.segment.desc': 'How much to keep before/after a rally, and when adjacent segments merge',
+      'g.prepend.title': 'Intro highlight reel (cutting mode only)',
+      'g.prepend.desc': 'Picks the fastest rallies as an intro reel before the main footage',
+      'g.fx.title': 'Visual effects',
+      'g.fx.desc': 'Ball comet trail, mini table, bounce/hit markers, player glow',
+      'g.adv.title': 'Advanced · geometry & debug',
+      'g.adv.desc': 'Fine tuning for table geometry, corridor filtering and track association. Keep defaults unless needed.',
+
+      'p.model.label': 'Quality level',
+      'p.model.note': 'Both models stay cached, switching back and forth will not reload them',
+      'p.cut.label': 'Cut by rally',
+      'p.cut.note': 'Checked: keep only valid rallies, drop ball-picking and idle gaps. Unchecked: add effects to the whole video without removing any frame (the three “cutting mode only” groups are disabled).',
+      'p.output_height.label': 'Output height (px, empty = source)',
+      'p.output_height.up': 'Higher: sharper image, slower render, bigger file',
+      'p.output_height.dn': 'Lower: faster render and smaller file; around 720p is usually enough',
+      'p.encoder.label': 'Encoder',
+      'p.encoder.note': 'auto picks hardware encoding (fastest). If you see artifacts or playback issues, use libx264.',
+      'p.no_audio.label': 'Drop audio',
+      'p.no_audio.note': 'Checked: faster render (skips audio rebuild), silent output',
+
+      'p.conf_ball.label': 'Ball confidence',
+      'p.conf_ball.up': 'Higher: only confident detections, fewer false positives but the track may break and rallies can decrease',
+      'p.conf_ball.dn': 'Lower: recalls more balls (including false ones), smoother track, more rallies detected',
+      'p.conf_table.label': 'Table confidence (empty = 0.30)',
+      'p.conf_table.up': 'Higher: keeps only the most certain table, but some frames may get none',
+      'p.conf_table.dn': 'Lower: easier to detect the table, but other rectangles may be picked up',
+      'p.conf_net.label': 'Net confidence (empty = 0.30)',
+      'p.conf_net.up': 'Higher: stricter, distant nets may be missed',
+      'p.conf_net.dn': 'Lower: easier to detect nets, but more false positives',
+      'p.conf_player.label': 'Player confidence (empty = 0.40)',
+      'p.conf_player.up': 'Higher: only confirmed players get the glow',
+      'p.conf_player.dn': 'Lower: more players detected, spectators may be marked too',
+      'p.conf_player.note': 'Only affects the player glow effect, not rallies or cutting',
+      'p.iou.label': 'NMS IoU threshold',
+      'p.iou.up': 'Higher: overlapping boxes are merged less, duplicates may appear',
+      'p.iou.dn': 'Lower: merges overlapping boxes aggressively; nearby paddles/players may be missed',
+
+      'p.ball_conf.label': 'Min ball confidence for tracking',
+      'p.ball_conf.up': 'Higher: only trusted balls feed the track (cleaner but may break, fewer rallies)',
+      'p.ball_conf.dn': 'Lower: smoother track and more rallies, but more noise points',
+      'p.ball_conf.note': 'This is the second ball filter (for tracking), separate from “Ball confidence” under detection',
+      'p.min_static_ball_count.label': 'Static ball filter (min detections)',
+      'p.min_static_ball_count.up': 'Higher: removes balls that barely move (e.g. on the floor), but slow rallies may be dropped too',
+      'p.min_static_ball_count.dn': 'Lower: static balls are more likely to pollute the track',
+      'p.max_jump_ratio.label': 'Max track jump (ratio of diagonal)',
+      'p.max_jump_ratio.up': 'Higher: allows bigger frame-to-frame jumps (fast balls, low frame rate)',
+      'p.max_jump_ratio.dn': 'Lower: more conservative; fast balls may be discarded',
+      'p.rally_lost_timeout.label': 'End rally after ball lost (s)',
+      'p.rally_lost_timeout.up': 'Higher: waits longer after losing the ball, longer and less fragmented rallies',
+      'p.rally_lost_timeout.dn': 'Lower: ends as soon as the ball is lost, more but shorter rallies',
+      'p.out_of_table_timeout.label': 'End rally after leaving table (s)',
+      'p.out_of_table_timeout.up': 'Higher: tolerates lobs and play away from the table',
+      'p.out_of_table_timeout.dn': 'Lower: ends as soon as the ball leaves the table area',
+      'p.no_bounce_timeout.label': 'End rally without bounce (s)',
+      'p.no_bounce_timeout.up': 'Higher: allows long stretches without a bounce, longer rallies',
+      'p.no_bounce_timeout.dn': 'Lower: closes the rally sooner, fewer and shorter rallies',
+
+      'p.min_rally_frames.label': 'Minimum rally length (frames)',
+      'p.min_rally_frames.up': 'Higher: only long rallies are kept, shorter but cleaner output',
+      'p.min_rally_frames.dn': 'Lower: short rallies are kept too, longer output (may include invalid ones)',
+      'p.min_rally_bounce_count.label': 'Short-rally exemption: bounces',
+      'p.min_rally_bounce_count.up': 'Higher: short rallies need more bounces to be kept, fewer rallies',
+      'p.min_rally_bounce_count.dn': 'Lower: short rallies are kept more easily, more rallies',
+      'p.min_rally_speed_top_n.label': 'Always keep top-N fastest rallies',
+      'p.min_rally_speed_top_n.up': 'Higher: more fast rallies are forced in (even short ones), more rallies',
+      'p.min_rally_speed_top_n.dn': 'Lower: rely on length/bounce rules only, fewer rallies',
+      'p.min_rally_speed_top_n.note': 'Set 0 to disable this exemption',
+
+      'p.pre_buffer.label': 'Pre-rally buffer (s)',
+      'p.pre_buffer.up': 'Higher: more lead-in before each rally, longer output',
+      'p.pre_buffer.dn': 'Lower: tighter starts',
+      'p.post_buffer.label': 'Post-rally buffer (s)',
+      'p.post_buffer.up': 'Higher: more time after each rally, longer output',
+      'p.post_buffer.dn': 'Lower: tighter endings',
+      'p.merge_gap.label': 'Merge segments closer than (s)',
+      'p.merge_gap.up': 'Higher: distant rallies are joined into one segment, smoother flow, fewer cuts',
+      'p.merge_gap.dn': 'Lower: more and shorter segments, more jump cuts',
+
+      'p.no_highlight_prepend.label': 'Disable intro reel',
+      'p.no_highlight_prepend.note': 'Checked: no intro reel, only the main footage. The rest of this group is ignored.',
+      'p.highlight_top_n.label': 'Top N fastest rallies',
+      'p.highlight_top_n.up': 'Higher: longer intro reel',
+      'p.highlight_top_n.dn': 'Lower: shorter reel; 0 disables the reel',
+      'p.highlight_min_duration.label': 'Minimum rally duration (s)',
+      'p.highlight_min_duration.up': 'Higher: only long rallies make it into the reel',
+      'p.highlight_min_duration.dn': 'Lower: short rallies are included too',
+      'p.highlight_min_bounce_count.label': 'Bounce count required',
+      'p.highlight_min_bounce_count.up': 'Higher: needs more bounces to qualify, fewer entries',
+      'p.highlight_min_bounce_count.dn': 'Lower: easier to qualify',
+      'p.highlight_black_gap.label': 'Black gap before main footage (s)',
+      'p.highlight_black_gap.up': 'Higher: longer black transition, stronger chapter feel',
+      'p.highlight_black_gap.dn': 'Lower: straight cut, tighter pacing',
+
+      'p.fx_level.label': 'Effect intensity',
+      'p.fx_level.note': 'Minimal is the cheapest (drops some overlays); Maximum is the richest but slowest to render',
+      'p.no_player_fx.label': 'Disable player glow',
+      'p.no_player_fx.note': 'Checked: cleaner image, slightly faster render, player detections no longer needed',
+
+      'p.corridor_margin.label': 'Corridor lateral tolerance',
+      'p.corridor_margin.up': 'Higher: wider corridor keeps more edge balls but also more false detections',
+      'p.corridor_margin.dn': 'Lower: stronger filtering, real balls near the table edge may be removed',
+      'p.corridor_extend.label': 'Corridor extension',
+      'p.corridor_extend.up': 'Higher: corridor reaches further outside the table, tolerates balls away from it',
+      'p.corridor_extend.dn': 'Lower: only balls near the table are accepted',
+      'p.corridor_max_drop.label': 'Max drop ratio per pass',
+      'p.corridor_max_drop.up': 'Higher: allows removing more balls at once, may wipe out real detections',
+      'p.corridor_max_drop.dn': 'Lower: safer, keeps real balls (under-filtering leaves noise)',
+      'p.center_dist_ratio.label': 'Discard distance from center',
+      'p.center_dist_ratio.up': 'Higher: allows targets further from the image center',
+      'p.center_dist_ratio.dn': 'Lower: prefers the table near the center',
+      'p.center_dist_ratio.note': 'Set 0 to disable (useful with multiple tables)',
+      'p.table_edge_tol.label': 'Bounce tolerance (px)',
+      'p.table_edge_tol.up': 'Higher: more lenient, edge balls still count as on-table',
+      'p.table_edge_tol.dn': 'Lower: stricter, edge balls count as off-table',
+      'p.match_algo.label': 'Track association',
+      'p.match_algo.note': 'Try hungarian when the track gets messy; use greedy for speed',
+      'p.debug.label': 'Verbose debug output',
+      'p.debug.note': 'Checked: log table geometry, long/short edges and bounce coordinates — for troubleshooting',
+    },
+  };
+
+  const ORDER = ['en', 'zh'];
+
+  function detectLang() {
+    const saved = localStorage.getItem('ttcomet.lang');
+    if (saved && DICT[saved]) return saved;
+    const nav = (navigator.language || 'zh').toLowerCase();
+    return nav.startsWith('zh') ? 'zh' : 'en';
+  }
+
+  let current = detectLang();
+
+  function t(key, vars) {
+    const table = DICT[current] || DICT.zh;
+    let s = table[key];
+    if (s === undefined) s = (DICT.zh[key] !== undefined ? DICT.zh[key] : key);
+    if (vars) {
+      for (const [k, v] of Object.entries(vars)) {
+        s = s.replace(new RegExp('\\{' + k + '\\}', 'g'), String(v));
+      }
+    }
+    return s;
+  }
+
+  window.I18N = {
+    dict: DICT,
+    order: ORDER,
+    t,
+    get lang() { return current; },
+    setLang(l) {
+      if (!DICT[l]) return;
+      current = l;
+      localStorage.setItem('ttcomet.lang', l);
+    },
+    available: () => Object.keys(DICT),
+  };
+  window.t = t;
+})();

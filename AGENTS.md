@@ -64,6 +64,19 @@ YOLO 视频帧提取、推理与模型微调工具集。从检测日志中抽帧
 ├── runs/                                # YOLO 训练输出 (weights, metrics, plots)
 ├── runs_detr/                           # RF-DETR 训练输出 (checkpoint_*.pth)
 ├── Videos/                              # 原始输入视频
+├── webui/                               # 乒乓彗星 TTComet —— 本地 WebUI + ONNX 推理（可打包成 exe）
+│   ├── run_server.py                    #   启动器（exe 入口）：起本地服务 + 开浏览器
+│   ├── app/                             #   后端与前端
+│   │   ├── onnx_engine.py               #     ONNX 推理引擎（预处理/NMS/mask→polygon）
+│   │   ├── inference_job.py             #     推理主流程（VFR→CFR、三段流水线）
+│   │   ├── highlight_bridge.py          #     以模块方式加载并调用 src/pingpong_highlight.py
+│   │   ├── jobs.py / server.py          #     串行任务队列 / FastAPI + SSE
+│   │   ├── paths.py                     #     资源路径（兼容 PyInstaller）
+│   │   └── static/                      #     单页界面 + three.js 场景 + favicon
+│   ├── models/                          #   两档 ONNX 模型（高精度 m960 / 低精度 s960）
+│   ├── design/                          #   图标设计与生成脚本（make_icons.py / make_ico.py）
+│   ├── packaging/                       #   打包：app.spec (PyInstaller) / app.iss (Inno Setup)
+│   └── bench/                           #   引擎基准与结果对拍脚本（RESULTS.md 有实测数据）
 ├── random_frames/                       # 输出: random_sample_frames.py 抽帧结果
 ├── missing_ball_frames/                 # 输出: extract_missing_ball.py 漏检帧结果
 ├── inference_output/                    # 输出: inference_video.py 推理结果
@@ -94,6 +107,11 @@ YOLO 视频帧提取、推理与模型微调工具集。从检测日志中抽帧
 | RF-DETR 权重预下载 | `src_detr/download_weights.py` | 官方 GCS 源多连接分段 + MD5 校验; 缓存到 `~/.roboflow/models/` |
 | Label Studio ML 后端 | `src_yls/model.py` | Label Studio 集成，`src_yls/start.py` 启动 |
 | Label Studio 标注服务 | conda 环境 `label-studio` | Windows 原生运行, `http://localhost:8080`, 数据在 `%LOCALAPPDATA%\label-studio\label-studio\` |
+| 本地 WebUI（乒乓彗星） | `webui/run_server.py` | 起本地服务 + 开浏览器；用 `webui/.venv` |
+| ONNX 推理引擎 | `webui/app/onnx_engine.py` | 预处理 + NMS + mask→polygon，DirectML 加速 |
+| 打包 exe / 安装包 | `webui/packaging/build.ps1` | `-WithFFmpeg -Installer`，产物在 `webui/dist` |
+| 界面文案（中/英） | `webui/app/static/i18n.js` | 所有 UI 与参数说明的翻译源 |
+| 图标设计 | `webui/design/make_ico.py` | 生成 `ttComet.ico` / `favicon.ico` |
 | 查找训练结果 | `runs/<name>/weights/best.pt` | 同时保存 best_class_*_ap.pt 和 best_class_*_map50.pt |
 | 训练配置 | `train_data/*/data.yaml` | nc, names, path 字段 |
 
