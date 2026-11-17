@@ -320,10 +320,34 @@ def fs_list(path: str):
 # ----------------------------------------------------------------------
 # 任务
 # ----------------------------------------------------------------------
+def _validate_output_dir(params: dict) -> None:
+    """用户指定输出目录时做基本校验：存在或可创建、必须是目录、可写。"""
+    out = (params.get("output_dir") or "").strip()
+    if not out:
+        return
+    p = os.path.abspath(os.path.expanduser(out))
+    try:
+        os.makedirs(p, exist_ok=True)
+    except Exception as e:
+        raise HTTPException(400, f"无法创建输出目录: {e}")
+    if not os.path.isdir(p):
+        raise HTTPException(400, f"输出路径不是目录: {p}")
+    probe = os.path.join(p, ".ttcomet_write_test")
+    try:
+        with open(probe, "w", encoding="utf-8") as f:
+            f.write("ok")
+        os.remove(probe)
+    except Exception:
+        raise HTTPException(400, f"输出目录不可写: {p}")
+    params["output_dir"] = p
+
+
 @app.post("/api/jobs")
 def create_job(body: CreateJobBody):
+    params = dict(body.params or {})
+    _validate_output_dir(params)
     try:
-        job = manager.create(body.path, body.params or {})
+        job = manager.create(body.path, params)
     except FileNotFoundError:
         raise HTTPException(404, f"路径不存在: {body.path}")
     except ValueError as e:

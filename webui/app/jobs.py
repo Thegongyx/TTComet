@@ -312,6 +312,25 @@ class JobManager:
             finally:
                 job._broadcast({"type": "done", "data": job.to_dict()})
 
+    @staticmethod
+    def _resolve_output_path(job: Job, item: "VideoItem") -> str:
+        """视频输出位置：用户指定了目录就写到那里，否则放任务自己的目录。
+
+        指定目录时用「原视频名_highlight.mp4」，重名自动加序号，不覆盖已有文件。
+        """
+        target_dir = (job.params.get("output_dir") or "").strip()
+        if not target_dir:
+            return os.path.join(item.out_dir, "highlight.mp4")
+
+        os.makedirs(target_dir, exist_ok=True)
+        stem = Path(item.src_path).stem
+        candidate = os.path.join(target_dir, f"{stem}_highlight.mp4")
+        k = 2
+        while os.path.exists(candidate):
+            candidate = os.path.join(target_dir, f"{stem}_highlight_{k}.mp4")
+            k += 1
+        return candidate
+
     def _ensure_detector(self, job: Job):
         """按任务选择的精度档位取（或懒加载）对应的 detector。"""
         mid = str(job.params.get("model") or self.default_model)
@@ -386,10 +405,11 @@ class JobManager:
             job.add_log("推理完成，开始高光剪辑")
 
             highlight_video = inf.get("cfr_video") or inf["video"]
-            output = os.path.join(item.out_dir, "highlight.mp4")
+            output = self._resolve_output_path(job, item)
             params = {k: v for k, v in job.params.items()
-                      if k not in ("model", "conf_ball", "iou", "conf_player",
-                                   "conf_racket", "conf_table", "conf_net")}
+                      if k not in ("model", "output_dir", "conf_ball", "iou",
+                                   "conf_player", "conf_racket",
+                                   "conf_table", "conf_net")}
             hl = run_highlight(highlight_video, inf["jsonl"], output, params,
                                log=job.add_log)
             item.result["highlight"] = hl

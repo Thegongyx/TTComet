@@ -7,3 +7,5 @@ workspace/
 dist/
 build/
 static/__pycache__/
+logs/
+last_url.txt

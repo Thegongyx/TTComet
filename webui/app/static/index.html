@@ -330,6 +330,10 @@
       <button class="ghost" id="btnFile" data-i18n="input.pickFile">选择视频文件</button>
       <button class="ghost" id="btnDir" data-i18n="input.pickDir">选择文件夹</button>
     </div>
+    <div class="pathbox" style="margin-top:10px">
+      <input type="text" id="outDir" data-i18n-ph="input.outDirPh" placeholder="输出目录（留空 = 默认目录）" spellcheck="false" />
+      <button class="ghost" id="btnOutDir" data-i18n="input.pickOutDir">选择输出目录</button>
+    </div>
     <div class="picked" id="picked" data-i18n="input.hint">支持 mp4 / mov / mkv / avi / webm 等；选文件夹时会扫描该目录下所有视频批量处理</div>
   </div>
 
@@ -681,7 +685,7 @@ async function api(url, opts) {
   return r.json();
 }
 
-function openBrowser(mode) {
+function openBrowser(mode, onPick) {
   browserMode = mode;
   const mask = document.createElement('div');
   mask.className = 'mask';
@@ -734,8 +738,10 @@ function openBrowser(mode) {
         r.innerHTML = `<span class="ic">🎬</span><span>${v.name}</span><span class="sz">${v.mb} MB</span>`;
         if (browserMode === 'file') {
           r.onclick = () => {
+            close();
+            if (onPick) { onPick(join(d.path, v.name)); return; }
             selected = { type: 'file', path: join(d.path, v.name) };
-            close(); renderPicked();
+            renderPicked();
           };
         }
         body.appendChild(r);
@@ -767,27 +773,39 @@ function openBrowser(mode) {
   pathInput.onkeydown = (e) => { if (e.key === 'Enter') load(pathInput.value); };
   mask.querySelector('#fsCancel').onclick = close;
   mask.querySelector('#fsPickDir').onclick = () => {
-    selected = { type: 'dir', path: pathInput.value };
-    close(); renderPicked();
+    const dir = pathInput.value;
+    close();
+    if (onPick) { onPick(dir); return; }
+    selected = { type: 'dir', path: dir };
+    renderPicked();
   };
   if (browserMode === 'file') mask.querySelector('#fsPickDir').style.display = 'none';
 }
 
 function renderPicked() {
   const el = $('picked');
+  const out = ($('outDir').value || '').trim();
+  const outLine = out
+    ? `<div style="margin-top:4px">${T('input.outDirPicked')}<b>${out}</b></div>`
+    : `<div style="margin-top:4px" class="hint">${T('input.outDirDefault')}</div>`;
+
   if (!selected) {
     $('selPath').value = '';
-    el.textContent = T('input.hint');
+    el.innerHTML = T('input.hint') + outLine;
     return;
   }
   $('selPath').value = selected.path;
-  el.innerHTML = selected.type === 'dir'
+  el.innerHTML = (selected.type === 'dir'
     ? `${T('input.pickedDir')}<b>${selected.path}</b>${T('input.dirNote')}`
-    : `${T('input.pickedFile')}<b>${selected.path}</b>`;
+    : `${T('input.pickedFile')}<b>${selected.path}</b>`) + outLine;
 }
 
 $('btnFile').onclick = () => openBrowser('file');
 $('btnDir').onclick = () => openBrowser('dir');
+$('btnOutDir').onclick = () => openBrowser('dir', (dir) => {
+  $('outDir').value = dir;
+  renderPicked();
+});
 $('selPath').oninput = () => {
   const v = $('selPath').value.trim();
   selected = v ? { type: /\.(mp4|avi|mov|mkv|webm|flv|wmv|m4v|mpg|mpeg|ts|3gp)$/i.test(v) ? 'file' : 'dir', path: v } : null;
@@ -1216,10 +1234,13 @@ $('btnRun').onclick = async () => {
   $('mStage').textContent = T('run.submitting');
 
   try {
+    const params = collectParams();
+    const outDir = ($('outDir').value || '').trim();
+    if (outDir) params.output_dir = outDir;
     const d = await api('/api/jobs', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ path: selected.path, params: collectParams() }),
+      body: JSON.stringify({ path: selected.path, params }),
     });
     sceneMode('calm');
     setBarActive(true);

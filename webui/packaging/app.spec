@@ -12,6 +12,8 @@ PyInstaller 打包配置（onedir）
 
 说明：
   - 用 onedir 而不是 onefile：onefile 每次启动都要把 ~300MB 解压到临时目录，冷启动几十秒。
+  - console=False：双击不弹控制台；日志写 %LOCALAPPDATA%\TTComet\logs\app.log，
+    启动失败会弹原生提示框。托盘图标提供「打开界面 / 退出程序」。
   - 资源（静态页 / three.js / 模型 / 高光脚本）作为 data 随包，路径由 paths.resource() 解析。
   - ffmpeg / ffprobe 默认不内置；设置环境变量 PPT_BUNDLE_FFMPEG=1 可从 PATH 复制进包。
 """
@@ -62,6 +64,11 @@ hiddenimports = [
     "uvicorn.protocols.websockets.auto",
     "uvicorn.lifespan",
     "uvicorn.lifespan.on",
+    "pystray",
+    "pystray._win32",
+    "PIL",
+    "PIL.Image",
+    "PIL.ImageDraw",
     "onnxruntime",
     "onnxruntime.capi",
     "onnxruntime.capi._pybind_state",
@@ -100,7 +107,7 @@ exe = EXE(
     bootloader_ignore_signals=False,
     strip=False,
     upx=False,
-    console=True,                 # 保留控制台：显示地址、错误信息，方便用户反馈
+    console=False,                # 窗口子系统：双击不弹黑框（日志写文件，见 run_server.py）
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,
