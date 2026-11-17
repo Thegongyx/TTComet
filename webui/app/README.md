@@ -340,18 +340,33 @@ cd webui
 | 端到端任务 | 703 帧片段 → 推理 63 fps → 高光 307 帧 → 9.2 MB，全流程通过 |
 | 视频拖动 | `Range` 请求返回 206 |
 
-## 已知缺口
+### 发版流程
+
+```powershell
+# 1. 改三处版本号：webui/app/server.py(APP_VERSION) / webui/packaging/app.iss / README.md
+# 2. 重写 webui/packaging/RELEASE_NOTES.md（顶部版本号、变更内容、新 SHA256）
+# 3. 构建
+cd webui; .\packaging\build.ps1 -WithFFmpeg -Installer
+
+# 4. 打标签并推两端
+git tag -a v0.x.y -m "乒乓彗星 TTComet v0.x.y"; git push origin refs/tags/v0.x.y
+
+# 5. 两端发 Release
+#    GitHub：整包 243 MB 直接上传
+#    Gitee ：单文件上限 100 MB，切 3 卷上传，说明里保留 copy /b 合并命令
+```
+
+**版本策略（2026-11 起）**：**保留全部历史 Release，不再删除旧版本**。
+用户升级时可能想回退，历史包也便于对照问题（v0.1.0 及更早的版本在发版时曾被清空过）。
 
 ## 已知缺口
 
-1. **打包未做**。`run_server.py` 目前依赖 venv；打成 exe 时要处理：子进程调用链、
-   `%LOCALAPPDATA%` 工作目录、ffmpeg 随包、`pingpong_highlight.py` 作为资源文件、
-   单实例锁（防重复启动抢 GPU）。
-2. **任务状态只在内存**，服务重启后历史任务丢失（输出文件还在磁盘上）。
-3. **取消只对推理阶段生效**。高光渲染是同步调用源脚本，只能等当前帧渲染完。
-4. **无鉴权**。服务只监听 127.0.0.1，单机单用户场景可接受；若要局域网共享必须加认证
+1. **取消只对推理阶段生效**。高光渲染是同步调用源脚本，只能等当前帧渲染完。
+2. **处理记录的日志不落盘**。任务快照存在 `job.json`，但日志正文只在内存，
+   重启后历史记录能点开看结果，日志区是空的。
+3. **无鉴权**。服务只监听 127.0.0.1，单机单用户场景可接受；若要局域网共享必须加认证
    和路径白名单。
-5. **预处理 19.5ms 偏慢**（占整帧约 1/3）。`cv2.dnn.blobFromImage` + `astype(float16)`
+4. **预处理 19.5ms 偏慢**（占整帧约 1/3）。`cv2.dnn.blobFromImage` + `astype(float16)`
    有两次大块拷贝，可考虑导出 fp32 输入模型或零拷贝填 tensor。
-6. **jsonl 内存问题未解**。已默认 gzip（体积 1/20）并在任务结束后压缩归档，但
+5. **jsonl 内存问题未解**。已默认 gzip（体积 1/20）并在任务结束后压缩归档，但
    `pingpong_highlight.load_detections()` 仍是全量读入（491MB → 约 4GB）。长视频要改流式。
