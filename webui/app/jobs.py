@@ -218,6 +218,11 @@ class JobManager:
     def loaded_models(self) -> list[str]:
         return sorted(self._detectors.keys())
 
+    def has_active_jobs(self) -> bool:
+        """是否有排队中或正在跑的任务（退程序前要拦一下）。"""
+        with self._lock:
+            return any(j.status in ("queued", "running") for j in self.jobs.values())
+
     # ---- 提交 ----
     def create(self, source: str, params: dict) -> Job:
         """source 可以是视频文件或目录（目录只扫当前层）。"""

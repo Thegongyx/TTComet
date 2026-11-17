@@ -52,7 +52,11 @@
   h1 small { color:var(--muted); font-weight:400; font-size:12px; }
   .brand-en { color:var(--cyan); font-size:13px; font-weight:600; letter-spacing:.4px; }
   .brand-en:empty { display:none; }
-  .lang-switch { display:flex; gap:6px; flex:0 0 auto; }
+  .topbar-right { display:flex; align-items:center; gap:10px; flex:0 0 auto; }
+  .lang-switch { display:flex; gap:6px; }
+  .quit-btn { border-color:rgba(255,90,118,.35); color:#ffb3bf; }
+  .quit-btn:hover:not(:disabled) { border-color:rgba(255,90,118,.7);
+                                   background:rgba(255,90,118,.12) !important; }
   .lang-switch button { padding:5px 12px; font-size:12px; font-weight:500; }
   .lang-switch button.active { border-color:var(--cyan); color:var(--cyan); box-shadow:0 0 0 1px rgba(69,243,255,.25) inset; }
 
@@ -292,9 +296,12 @@
       <span class="brand-en" data-i18n="app.brand">TTComet</span>
       <small data-i18n="app.subtitle">自动高光剪辑 · 本地运行</small>
     </h1>
-    <div class="lang-switch">
-      <button class="ghost sm" data-lang="zh">中文</button>
-      <button class="ghost sm" data-lang="en">EN</button>
+    <div class="topbar-right">
+      <div class="lang-switch">
+        <button class="ghost sm" data-lang="zh">中文</button>
+        <button class="ghost sm" data-lang="en">EN</button>
+      </div>
+      <button class="ghost sm quit-btn" id="btnQuit" data-i18n="quit.button">退出程序</button>
     </div>
   </div>
   <div class="health" id="health">…</div>
@@ -1008,6 +1015,42 @@ $('btnDeletePreset').onclick = () => {
         $('presetHint').textContent = T('preset.deleted', { name: p.name });
       } catch (e) {
         alert(T('preset.deleteFail', { msg: e.message }));
+      }
+    },
+  });
+};
+
+/* ==================== 退出程序 ==================== */
+function showQuitOverlay() {
+  const m = document.createElement('div');
+  m.className = 'mask';
+  m.innerHTML = `<div class="modal dlg"><div class="dlg-body" style="text-align:center;padding:28px 20px">
+      <div style="font-size:16px;font-weight:600;margin-bottom:8px">${T('quit.bye')}</div>
+      <div class="dlg-hint" style="font-size:12px">${T('quit.byeHint')}</div>
+    </div></div>`;
+  document.body.appendChild(m);
+  try { window.TTCometScene && window.TTCometScene.setMode('pause'); } catch (e) {}
+}
+
+$('btnQuit').onclick = () => {
+  openDialog({
+    title: T('quit.title'),
+    message: T('quit.msg'),
+    noInput: true,
+    confirmText: T('quit.confirm'),
+    danger: true,
+    onOk: async () => {
+      try {
+        const r = await fetch('/api/shutdown', {
+          method: 'POST',
+          headers: { 'X-TTComet-Request': '1' },
+        });
+        if (r.status === 409) { alert(T('quit.busy')); return; }
+        if (!r.ok) { alert(r.statusText); return; }
+        showQuitOverlay();
+      } catch (e) {
+        // 进程已经退出时 fetch 会直接失败，这属于正常结果
+        showQuitOverlay();
       }
     },
   });

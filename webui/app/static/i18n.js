@@ -113,6 +113,13 @@
       'preset.deleteFail': '删除失败: {msg}',
 
       // dialogs
+      'quit.button': '退出程序',
+      'quit.title': '退出程序',
+      'quit.msg': '退出后会停止本地服务并关闭程序窗口，正在运行的任务会被中断。确定退出吗？',
+      'quit.confirm': '退出',
+      'quit.busy': '有任务正在运行，请等它完成或先取消。',
+      'quit.bye': '程序已退出',
+      'quit.byeHint': '本地服务已停止，可以关闭这个页面了。',
       'dlg.cancel': '取消',
       'dlg.ok': '确定',
       'dlg.delete': '删除',
@@ -387,6 +394,13 @@
       'preset.renameFail': 'Rename failed: {msg}',
       'preset.deleteFail': 'Delete failed: {msg}',
 
+      'quit.button': 'Quit',
+      'quit.title': 'Quit application',
+      'quit.msg': 'This stops the local service and closes the app. Running jobs will be interrupted. Quit?',
+      'quit.confirm': 'Quit',
+      'quit.busy': 'A job is still running — wait for it or cancel it first.',
+      'quit.bye': 'Application stopped',
+      'quit.byeHint': 'The local service has stopped. You can close this page.',
       'dlg.cancel': 'Cancel',
       'dlg.ok': 'OK',
       'dlg.delete': 'Delete',

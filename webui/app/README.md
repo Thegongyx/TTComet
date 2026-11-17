@@ -63,6 +63,15 @@ webui\.venv\Scripts\python.exe webui\run_server.py
 - 档位是普通参数，会跟着预设一起保存，所以可以存"高速-快速出片""高精度-比赛成片"两套。
 - 接口：`GET /api/models` 返回可用档位、默认档位与已加载列表。
 
+### 退出程序
+
+页面右上角有「退出程序」按钮，会弹确认框，确认后本地服务停止、进程退出（打包版的控制台窗口一起关掉）。
+
+- 有任务在排队或运行时会被拒绝（返回 409），需要先等它完成或手动取消
+- 接口要求自定义头 `X-TTComet-Request: 1`：浏览器对跨域自定义头会先发 preflight，
+  本服务不放行 CORS，所以其它网页无法偷偷调用这个接口关掉程序
+- 也可以直接关控制台窗口（等价，但不会清理得更干净）
+
 ### 参数预设
 
 调好一套参数后可以存下来反复用：
@@ -135,6 +144,7 @@ webui\.venv\Scripts\python.exe webui\run_server.py
 | GET | `/api/jobs/{id}/events` | SSE：进度 / 日志 / 状态 / 视频列表 |
 | GET | `/api/jobs/{id}/videos/{idx}` | 单个结果视频（支持 Range） |
 | POST | `/api/jobs/{id}/cancel` | 取消 |
+| POST | `/api/shutdown` | 退出程序（需 `X-TTComet-Request: 1` 头；有任务在跑时返回 409） |
 
 
 ## 高光逻辑一致性

@@ -34,7 +34,7 @@ import threading
 import time
 import uuid
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -158,6 +158,30 @@ def _clean_name(name: str) -> str:
 def list_presets():
     with _preset_lock:
         return {"presets": _load_presets()}
+
+
+# ----------------------------------------------------------------------
+# 退出程序
+# ----------------------------------------------------------------------
+@app.post("/api/shutdown")
+def shutdown(x_ttcomet_request: str = Header(default="")):
+    """关闭整个程序（进程退出，控制台窗口随之关闭）。
+
+    防跨站误触：要求自定义请求头 `X-TTComet-Request: 1`。
+    浏览器对跨域自定义头的请求会先发 preflight，而本服务不放行 CORS，
+    所以其它网页无法偷偷调用这个接口。
+    """
+    if x_ttcomet_request != "1":
+        raise HTTPException(403, "missing confirmation header")
+    if manager.has_active_jobs():
+        raise HTTPException(409, "job running")
+
+    def _exit() -> None:
+        time.sleep(0.4)     # 先让 HTTP 响应写完
+        os._exit(0)         # 直接退出进程：线程/子进程随之结束
+
+    threading.Thread(target=_exit, name="shutdown", daemon=True).start()
+    return {"ok": True}
 
 
 @app.post("/api/presets")
