@@ -1,9 +1,9 @@
-## 乒乓彗星 TTComet v0.1.0
+## 乒乓彗星 TTComet v0.1.1
 
 **本地运行的乒乓球视频自动高光剪辑工具**，无需安装 Python 或任何运行环境。
 
-> 本版把 v0.0.2 之后的所有改进打包发布：桌面体验（无控制台、托盘、输出目录）、
-> 界面（页脚署名、打赏入口、播放器可关闭）、日志（默认输出详细调试信息）等。
+> v0.1.1 主要修复了「刷新页面后处理结果就没了」的问题：任务现在会自动落盘，
+> 刷新页面、甚至重启程序都能看到历史记录。
 
 ### 主要功能
 
@@ -16,28 +16,18 @@
 - **自定义输出目录**：留空用默认目录，也可指定任意文件夹；同名自动加序号，不覆盖
 - **自动化处理**：VFR 自动转 CFR，检测日志自动压缩（约 20:1）
 
-### 本版新增（相对 v0.0.2）
+### 本版新增（相对 v0.1.0）
 
-**桌面体验**
+**处理记录（刷新、重启都不丢）**
 
-- **不再弹出控制台黑框**：双击启动只开界面；日志写入 `%LOCALAPPDATA%\TTComet\logs\app.log`（2 MB 滚动，保留 5 份）
-- **任务栏托盘图标**：左键打开界面，右键菜单可「打开界面 / 退出程序」
-- **界面右上角「退出程序」按钮**
-- **启动失败不再"双击没反应"**：弹原生提示框并给日志路径
-- 默认端口固定 `8760`（原实现端口设置有 bug，一直走随机端口），被占用才换随机端口
-
-**界面**
-
-- 页脚新增 **GitHub 项目地址 + 开发者署名 + 版本号 + 未签名提示**
-- 右下角淡色水印 `Thegongyx · TTComet`
-- **♥ 支持项目**：状态行右侧醒目标识 + 页脚入口，点开是打赏卡片（爱发电），只在点开时出现，不做弹窗骚扰
-- 首次成功出片后，右下角浮出一次淡色提示，15 秒自动消失，只提示一次
-- **视频播放器可关闭**：右上角 ✕ 折叠播放器并释放解码器（原来打开后无法收起）
-
-**日志**
-
-- **默认打开 `--debug`**：日志里额外输出球台四角坐标、长边/短边、走廊过滤统计、落点半台检测等细节；嫌太长可在参数「高级 · 几何与调试」里取消勾选
-- 去掉状态行「模型 未加载 / 已加载」—— 该状态反映的是进程内会话是否常驻，跑完任务不刷新，容易误导
+- 任务自动落盘到 `%LOCALAPPDATA%\TTComet\jobs\<任务ID>\job.json`（约 2 KB）
+- 「③ 处理」顶部新增 **处理记录** 列表：时间 / 来源 / 成功失败数 / 状态 / `查看`
+- **刷新页面** → 自动把最近一次任务的结果和日志铺回结果区，不用重新跑
+- **重启程序** → 启动时恢复历史（最多 80 条）
+- 正在处理时刷新 → 进度条和日志会继续跟着任务走
+- 被强行关闭的任务恢复后标记为 **「已中断」**（橙色），不会假装还在运行
+- 成品文件被删除/移动后，该条记录标「成品文件已不存在」，不再给出点不开的播放按钮
+- 老版本留下的任务目录也能识别：只要 `highlight.mp4` 还在，就会出现在历史里
 
 ### 安装
 
@@ -61,31 +51,31 @@
 
 ```powershell
 # 在下载目录执行，把输出与下方 SHA256 对比
-certutil -hashfile TTComet-0.1.0-setup.exe SHA256
+certutil -hashfile TTComet-0.1.1-setup.exe SHA256
 ```
 
 本版本 SHA256 校验值：
 
 ```
-8380dabc7dbf61946541cabeb9eec7cb745e35ed3904b978013a9bd244729c19  TTComet-0.1.0-setup.exe
-500d4581409c51bda25f6c229f355a48112b4aa2173d497dec3c80d5257912f5  TTComet.exe
+0aa44cf0eb1adf718d00a9b5cd77cee050a5d08d466bfa1d76947e5fb0be0de6  TTComet-0.1.1-setup.exe
+9800927db8b3cb787763ded004a2d30fd1e48f359c8c29df82cd531ad4e74f03  TTComet.exe
 ```
 
 ### 📦 安装包下载
 
 > **最省事的方式**：从 GitHub 直接下载完整安装包（不用合并）
-> https://github.com/Thegongyx/TTComet/releases/download/v0.1.0/TTComet-0.1.0-setup.exe
+> https://github.com/Thegongyx/TTComet/releases/download/v0.1.1/TTComet-0.1.1-setup.exe
 
 **Gitee 附件单个限制 100 MB**，所以 Gitee 上的安装包分成了 3 个分卷，需要下载后合并：
 
-1. 把 `TTComet-0.1.0-setup.exe.part1 / .part2 / .part3` 下载到**同一目录**
+1. 把 `TTComet-0.1.1-setup.exe.part1 / .part2 / .part3` 下载到**同一目录**
 2. 在该目录打开命令行（地址栏输入 `cmd` 回车），执行：
 
 ```
-copy /b TTComet-0.1.0-setup.exe.part1 + TTComet-0.1.0-setup.exe.part2 + TTComet-0.1.0-setup.exe.part3 TTComet-0.1.0-setup.exe
+copy /b TTComet-0.1.1-setup.exe.part1 + TTComet-0.1.1-setup.exe.part2 + TTComet-0.1.1-setup.exe.part3 TTComet-0.1.1-setup.exe
 ```
 
-3. 得到完整的 `TTComet-0.1.0-setup.exe`，双击安装
+3. 得到完整的 `TTComet-0.1.1-setup.exe`，双击安装
 
 合并后建议校验 SHA256，应与上面列出的值一致。
 
@@ -101,6 +91,7 @@ copy /b TTComet-0.1.0-setup.exe.part1 + TTComet-0.1.0-setup.exe.part2 + TTComet-
 - 同一时间只允许运行一个实例（避免抢占 GPU）
 - 批量处理时逐个视频串行（推理 → 剪辑 → 下一个），不会并行占用多份 GPU/CPU
 - 暂不支持 GPU 型号选择，由 DirectML 自动挑选
+- 处理记录最多恢复 80 条；日志只保存在内存里，重启后不保留日志正文
 
 ### 技术说明
 
