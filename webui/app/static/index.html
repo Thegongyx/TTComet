@@ -289,6 +289,24 @@
             color:#a9b8d1; white-space:pre-wrap; margin:12px 0 0;
             font-family:Consolas,"Cascadia Mono",monospace; }
   video { width:100%; border-radius:8px; margin-top:10px; background:#000; }
+
+  /* 播放器：叠一个关闭按钮，随时能折叠回去 */
+  .player-wrap { position:relative; }
+  .player-wrap video { margin-top:10px; }
+  .player-close {
+    position:absolute; top:18px; right:12px;
+    width:30px; height:30px; padding:0; border-radius:50%;
+    display:flex; align-items:center; justify-content:center;
+    font-size:14px; line-height:1; cursor:pointer;
+    color:#fff; background:rgba(8,14,26,.72);
+    border:1px solid rgba(255,255,255,.28);
+    backdrop-filter:blur(4px);
+    transition:background .15s ease, transform .15s ease, border-color .15s ease;
+  }
+  .player-close:hover {
+    background:rgba(255,77,121,.85); border-color:rgba(255,255,255,.5);
+    transform:scale(1.08);
+  }
   .hidden { display:none !important; }
 
   /* ---------- 文件浏览器 ---------- */
@@ -448,7 +466,10 @@
       <span id="mEta"></span>
     </div>
     <div class="vlist hidden" id="vlist"></div>
-    <video id="player" controls playsinline class="hidden"></video>
+    <div class="player-wrap hidden" id="playerWrap">
+      <video id="player" controls playsinline></video>
+      <button class="player-close" id="btnHidePlayer" data-i18n-title="result.close" title="关闭">✕</button>
+    </div>
     <div class="meta hidden" id="dlWrap" style="margin-top:8px">
       <a id="dlLink" download data-i18n="result.download">下载当前视频</a>
       <span id="dlMeta"></span>
@@ -739,6 +760,9 @@ function applyLang(lang) {
   });
   document.querySelectorAll('[data-i18n-ph]').forEach((el) => {
     el.placeholder = T(el.dataset.i18nPh);
+  });
+  document.querySelectorAll('[data-i18n-title]').forEach((el) => {
+    el.title = T(el.dataset.i18nTitle);
   });
   document.querySelectorAll('.lang-switch button').forEach((b) => {
     b.classList.toggle('active', b.dataset.lang === L);
@@ -1293,6 +1317,26 @@ function applyProgress(p) {
   if (p.eta_sec !== undefined) $('mEta').textContent = T('meta.eta', { n: Math.round(p.eta_sec) });
 }
 
+function showPlayer(v) {
+  const p = $('player');
+  p.src = v.video_url + '?t=' + Date.now();
+  $('dlLink').href = v.video_url;
+  $('dlMeta').textContent = v.size_mb ? `${v.name} · ${v.size_mb} MB` : v.name;
+  $('playerWrap').classList.remove('hidden');
+  $('dlWrap').classList.remove('hidden');
+  $('playerWrap').scrollIntoView({ behavior: 'smooth', block: 'center' });
+}
+
+/** 关闭/折叠播放器：暂停 + 释放解码资源，删掉 src 避免继续占着文件 */
+function closePlayer() {
+  const p = $('player');
+  try { p.pause(); } catch (e) {}
+  p.removeAttribute('src');
+  try { p.load(); } catch (e) {}
+  $('playerWrap').classList.add('hidden');
+  $('dlWrap').classList.add('hidden');
+}
+
 function renderVideos(videos) {
   const box = $('vlist');
   box.classList.remove('hidden');
@@ -1311,14 +1355,7 @@ function renderVideos(videos) {
       const b = document.createElement('button');
       b.className = 'ghost sm';
       b.textContent = T('result.play');
-      b.onclick = () => {
-        $('player').src = v.video_url + '?t=' + Date.now();
-        $('player').classList.remove('hidden');
-        $('dlLink').href = v.video_url;
-        $('dlMeta').textContent = `${v.name} · ${size}`;
-        $('dlWrap').classList.remove('hidden');
-        $('player').scrollIntoView({ behavior: 'smooth', block: 'center' });
-      };
+      b.onclick = () => showPlayer(v);
       row.appendChild(b);
     }
     if (v.error) {
@@ -1384,8 +1421,7 @@ $('btnRun').onclick = async () => {
   $('btnRun').disabled = true;
   $('btnCancel').disabled = false;
   clearLog();
-  $('player').classList.add('hidden');
-  $('dlWrap').classList.add('hidden');
+  closePlayer();
   $('vlist').classList.add('hidden');
   $('barFill').style.width = '0%';
   $('mStage').textContent = T('run.submitting');
@@ -1424,6 +1460,8 @@ $('btnReset').onclick = () => {
   }
   refreshAvailability();
 };
+
+$('btnHidePlayer').onclick = closePlayer;
 
 /* ==================== 自检 ==================== */
 function loadHealth() {

@@ -80,6 +80,7 @@
       // results
       'result.play': '▶ 播放',
       'result.download': '下载当前视频',
+      'result.close': '关闭播放器',
 
       // health
       'health.backend': '后端',
@@ -377,6 +378,7 @@
 
       'result.play': '▶ Play',
       'result.download': 'Download this video',
+      'result.close': 'Close player',
 
       'health.backend': 'Backend',
       'health.models': '{n} quality levels',
