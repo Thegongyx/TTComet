@@ -55,3 +55,8 @@ desktop.ini
 # RF-DETR training output
 runs_detr/
 *.pth
+
+# 数据集：只保留目录结构与说明，图片/标签内容不入库（体积太大）
+train_data/**
+!train_data/README.md
+!train_data/.gitkeep
