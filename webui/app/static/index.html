@@ -304,6 +304,25 @@
   .footer .support-link:hover { color:#ffb3b8; }
   .footer .support-link span:first-child { font-size:12px; }
 
+  /* 打赏弹窗 */
+  .support-body { color:var(--text); font-size:13px; line-height:1.75; }
+  .support-body b { color:#ffb3b8; }
+  .support-actions { display:flex; align-items:center; gap:10px; }
+
+  /* 首次出片后的淡色提示 */
+  .support-toast {
+    position:fixed; right:16px; bottom:42px; z-index:60;
+    display:flex; align-items:center; gap:10px; flex-wrap:wrap;
+    max-width:430px; padding:10px 12px; border-radius:12px;
+    background:linear-gradient(180deg, rgba(28,42,66,.97), rgba(18,29,47,.97));
+    border:1px solid var(--line-strong);
+    box-shadow:0 14px 34px rgba(4,10,20,.55);
+    font-size:12px; color:var(--text);
+    animation:fadeUp .3s ease both;
+  }
+  .support-toast .msg { flex:1; min-width:180px; }
+  .support-toast button { flex:0 0 auto; }
+
   /* 右下角固定水印（很淡，不挡操作） */
   .watermark {
     position:fixed; right:14px; bottom:10px; z-index:5;
@@ -1083,6 +1102,60 @@ $('btnDeletePreset').onclick = () => {
   });
 };
 
+/* ==================== 打赏入口 ==================== */
+function supportUrl() {
+  const a = $('supportLink');
+  return a ? a.href : 'https://ifdian.net/a/TTComet';
+}
+
+function showSupportDialog() {
+  const url = supportUrl();
+  const mask = document.createElement('div');
+  mask.className = 'mask';
+  mask.innerHTML = `
+    <div class="modal dlg">
+      <div class="dlg-head" style="color:#ffb3b8">♥ ${T('support.title')}</div>
+      <div class="dlg-body">
+        <div class="support-body">${T('support.body')}</div>
+      </div>
+      <div class="dlg-foot support-actions">
+        <button class="ghost sm" id="spClose">${T('support.close')}</button>
+        <button class="sm" id="spOpen">♥ ${T('support.open')}</button>
+      </div>
+    </div>`;
+  document.body.appendChild(mask);
+  const close = () => mask.remove();
+  mask.querySelector('#spClose').onclick = close;
+  mask.querySelector('#spOpen').onclick = () => {
+    window.open(url, '_blank', 'noopener');
+    close();
+  };
+  mask.onclick = (e) => { if (e.target === mask) close(); };
+  document.addEventListener('keydown', function esc(ev) {
+    if (ev.key === 'Escape') { close(); document.removeEventListener('keydown', esc); }
+  });
+}
+
+/** 首次成功出片后提示一次（localStorage 记忆，不再打扰） */
+function maybeShowSupportToast() {
+  try {
+    if (localStorage.getItem('ttcomet.supportSeen') === '1') return;
+    localStorage.setItem('ttcomet.supportSeen', '1');
+  } catch (e) {
+    return;
+  }
+  const el = document.createElement('div');
+  el.className = 'support-toast';
+  el.innerHTML = `
+    <span class="msg">${T('support.toast')}</span>
+    <button class="ghost sm" id="stBtn">♥ ${T('support.toastBtn')}</button>
+    <button class="ghost sm" id="stClose">×</button>`;
+  document.body.appendChild(el);
+  el.querySelector('#stBtn').onclick = () => { el.remove(); showSupportDialog(); };
+  el.querySelector('#stClose').onclick = () => el.remove();
+  setTimeout(() => el.remove(), 15000);
+}
+
 /* ==================== 退出程序 ==================== */
 function showQuitOverlay() {
   const m = document.createElement('div');
@@ -1132,6 +1205,11 @@ function updateHeroPair(pair) {
 $('btnShuffle').onclick = () => {
   try { window.TTCometScene && window.TTCometScene.shuffle(); } catch (e) {}
 };
+
+$('supportLink').addEventListener('click', (e) => {
+  e.preventDefault();
+  showSupportDialog();
+});
 window.addEventListener('pp:pair', (e) => updateHeroPair(e.detail));
 
 /* ==================== 任务 ==================== */
@@ -1262,6 +1340,9 @@ function subscribe(jobId) {
       setBarActive(false);
       sceneMode('full');
       es.close();
+      const produced = msg.data.status === 'done'
+        && (msg.data.result?.output || (msg.data.videos || []).some((v) => v.video_url));
+      if (produced) maybeShowSupportToast();
     }
   };
   es.onerror = () => {};
