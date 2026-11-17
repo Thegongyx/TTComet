@@ -323,6 +323,8 @@ def _process_one_video(args, python_cmd, has_ffmpeg, video_index=None, video_tot
         hl_cmd += ["--encoder", args.encoder]
     if args.no_audio:
         hl_cmd += ["--no-audio"]
+    if not args.cut:
+        hl_cmd += ["--no-cut"]
     if args.debug:
         hl_cmd += ["--debug"]
     if args.min_rally_frames is not None:
@@ -463,6 +465,9 @@ def main():
                         help="高光视频编码器 (auto/libx264/h264_amf/hevc_amf)")
     parser.add_argument("--no-audio", action="store_true",
                         help="高光视频不保留原声")
+    parser.add_argument("--cut", action=argparse.BooleanOptionalAction, default=True,
+                        help="是否按回合剪辑（默认开启）。--no-cut 时整段视频加特效，"
+                             "不裁掉捡球/短回合片段")
     parser.add_argument("--debug", action="store_true",
                         help="输出调试信息 (球台几何/落点坐标等)")
     parser.add_argument("--min-rally-frames", type=int, default=None,

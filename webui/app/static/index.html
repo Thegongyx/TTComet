@@ -1,0 +1,1225 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>PingPong Studio · 自动高光</title>
+<style>
+  :root {
+    /* 渐变背景 + 蓝紫主色 + 青色霓虹（参考：深海军蓝登录页风格） */
+    color-scheme:dark;                 /* 原生控件（下拉列表/滚动条）跟随深色 */
+    --bg:#141e30;
+    --panel:rgba(255,255,255,.055);
+    --panel2:rgba(255,255,255,.09);
+    --line:rgba(255,255,255,.10);
+    --line-strong:rgba(255,255,255,.20);
+    --text:#eef3ff;
+    --muted:#93a4c0;
+    --accent:#7287fe;
+    --accent-2:#8258ba;
+    --cyan:#45f3ff;
+    --ok:#3ddc97;
+    --bad:#ff5a76;
+    --warn:#ffc857;
+    --up:#6fd7ff;
+    --dn:#ffb066;
+  }
+  * { box-sizing:border-box; }
+  html, body { min-height:100%; }
+  body {
+    margin:0; color:var(--text);
+    font:14px/1.65 "Segoe UI","Microsoft YaHei",sans-serif;
+    background:linear-gradient(160deg,#141e30 0%,#1a2942 48%,#243b55 100%);
+    background-attachment:fixed;
+  }
+  /* 三处极淡光斑，给渐变加点呼吸感（不做纹理，避免发脏） */
+  body::before {
+    content:""; position:fixed; inset:0; pointer-events:none; z-index:0;
+    background:
+      radial-gradient(680px 420px at 8% -8%, rgba(114,135,254,.22), transparent 62%),
+      radial-gradient(620px 380px at 96% 2%, rgba(69,243,255,.10), transparent 60%),
+      radial-gradient(720px 440px at 50% 110%, rgba(130,88,186,.18), transparent 62%);
+  }
+  .wrap { position:relative; z-index:1; max-width:1180px; margin:0 auto;
+          padding:26px 20px 70px; }
+  ::-webkit-scrollbar { width:10px; height:10px; }
+  ::-webkit-scrollbar-thumb { background:rgba(255,255,255,.16); border-radius:99px; }
+  ::-webkit-scrollbar-thumb:hover { background:rgba(255,255,255,.26); }
+  ::-webkit-scrollbar-track { background:transparent; }
+  h1 { font-size:20px; margin:0 0 6px; }
+  h1 small { color:var(--muted); font-weight:400; font-size:12px; margin-left:8px; }
+  .health { font-size:12px; color:var(--muted); display:flex; gap:14px; flex-wrap:wrap; }
+  .health b { color:var(--text); font-weight:600; }
+  .panel {
+    background:linear-gradient(180deg, rgba(26,39,62,.72), rgba(17,28,46,.78));
+    border:1px solid var(--line);
+    border-radius:16px;
+    padding:18px;
+    margin-top:16px;
+    backdrop-filter:blur(12px);
+    -webkit-backdrop-filter:blur(12px);
+    box-shadow:0 12px 34px rgba(6,12,24,.38), inset 0 1px 0 rgba(255,255,255,.06);
+  }
+  .panel h2 { font-size:14px; margin:0 0 12px; color:#dfe8fb; font-weight:600;
+              letter-spacing:.2px; }
+  .row { display:flex; gap:12px; flex-wrap:wrap; align-items:flex-end; }
+  .field { display:flex; flex-direction:column; gap:5px; min-width:0; }
+  label { color:var(--muted); font-size:12px; }
+  input[type=number], input[type=text], select {
+    background:rgba(255,255,255,.05); border:1px solid var(--line); border-radius:10px;
+    color:var(--text); padding:7px 9px; font-size:13px; width:100%;
+  }
+  /* Windows 原生下拉框：半透明背景会让展开列表变成白底白字，
+     改成不透明深色 + 自绘箭头，并配合 :root 的 color-scheme:dark */
+  select {
+    background-color:#16233a;
+    color:#eef3ff;
+    appearance:none;
+    -webkit-appearance:none;
+    background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'><path d='M1 1l5 5 5-5' stroke='%2393a4c0' stroke-width='1.6' fill='none' stroke-linecap='round'/></svg>");
+    background-repeat:no-repeat;
+    background-position:right 11px center;
+    padding-right:30px;
+  }
+  select option { background-color:#16233a; color:#eef3ff; }
+  select:focus { border-color:rgba(69,243,255,.55); box-shadow:0 0 0 3px rgba(69,243,255,.13); }
+  input[type=number]:focus, input[type=text]:focus, select:focus {
+    outline:none; border-color:rgba(69,243,255,.55);
+    box-shadow:0 0 0 3px rgba(69,243,255,.13);
+  }
+  button {
+    background:linear-gradient(135deg,#7287fe,#8258ba);
+    color:#fff; border:0; border-radius:11px;
+    padding:10px 18px; font-size:13px; font-weight:600; cursor:pointer;
+    box-shadow:0 8px 22px rgba(114,135,254,.30);
+    transition:transform .12s ease, filter .18s ease, box-shadow .2s ease;
+  }
+  button:hover:not(:disabled) {
+    filter:brightness(1.09);
+    box-shadow:0 10px 28px rgba(114,135,254,.44);
+  }
+  button:active:not(:disabled) { transform:translateY(1px) scale(.995); }
+  button:disabled { opacity:.45; cursor:not-allowed; }
+  button.ghost { background:rgba(255,255,255,.05); border:1px solid var(--line);
+                 color:var(--text); font-weight:400; box-shadow:none; }
+  button.ghost:hover:not(:disabled) { background:rgba(255,255,255,.10);
+                 border-color:rgba(69,243,255,.45); box-shadow:none; }
+  button.sm { padding:4px 10px; font-size:12px; }
+  .pathbox { display:flex; gap:10px; align-items:center; }
+  .pathbox input { flex:1; font-family:Consolas,monospace; font-size:12px; }
+  .picked { margin-top:10px; font-size:13px; color:var(--muted); }
+  .picked b { color:var(--text); }
+
+  /* ---------- Hero: three.js 动画区 ---------- */
+  .hero {
+    position:relative; height:252px; margin-top:14px; border-radius:12px;
+    overflow:hidden; border:1px solid var(--line);
+    background:
+      linear-gradient(160deg,#1d2c46 0%,#16233a 55%,#101a2b 100%);
+    animation: fadeUp .5s ease both;
+  }
+  .hero::after {  /* 底部渐隐，让按钮区更好读 */
+    content:""; position:absolute; inset:auto 0 0 0; height:64px; pointer-events:none;
+    background:linear-gradient(to top, rgba(16,26,43,.88), transparent);
+  }
+  .hero canvas { display:block; width:100%; height:100%; }
+  .hero .hero-bar {
+    position:absolute; left:16px; right:16px; bottom:12px; z-index:2;
+    display:flex; align-items:center; justify-content:space-between; gap:12px;
+  }
+  .hero .hero-cap { font-size:12px; color:var(--muted); }
+  .hero .hero-cap b { color:var(--text); }
+  .hero .hero-teams { margin-bottom:3px; }
+  .hero-chips { display:flex; gap:14px; font-size:11px; color:#7f8b9e; }
+  .hero-chips i {
+    display:inline-block; width:6px; height:6px; border-radius:50%;
+    margin-right:5px; vertical-align:middle;
+  }
+  .hero-chips .c1 { background:#3ec8ff; box-shadow:0 0 7px #3ec8ff; animation:pulse 2.4s ease-in-out infinite; }
+  .hero-chips .c2 { background:#7fe3ff; box-shadow:0 0 7px #7fe3ff; animation:pulse 2.4s ease-in-out .5s infinite; }
+  .hero-chips .c3 { background:#ffd166; box-shadow:0 0 7px #ffd166; animation:pulse 2.4s ease-in-out 1s infinite; }
+  .scene-fallback { display:none; }
+
+  /* ---------- 动效 ---------- */
+  @keyframes fadeUp { from { opacity:0; transform:translateY(6px); } to { opacity:1; transform:none; } }
+  @keyframes flow   { to { background-position:-200% 0; } }
+  @keyframes pulse  { 50% { opacity:.55; } }
+  @keyframes popIn  { 0% { transform:scale(.7); opacity:0; } 100% { transform:scale(1); opacity:1; } }
+
+  .panel { transition:border-color .25s ease, box-shadow .25s ease; }
+  .panel:hover { border-color:var(--line-strong);
+                 box-shadow:0 16px 40px rgba(6,12,24,.46), inset 0 1px 0 rgba(255,255,255,.09); }
+  button { transition:transform .12s ease, background .18s ease, border-color .18s ease; }
+  button:active:not(:disabled) { transform:scale(.96); }
+  .panel { animation:fadeUp .45s ease both; }
+  .panel:nth-of-type(2) { animation-delay:.04s; }
+  .panel:nth-of-type(3) { animation-delay:.08s; }
+
+  .bar > i {
+    background:linear-gradient(90deg,#45f3ff,#7287fe,#8258ba);
+    background-size:200% 100%;
+    box-shadow:0 0 14px rgba(69,243,255,.55);
+    border-radius:999px;
+  }
+
+  .bar.active > i { animation:flow 1.3s linear infinite; }
+
+  details[open] > .gdesc, details[open] > .grid { animation:fadeUp .22s ease both; }
+  .st.running { animation:pulse 1.2s ease-in-out infinite; }
+  .vitem { animation:fadeUp .25s ease both; }
+  .logline { animation:fadeUp .16s ease both; }
+  .logline:first-child { margin-top:0; }
+
+  @media (prefers-reduced-motion: reduce) {
+    * { animation-duration:.001ms !important; animation-iteration-count:1 !important;
+        transition-duration:.001ms !important; }
+  }
+
+  /* ---------- 参数区 ---------- */
+  details { border-top:1px solid var(--line); padding:6px 0 2px; }
+  details:first-of-type { border-top:0; }
+  summary { cursor:pointer; font-size:13px; font-weight:600; list-style:none;
+            display:flex; gap:8px; align-items:baseline; padding:8px 6px;
+            border-radius:8px; user-select:none; color:#dbe5f7; }
+  summary:hover { background:rgba(255,255,255,.055); }
+  summary::-webkit-details-marker { display:none; }
+  summary::before { content:"▸"; color:var(--muted); transition:transform .15s;
+                    display:inline-block; width:12px; flex:none; }
+  details[open] summary::before { transform:rotate(90deg); }
+  summary .cnt { color:var(--muted); font-weight:400; font-size:11px; }
+  summary .tagmod { color:var(--accent); font-weight:400; font-size:11px; }
+  .gdesc { color:var(--muted); font-size:11.5px; padding:0 0 6px 26px; line-height:1.5; }
+
+  /* 参数网格：列更宽，避免注释被挤成竖排 */
+  .grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(262px,1fr));
+          gap:16px 20px; padding:10px 0 14px 26px; align-items:start; }
+  .pitem { display:flex; flex-direction:column; gap:5px; min-width:0; }
+  .pitem > label { color:var(--muted); font-size:12px; }
+
+  /* checkbox 项：两列网格，注释单独占第二列第二行，避免和文字抢宽度 */
+  .pitem.chk { display:grid; grid-template-columns:auto minmax(0,1fr);
+               column-gap:9px; row-gap:4px; align-items:start; }
+  .pitem.chk > label { color:var(--text); font-size:13px; line-height:1.45;
+                       cursor:pointer; }
+  .pitem.chk input[type=checkbox] { width:auto; margin:3px 0 0; accent-color:var(--accent); }
+  .pitem.chk .tips { grid-column:2; }
+  .pitem.wide { grid-column:1 / -1; }
+
+  .tips { display:flex; flex-direction:column; gap:2px; min-width:0; }
+  .tips span { font-size:11px; line-height:1.5; color:#93a4c0; }
+  .tips .up::before { content:"↑ "; color:var(--up); font-weight:700; }
+  .tips .dn::before { content:"↓ "; color:var(--dn); font-weight:700; }
+  .tips .note { color:#8090ab; }
+  .tips .warn { color:var(--warn); }
+
+  .disabled-group { opacity:.42; }
+  .disabled-group summary { cursor:not-allowed; }
+  .hint { color:var(--muted); font-size:11px; }
+
+  /* ---------- 参数预设 ---------- */
+  .preset-bar {
+    display:flex; align-items:center; gap:8px; flex-wrap:wrap;
+    padding:10px 12px; margin-bottom:14px;
+    background:rgba(255,255,255,.045);
+    border:1px solid var(--line); border-radius:12px;
+  }
+  .preset-bar > label { font-size:12px; color:var(--muted); }
+  .preset-bar select { width:auto; min-width:170px; max-width:260px; padding:6px 10px; }
+  .preset-bar .hint { margin-left:auto; }
+
+  /* 通用小弹窗（命名 / 确认） */
+  .dlg { width:min(430px,92vw); }
+  .dlg-head { padding:15px 18px; border-bottom:1px solid var(--line);
+              font-size:14px; font-weight:600; }
+  .dlg-body { padding:16px 18px; }
+  .dlg-body input { width:100%; }
+  .dlg-msg { color:var(--text); font-size:13px; line-height:1.6; }
+  .dlg-err { color:var(--bad); font-size:11px; min-height:16px; margin-top:6px; }
+  .dlg-hint { color:var(--muted); font-size:11px; margin-top:2px; }
+  .dlg-foot { padding:12px 18px; border-top:1px solid var(--line);
+              display:flex; justify-content:flex-end; gap:8px; }
+  button.danger { background:linear-gradient(135deg,#ff6b81,#d63a5a);
+                  box-shadow:0 8px 22px rgba(255,90,118,.28); }
+
+  /* ---------- 任务区 ---------- */
+  .bar { height:9px; background:rgba(255,255,255,.08); border-radius:999px;
+         overflow:hidden; margin:12px 0 8px;
+         box-shadow:inset 0 1px 2px rgba(0,0,0,.35); }
+  .bar > i { display:block; height:100%; width:0%; background:var(--accent); transition:width .25s; }
+  .meta { display:flex; gap:16px; font-size:12px; color:var(--muted); flex-wrap:wrap; }
+  .vlist { margin-top:12px; border:1px solid var(--line); border-radius:8px; overflow:hidden; }
+  .vitem { display:flex; align-items:center; gap:10px; padding:8px 12px; font-size:13px;
+           border-top:1px solid var(--line); }
+  .vitem:first-child { border-top:0; }
+  .vitem.running { background:rgba(114,135,254,.13); }
+  .vitem .name { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .vitem .st { font-size:11px; padding:1px 8px; border-radius:999px; border:1px solid var(--line); }
+  .st.pending { color:var(--muted); }
+  .st.running { color:var(--accent); border-color:var(--accent); }
+  .st.done { color:var(--ok); border-color:var(--ok); }
+  .st.failed { color:var(--bad); border-color:var(--bad); }
+  .st.cancelled { color:var(--warn); border-color:var(--warn); }
+  pre.log { background:rgba(8,14,26,.62); border:1px solid var(--line); border-radius:12px;
+            padding:12px; height:230px; overflow:auto; font-size:12px; line-height:1.5;
+            color:#a9b8d1; white-space:pre-wrap; margin:12px 0 0;
+            font-family:Consolas,"Cascadia Mono",monospace; }
+  video { width:100%; border-radius:8px; margin-top:10px; background:#000; }
+  .hidden { display:none !important; }
+
+  /* ---------- 文件浏览器 ---------- */
+  .mask { position:fixed; inset:0; background:rgba(8,14,26,.66); backdrop-filter:blur(3px); display:flex;
+          align-items:center; justify-content:center; z-index:50; }
+  .modal { background:var(--panel); border:1px solid var(--line); border-radius:12px;
+           width:min(860px,92vw); max-height:80vh; display:flex; flex-direction:column; }
+  .modal .head { padding:14px 16px; border-bottom:1px solid var(--line);
+                 display:flex; gap:10px; align-items:center; }
+  .modal .head input { flex:1; font-family:Consolas,monospace; font-size:12px; }
+  .modal .body { overflow:auto; padding:8px 0; flex:1; }
+  .modal .foot { padding:10px 16px; border-top:1px solid var(--line);
+                 display:flex; justify-content:space-between; gap:10px; }
+  .fsrow { display:flex; align-items:center; gap:10px; padding:7px 16px; cursor:pointer;
+           font-size:13px; }
+  .fsrow:hover { background:rgba(255,255,255,.07); }
+  .fsrow .ic { width:18px; text-align:center; }
+  .fsrow .sz { color:var(--muted); font-size:11px; margin-left:auto; }
+  .fsquick { display:flex; gap:8px; flex-wrap:wrap; padding:10px 16px;
+             border-bottom:1px solid var(--line); }
+  a { color:var(--accent); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>🏓 PingPong Studio <small>自动高光剪辑 · 本地运行</small></h1>
+  <div class="health" id="health">正在自检…</div>
+
+  <!-- ============ three.js 动画区 ============ -->
+  <div class="hero" id="hero">
+    <canvas id="ppScene"></canvas>
+    <div class="hero-bar">
+      <div class="hero-cap">
+        <div class="hero-teams"><b id="heroPair">正在热桌…</b></div>
+        <div class="hero-chips">
+          <span><i class="c1"></i>速度残影</span>
+          <span><i class="c2"></i>落点标记</span>
+          <span><i class="c3"></i>球速显示</span>
+        </div>
+      </div>
+      <button class="ghost sm" id="btnShuffle">换一组对手</button>
+    </div>
+  </div>
+
+  <!-- ============ 输入 ============ -->
+  <div class="panel">
+    <h2>① 选择视频</h2>
+    <div class="pathbox">
+      <input type="text" id="selPath" placeholder="未选择（可手动粘贴路径）" spellcheck="false" />
+      <button class="ghost" id="btnFile">选择视频文件</button>
+      <button class="ghost" id="btnDir">选择文件夹</button>
+    </div>
+    <div class="picked" id="picked">支持 mp4 / mov / mkv / avi / webm 等；选文件夹时会扫描该目录下所有视频批量处理</div>
+  </div>
+
+  <!-- ============ 参数 ============ -->
+  <div class="panel">
+    <h2>② 参数（按业务分组，默认全部折叠，保持默认即可）</h2>
+    <div class="preset-bar">
+      <label>预设</label>
+      <select id="presetSel"><option value="">— 未选择 —</option></select>
+      <button class="ghost sm" id="btnApplyPreset" disabled>应用</button>
+      <button class="ghost sm" id="btnSavePreset">保存当前参数</button>
+      <button class="ghost sm" id="btnRenamePreset" disabled>重命名</button>
+      <button class="ghost sm" id="btnDeletePreset" disabled>删除</button>
+      <span class="hint" id="presetHint"></span>
+    </div>
+    <div id="params"></div>
+    <div class="row" style="margin-top:10px">
+      <button id="btnReset" class="ghost sm">恢复默认</button>
+      <span class="hint" id="changeHint">已修改 0 项</span>
+    </div>
+  </div>
+
+  <!-- ============ 任务 ============ -->
+  <div class="panel">
+    <h2>③ 处理</h2>
+    <div class="row">
+      <button id="btnRun" style="min-width:160px">开始处理</button>
+      <button id="btnCancel" class="ghost" disabled>取消</button>
+      <span class="meta" id="runMeta"></span>
+    </div>
+    <div class="bar" id="bar"><i id="barFill"></i></div>
+    <div class="meta">
+      <span id="mStage">等待开始</span>
+      <span id="mVideo"></span>
+      <span id="mFrames"></span>
+      <span id="mFps"></span>
+      <span id="mEta"></span>
+    </div>
+    <div class="vlist hidden" id="vlist"></div>
+    <video id="player" controls playsinline class="hidden"></video>
+    <div class="meta hidden" id="dlWrap" style="margin-top:8px">
+      <a id="dlLink" download>下载当前视频</a>
+      <span id="dlMeta"></span>
+    </div>
+    <pre class="log" id="log">（日志会显示在这里）</pre>
+  </div>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+
+/* =========================================================================
+ * 参数定义
+ *   up   : 调高 / 增大的效果
+ *   dn   : 调低 / 减小的效果
+ *   note : 无方向性的说明（开关、枚举、注意事项）
+ * 分组顺序即业务链条：成片形态 -> 检测 -> 轨迹/回合 -> 剪辑规则 -> 集锦 -> 特效 -> 高级
+ * ========================================================================= */
+const PARAM_GROUPS = [
+  {
+    title: "模型精度",
+    desc: "高精度识别更准但慢一些；低精度快约 2.8 倍。切换档位会自动换模型，不用重启",
+    items: [
+      { key:"model", label:"精度档位", type:"select", def:"m960",
+        options:[["m960","高精度"],["s960","低精度"]],
+        note:"加载中…" },
+    ],
+  },
+  {
+    title: "剪辑与输出",
+    desc: "成片形态：剪不剪、分辨率、编码器、声音",
+    items: [
+      { key:"cut", label:"按回合剪辑", type:"checkbox", def:true, wide:true,
+        note:"勾选：只保留判定的有效回合，剪掉捡球/走动的空档。取消勾选：整段视频加特效，一个镜头都不删（此时下面三个“仅剪辑模式”的组失效）" },
+      { key:"output_height", label:"输出高度 px（留空 = 原分辨率）", type:"number", def:"", min:240, max:4320, step:2,
+        up:"调高：画面更清晰，但渲染更慢、文件更大", dn:"调低：渲染更快、文件更小，720p 左右通常够用" },
+      { key:"encoder", label:"编码器", type:"select", def:"auto",
+        options:[["auto","自动（优先 AMD AMF 硬编）"],["libx264","libx264（兼容性最好）"],
+                 ["h264_amf","h264_amf"],["hevc_amf","hevc_amf"]],
+        note:"auto 会自动挑硬编，速度最快；若出现花屏/播放器不兼容，改 libx264" },
+      { key:"no_audio", label:"去掉原声", type:"checkbox", def:false,
+        note:"勾选：渲染更快（省掉音频重建），输出无声视频" },
+    ],
+  },
+  {
+    title: "检测阈值",
+    desc: "模型识别各类目标的置信度下限，低于阈值的检测直接丢弃",
+    items: [
+      { key:"conf_ball", label:"乒乓球 置信度", type:"number", def:0.10, min:0.01, max:1, step:0.01,
+        up:"调高：只记录很有把握的球，误检少但轨迹容易断，回合可能变少",
+        dn:"调低：召回更多球（含误检），轨迹更连续，回合更容易连起来" },
+      { key:"conf_table", label:"球桌 置信度（留空 = 0.30）", type:"number", def:"", min:0.01, max:1, step:0.01,
+        up:"调高：球台只保留最确定的那个，几何更稳但可能一帧都检不到",
+        dn:"调低：更容易检到球台，但可能把别的矩形当球台" },
+      { key:"conf_net", label:"球网 置信度（留空 = 0.30）", type:"number", def:"", min:0.01, max:1, step:0.01,
+        up:"调高：球网更严格，远处小球网可能漏检", dn:"调低：更容易检到球网，但可能误检" },
+      { key:"conf_player", label:"球员 置信度（留空 = 0.40）", type:"number", def:"", min:0.01, max:1, step:0.01,
+        up:"调高：只给确定的球员加光环", dn:"调低：更多球员被识别，可能把观众也标上",
+        note:"只影响球员光环特效，不影响回合与剪辑" },
+      { key:"iou", label:"NMS 重叠抑制阈值", type:"number", def:0.45, min:0.1, max:0.95, step:0.05,
+        up:"调高：重叠的框更少被合并，同一目标可能出现重复框",
+        dn:"调低：更激进地合并重叠框，球拍/球员紧挨时可能漏检" },
+    ],
+  },
+  {
+    title: "球轨迹与回合判定",
+    desc: "轨迹的鲁棒性，以及一个回合什么时候开始、什么时候结束（两种模式都生效）",
+    items: [
+      { key:"ball_conf", label:"高光阶段球置信度下限", type:"number", def:0.50, min:0.05, max:1, step:0.01,
+        up:"调高：只用更可信的球参与轨迹，轨迹更干净但可能断开、回合变少",
+        dn:"调低：轨迹更连续、回合更容易成立，但杂点会增多",
+        note:"这是第二道球筛选（算轨迹用），与上面“检测阈值”里的乒乓球是两个环节" },
+      { key:"min_static_ball_count", label:"静止球过滤（最少检测数）", type:"number", def:20, min:0, step:1,
+        up:"调高：更狠地剔除位置几乎不变的球（捡球时地上的球），但慢速对拉也可能被误删",
+        dn:"调低：静止球更容易混进轨迹，导致回合判断被带偏" },
+      { key:"max_jump_ratio", label:"轨迹最大跳变（占对角线比例）", type:"number", def:0.10, min:0.01, max:1, step:0.01,
+        up:"调高：允许球一帧跳更远，适合快球或低帧率素材", dn:"调低：轨迹更保守，快球容易被判为跳变而丢弃" },
+      { key:"rally_lost_timeout", label:"球丢失多久判回合结束（秒）", type:"number", def:1.5, min:0.2, step:0.1,
+        up:"调高：球丢了还继续等，回合更长、不容易被切碎，但可能把捡球算进来",
+        dn:"调低：一丢球就结束，回合更多也更碎" },
+      { key:"out_of_table_timeout", label:"持续出台多久判结束（秒）", type:"number", def:3.0, min:0.2, step:0.1,
+        up:"调高：容忍放高球/远台，回合更完整", dn:"调低：球一出球台范围就结束，回合变短" },
+      { key:"no_bounce_timeout", label:"连续无落点多久判结束（秒）", type:"number", def:3.0, min:0.2, step:0.1,
+        up:"调高：允许更长时间没有落点（比如长回合对拉），回合变长",
+        dn:"调低：久不落点就收尾，回合变少变短" },
+    ],
+  },
+  {
+    title: "回合有效性（仅剪辑模式）",
+    desc: "哪些回合值得剪进成片。关闭“按回合剪辑”后整组不生效",
+    onlyWhenCut: true,
+    items: [
+      { key:"min_rally_frames", label:"有效回合最小帧数", type:"number", def:90, min:10, step:1,
+        up:"调高：门槛更高，只留长回合，成片更短更精、回合数变少",
+        dn:"调低：短回合也能入选，成片更长、回合变多（可能混入无效来回）" },
+      { key:"min_rally_bounce_count", label:"短回合豁免：落点数", type:"number", def:2, min:0, step:1,
+        up:"调高：短回合要求更多落点才豁免，回合变少",
+        dn:"调低：短回合更容易被保留，回合变多" },
+      { key:"min_rally_speed_top_n", label:"球速前 N 名无条件保留", type:"number", def:10, min:0, step:1,
+        up:"调高：更多“球速快”的回合被强行保留（即使很短），回合变多",
+        dn:"调低：只靠时长/落点条件筛选，回合变少",
+        note:"填 0 = 关闭该豁免" },
+    ],
+  },
+  {
+    title: "片段边界（仅剪辑模式）",
+    desc: "回合前后留多少画面、相邻片段什么时候合并",
+    onlyWhenCut: true,
+    items: [
+      { key:"pre_buffer", label:"回合前缓冲（秒）", type:"number", def:1.5, min:0, step:0.1,
+        up:"调高：回合前多留，能看到发球准备动作，成片更长", dn:"调低：开场更干脆，成片更紧凑" },
+      { key:"post_buffer", label:"回合后缓冲（秒）", type:"number", def:2.5, min:0, step:0.1,
+        up:"调高：回合后多留，能看到捡球开头，成片更长", dn:"调低：结束更干脆" },
+      { key:"merge_gap", label:"相邻片段合并间隔（秒）", type:"number", def:2.0, min:0, step:0.1,
+        up:"调高：间隔较远的回合也会连成一段，成片更连贯、片段数变少",
+        dn:"调低：片段切得更碎、跳转更频繁" },
+    ],
+  },
+  {
+    title: "前置精彩集锦（仅剪辑模式）",
+    desc: "在成片开头按球速挑选精彩回合做集锦，再放正片",
+    onlyWhenCut: true,
+    items: [
+      { key:"no_highlight_prepend", label:"关闭前置集锦", type:"checkbox", def:false, wide:true,
+        note:"勾选：不生成开头集锦，只输出正片顺序。勾选后本组其余参数失效" },
+      { key:"highlight_top_n", label:"取球速最快的 N 个回合", type:"number", def:7, min:0, max:50, step:1,
+        up:"调高：集锦包含更多回合，开头更长", dn:"调低：集锦更短；填 0 = 不做集锦",
+        disabledWhenPrependOff: true },
+      { key:"highlight_min_duration", label:"入选最小时长（秒）", type:"number", def:6.0, min:0, step:0.5,
+        up:"调高：只有较长的回合能进集锦，集锦更少", dn:"调低：短回合也能进集锦，集锦更多",
+        disabledWhenPrependOff: true },
+      { key:"highlight_min_bounce_count", label:"入选落点数条件", type:"number", def:4, min:0, step:1,
+        up:"调高：需要更多落点才能进集锦，入选更少", dn:"调低：更容易入选",
+        disabledWhenPrependOff: true },
+      { key:"highlight_black_gap", label:"集锦与正片间黑幕（秒）", type:"number", def:1.0, min:0, step:0.1,
+        up:"调高：黑屏过渡更久，段落感更强", dn:"调低：直接切换，节奏更紧凑",
+        disabledWhenPrependOff: true },
+    ],
+  },
+  {
+    title: "视觉效果",
+    desc: "球轨迹彗尾、迷你球台、落点与击球标记、球员光环",
+    items: [
+      { key:"fx_level", label:"特效强度", type:"select", def:"normal",
+        options:[["minimal","minimal 极简"],["normal","normal 常规"],["max","max 最强"]],
+        note:"minimal 最省性能（关闭部分叠加效果）；max 特效最丰富但渲染更慢" },
+      { key:"no_player_fx", label:"关闭球员脚下光环", type:"checkbox", def:false,
+        note:"勾选：画面更干净、渲染略快，也不再需要球员检测结果" },
+    ],
+  },
+  {
+    title: "高级 · 几何与调试",
+    desc: "球台几何、走廊过滤、轨迹关联的精细调节。不确定时请保持默认",
+    items: [
+      { key:"corridor_margin", label:"长边走廊横向容差", type:"number", def:0.5, min:0, step:0.05,
+        up:"调高：走廊更宽，能保留更多贴边的球，但误检也更容易混进来",
+        dn:"调低：过滤更狠，靠近球台边线的真球可能被删" },
+      { key:"corridor_extend", label:"走廊纵向延伸倍数", type:"number", def:5.0, min:0, step:0.5,
+        up:"调高：走廊向球台外延伸更远，容忍远离球台的球", dn:"调低：只认球台附近的球，远处击球会被丢" },
+      { key:"corridor_max_drop", label:"走廊单次剔除比例上限", type:"number", def:0.55, min:0, max:1, step:0.05,
+        up:"调高：允许一次剔除更多球，过滤更彻底但可能删光真球",
+        dn:"调低：更保守，保护真球不被过滤（过滤不足时轨迹会脏）" },
+      { key:"center_dist_ratio", label:"离画面中心丢弃比例", type:"number", def:0.2, min:0, max:1, step:0.05,
+        up:"调高：允许离画面中心更远的目标", dn:"调低：更偏向画面中央的球台",
+        note:"填 0 = 关闭该过滤（多球台场景可关掉）" },
+      { key:"table_edge_tol", label:"落点出台容差 px", type:"number", def:30, min:0, step:5,
+        up:"调高：落点判定更宽容，擦边球也算落在台上", dn:"调低：判定更严格，擦边球会被判为出台" },
+      { key:"match_algo", label:"轨迹关联算法", type:"select", def:"auto",
+        options:[["auto","auto（自动选择）"],["hungarian","hungarian（更准更慢）"],["greedy","greedy（更快）"]],
+        note:"球多、轨迹混乱时可试 hungarian；想更快就 greedy" },
+      { key:"debug", label:"输出调试信息", type:"checkbox", def:false,
+        note:"勾选：日志里额外输出球台几何、长边/短边坐标、落点等，排查问题时用" },
+    ],
+  },
+];
+
+/* ==================== 参数渲染 ==================== */
+const paramInputs = {};   // key -> { el, def, type, onlyWhenCut, disabledWhenPrependOff }
+const groupRefs = [];     // { el, refs, onlyWhenCut }
+
+function buildTips(it) {
+  const hasUp = !!it.up, hasDn = !!it.dn, hasNote = !!it.note;
+  if (!hasUp && !hasDn && !hasNote) return null;
+  const tips = document.createElement('div');
+  tips.className = 'tips';
+  if (hasUp) {
+    const s = document.createElement('span'); s.className = 'up'; s.textContent = it.up;
+    tips.appendChild(s);
+  }
+  if (hasDn) {
+    const s = document.createElement('span'); s.className = 'dn'; s.textContent = it.dn;
+    tips.appendChild(s);
+  }
+  if (hasNote) {
+    const s = document.createElement('span'); s.className = 'note'; s.textContent = it.note;
+    tips.appendChild(s);
+  }
+  return tips;
+}
+
+function buildParams() {
+  const root = $('params');
+  root.innerHTML = '';
+  for (const g of PARAM_GROUPS) {
+    const d = document.createElement('details');
+    const s = document.createElement('summary');
+    s.innerHTML = `<span>${g.title}</span><span class="cnt">${g.items.length} 项</span>
+                   <span class="tagmod hidden" data-role="mod"></span>`;
+    d.appendChild(s);
+    if (g.desc) {
+      const ds = document.createElement('div');
+      ds.className = 'gdesc';
+      ds.textContent = g.desc;
+      d.appendChild(ds);
+    }
+    const grid = document.createElement('div');
+    grid.className = 'grid';
+    const refs = [];
+    for (const it of g.items) {
+      const wrap = document.createElement('div');
+      let el, labelEl;
+      if (it.type === 'checkbox') {
+        wrap.className = 'pitem chk' + (it.wide ? ' wide' : '');
+        el = document.createElement('input');
+        el.type = 'checkbox';
+        el.checked = !!it.def;
+        labelEl = document.createElement('label');
+        labelEl.textContent = it.label;
+        labelEl.onclick = () => { el.checked = !el.checked;
+          el.dispatchEvent(new Event('change', { bubbles: true })); };
+        wrap.appendChild(el);
+        wrap.appendChild(labelEl);
+      } else if (it.type === 'select') {
+        wrap.className = 'pitem' + (it.wide ? ' wide' : '');
+        labelEl = document.createElement('label'); labelEl.textContent = it.label;
+        el = document.createElement('select');
+        for (const [v, t] of it.options) {
+          const o = document.createElement('option');
+          o.value = v; o.textContent = t;
+          if (v === it.def) o.selected = true;
+          el.appendChild(o);
+        }
+        wrap.appendChild(labelEl); wrap.appendChild(el);
+      } else {
+        wrap.className = 'pitem' + (it.wide ? ' wide' : '');
+        labelEl = document.createElement('label'); labelEl.textContent = it.label;
+        el = document.createElement('input');
+        el.type = 'number';
+        if (it.def !== '') el.value = it.def;
+        if (it.min !== undefined) el.min = it.min;
+        if (it.max !== undefined) el.max = it.max;
+        if (it.step !== undefined) el.step = it.step;
+        wrap.appendChild(labelEl); wrap.appendChild(el);
+      }
+      const tips = buildTips(it);
+      if (tips) wrap.appendChild(tips);
+
+      el.dataset.key = it.key;
+      el.addEventListener('input', updateChangeHint);
+      el.addEventListener('change', () => { updateChangeHint(); refreshAvailability(); });
+      const rec = { el, def: it.def, type: it.type,
+                    onlyWhenCut: !!g.onlyWhenCut,
+                    disabledWhenPrependOff: !!it.disabledWhenPrependOff };
+      paramInputs[it.key] = rec;
+      refs.push(rec);
+      grid.appendChild(wrap);
+    }
+    d.appendChild(grid);
+    root.appendChild(d);
+    groupRefs.push({ el: d, refs, onlyWhenCut: !!g.onlyWhenCut });
+  }
+  refreshAvailability();
+}
+
+/** 生效条件：剪辑开关 / 前置集锦开关 */
+function refreshAvailability() {
+  const cutOn = paramInputs.cut ? paramInputs.cut.el.checked : true;
+  const prependOn = paramInputs.no_highlight_prepend
+    ? !paramInputs.no_highlight_prepend.el.checked : true;
+
+  for (const g of groupRefs) {
+    const cutOff = g.onlyWhenCut && !cutOn;
+    g.el.classList.toggle('disabled-group', cutOff);
+    for (const r of g.refs) {
+      r.el.disabled = cutOff || (r.disabledWhenPrependOff && !prependOn);
+    }
+    const mod = g.el.querySelector('[data-role="mod"]');
+    if (!mod) continue;
+    if (cutOff) {
+      mod.textContent = '当前模式不生效';
+      mod.classList.remove('hidden');
+    } else {
+      const n = g.refs.filter(isDirty).length;
+      if (n > 0) { mod.textContent = `已改 ${n} 项`; mod.classList.remove('hidden'); }
+      else mod.classList.add('hidden');
+    }
+  }
+  updateChangeHint();
+}
+
+function isDirty(r) {
+  if (r.type === 'checkbox') return r.el.checked !== !!r.def;
+  if (r.type === 'select') return r.el.value !== r.def;
+  return r.el.value.trim() !== String(r.def);
+}
+
+function collectParams() {
+  const p = {};
+  for (const [key, r] of Object.entries(paramInputs)) {
+    if (r.el.disabled) continue;
+    if (r.type === 'checkbox') { p[key] = r.el.checked; continue; }
+    if (r.type === 'select') { p[key] = r.el.value; continue; }
+    const v = r.el.value.trim();
+    if (v === '') continue;
+    p[key] = Number(v);
+  }
+  return p;
+}
+
+function updateChangeHint() {
+  let n = 0;
+  for (const r of Object.values(paramInputs)) {
+    if (r.el.disabled) continue;
+    if (isDirty(r)) n++;
+  }
+  $('changeHint').textContent = `已修改 ${n} 项（只统计当前模式下生效的参数）`;
+}
+
+$('btnReset').onclick = () => {
+  for (const r of Object.values(paramInputs)) {
+    if (r.type === 'checkbox') r.el.checked = !!r.def;
+    else if (r.type === 'select') r.el.value = r.def;
+    else r.el.value = r.def === '' ? '' : r.def;
+  }
+  refreshAvailability();
+};
+
+/* ==================== 文件浏览 ==================== */
+let selected = null;
+let browserMode = 'file';
+
+async function api(url, opts) {
+  const r = await fetch(url, opts);
+  if (!r.ok) {
+    let msg = r.statusText;
+    try { msg = (await r.json()).detail || msg; } catch (e) {}
+    throw new Error(msg);
+  }
+  return r.json();
+}
+
+function openBrowser(mode) {
+  browserMode = mode;
+  const mask = document.createElement('div');
+  mask.className = 'mask';
+  mask.innerHTML = `
+    <div class="modal">
+      <div class="head">
+        <input type="text" id="fsPath" spellcheck="false" />
+        <button class="ghost sm" id="fsGo">跳转</button>
+      </div>
+      <div class="fsquick" id="fsQuick"></div>
+      <div class="body" id="fsBody"></div>
+      <div class="foot">
+        <span class="hint" id="fsHint"></span>
+        <span>
+          <button class="ghost sm" id="fsCancel">取消</button>
+          <button class="sm" id="fsPickDir">选择此文件夹</button>
+        </span>
+      </div>
+    </div>`;
+  document.body.appendChild(mask);
+
+  const close = () => mask.remove();
+  const body = mask.querySelector('#fsBody');
+  const pathInput = mask.querySelector('#fsPath');
+  const join = (base, name) => base.replace(/[\\/]+$/, '') + '\\' + name;
+
+  async function load(p) {
+    body.innerHTML = '<div class="fsrow hint">加载中…</div>';
+    try {
+      const d = await api('/api/fs/list?path=' + encodeURIComponent(p));
+      pathInput.value = d.path;
+      body.innerHTML = '';
+      if (d.parent) {
+        const up = document.createElement('div');
+        up.className = 'fsrow';
+        up.innerHTML = '<span class="ic">↩</span><span>上一级</span>';
+        up.onclick = () => load(d.parent);
+        body.appendChild(up);
+      }
+      for (const dir of d.dirs) {
+        const r = document.createElement('div');
+        r.className = 'fsrow';
+        r.innerHTML = `<span class="ic">📁</span><span>${dir}</span>`;
+        r.onclick = () => load(join(d.path, dir));
+        body.appendChild(r);
+      }
+      for (const v of d.videos) {
+        const r = document.createElement('div');
+        r.className = 'fsrow';
+        r.innerHTML = `<span class="ic">🎬</span><span>${v.name}</span><span class="sz">${v.mb} MB</span>`;
+        if (browserMode === 'file') {
+          r.onclick = () => {
+            selected = { type: 'file', path: join(d.path, v.name) };
+            close(); renderPicked();
+          };
+        }
+        body.appendChild(r);
+      }
+      if (!d.dirs.length && !d.videos.length) {
+        body.innerHTML += '<div class="fsrow hint">（空目录，没有子目录或视频）</div>';
+      }
+      mask.querySelector('#fsHint').textContent = browserMode === 'file'
+        ? `此目录下 ${d.videos.length} 个视频，点击文件名选择`
+        : `此目录下 ${d.videos.length} 个视频，点下方按钮按文件夹批量处理`;
+    } catch (e) {
+      body.innerHTML = `<div class="fsrow hint">读取失败：${e.message}</div>`;
+    }
+  }
+
+  api('/api/fs/roots').then(r => {
+    const q = mask.querySelector('#fsQuick');
+    for (const [label, p] of [...r.quick.map(x => [x.name, x.path]),
+                             ...r.drives.map(d => [d, d])]) {
+      const b = document.createElement('button');
+      b.className = 'ghost sm'; b.textContent = label;
+      b.onclick = () => load(p);
+      q.appendChild(b);
+    }
+    load(r.quick[0]?.path || r.drives[0] || '.');
+  });
+
+  mask.querySelector('#fsGo').onclick = () => load(pathInput.value);
+  pathInput.onkeydown = (e) => { if (e.key === 'Enter') load(pathInput.value); };
+  mask.querySelector('#fsCancel').onclick = close;
+  mask.querySelector('#fsPickDir').onclick = () => {
+    selected = { type: 'dir', path: pathInput.value };
+    close(); renderPicked();
+  };
+  if (browserMode === 'file') mask.querySelector('#fsPickDir').style.display = 'none';
+}
+
+function renderPicked() {
+  const el = $('picked');
+  if (!selected) { $('selPath').value = ''; el.textContent = '未选择'; return; }
+  $('selPath').value = selected.path;
+  el.innerHTML = selected.type === 'dir'
+    ? `已选文件夹：<b>${selected.path}</b>（目录下所有视频按文件名顺序批量处理，模型只加载一次）`
+    : `已选视频：<b>${selected.path}</b>`;
+}
+
+$('btnFile').onclick = () => openBrowser('file');
+$('btnDir').onclick = () => openBrowser('dir');
+$('selPath').oninput = () => {
+  const v = $('selPath').value.trim();
+  selected = v ? { type: /\.(mp4|avi|mov|mkv|webm|flv|wmv|m4v|mpg|mpeg|ts|3gp)$/i.test(v) ? 'file' : 'dir', path: v } : null;
+  renderPicked();
+};
+
+/* ==================== 任务 ==================== */
+let es = null;
+let currentJob = null;
+const STATUS_TEXT = { queued:'排队中', running:'处理中', done:'已完成',
+                      failed:'失败', cancelled:'已取消' };
+
+function appendLog(line) {
+  const el = $('log');
+  if (el.dataset.ready !== '1') { el.textContent = ''; el.dataset.ready = '1'; }
+  const div = document.createElement('div');
+  div.className = 'logline';
+  div.textContent = line;
+  el.appendChild(div);
+  while (el.childElementCount > 900) el.removeChild(el.firstChild);
+  el.scrollTop = el.scrollHeight;
+}
+
+function clearLog() {
+  const el = $('log');
+  el.textContent = '';
+  el.dataset.ready = '1';
+}
+
+/* 任务进行时把 3D 场景降到低帧率，避免和 DirectML 抢 GPU */
+function sceneMode(m) {
+  try { window.PingPongScene && window.PingPongScene.setMode(m); } catch (e) {}
+}
+function setBarActive(on) { $('bar').classList.toggle('active', on); }
+
+function applyProgress(p) {
+  if (!p) return;
+  if (typeof p.percent === 'number') $('barFill').style.width = Math.min(100, p.percent) + '%';
+  if (p.stage === 'inference') $('mStage').textContent = '推理中';
+  else if (p.stage === 'highlight') { $('mStage').textContent = '高光剪辑中'; $('barFill').style.width = '100%'; }
+  if (p.video_name) $('mVideo').textContent = `[${(p.video_index ?? 0) + 1}/${p.video_total ?? 1}] ${p.video_name}`;
+  if (p.frames !== undefined && p.total) $('mFrames').textContent = `${p.frames} / ${p.total} 帧`;
+  if (p.fps) $('mFps').textContent = `${p.fps} fps`;
+  if (p.eta_sec !== undefined) $('mEta').textContent = `剩余约 ${Math.round(p.eta_sec)} 秒`;
+}
+
+function renderVideos(videos) {
+  const box = $('vlist');
+  box.classList.remove('hidden');
+  box.innerHTML = '';
+  for (const v of videos) {
+    const row = document.createElement('div');
+    row.className = 'vitem ' + (v.status === 'running' ? 'running' : '');
+    const size = v.size_mb ? `${v.size_mb} MB` : '';
+    const frames = v.frames ? `${v.frames} 帧 / ${v.fps} fps` : '';
+    row.innerHTML = `
+      <span class="name">${v.index + 1}. ${v.name}</span>
+      <span class="hint">${frames}</span>
+      <span class="st ${v.status}">${STATUS_TEXT[v.status] || v.status}</span>
+      <span class="hint">${size}</span>`;
+    if (v.video_url) {
+      const b = document.createElement('button');
+      b.className = 'ghost sm'; b.textContent = '▶ 播放';
+      b.onclick = () => {
+        $('player').src = v.video_url + '?t=' + Date.now();
+        $('player').classList.remove('hidden');
+        $('dlLink').href = v.video_url;
+        $('dlMeta').textContent = `${v.name} · ${size}`;
+        $('dlWrap').classList.remove('hidden');
+        $('player').scrollIntoView({ behavior:'smooth', block:'center' });
+      };
+      row.appendChild(b);
+    }
+    if (v.error) {
+      const e = document.createElement('span');
+      e.className = 'hint'; e.style.color = 'var(--bad)';
+      e.textContent = v.error;
+      row.appendChild(e);
+    }
+    box.appendChild(row);
+  }
+}
+
+function renderRunMeta(summary, status) {
+  if (!summary) return;
+  $('runMeta').textContent =
+    `共 ${summary.total} 个 · 成功 ${summary.done} · 失败 ${summary.failed} · ${STATUS_TEXT[status] || status}`;
+}
+
+function subscribe(jobId) {
+  if (es) es.close();
+  es = new EventSource(`/api/jobs/${jobId}/events`);
+  es.onmessage = (ev) => {
+    const msg = JSON.parse(ev.data);
+    if (msg.type === 'snapshot') {
+      const { job, summary, queue_position } = msg.data;
+      currentJob = job;
+      if (queue_position > 1) $('mStage').textContent = `排队中（第 ${queue_position} 位）`;
+      (job.log_tail || []).forEach(appendLog);
+      applyProgress(job.progress);
+      renderVideos(job.videos || []);
+      renderRunMeta(summary, job.status);
+    } else if (msg.type === 'log') appendLog(msg.data);
+    else if (msg.type === 'progress') applyProgress(msg.data);
+    else if (msg.type === 'status') {
+      $('mStage').textContent = (STATUS_TEXT[msg.data.status] || msg.data.status) +
+        (msg.data.stage === 'highlight' ? ' · 高光剪辑中'
+         : msg.data.stage === 'inference' ? ' · 推理中' : '');
+    } else if (msg.type === 'videos') renderVideos(msg.data);
+    else if (msg.type === 'done') {
+      renderVideos(msg.data.videos || []);
+      renderRunMeta(msg.data.result?.summary, msg.data.status);
+      $('btnRun').disabled = false;
+      $('btnCancel').disabled = true;
+      setBarActive(false);
+      sceneMode('full');
+      es.close();
+    }
+  };
+  es.onerror = () => {};
+}
+
+$('btnRun').onclick = async () => {
+  if (!selected || !selected.path) { alert('请先选择视频文件或文件夹'); return; }
+  $('btnRun').disabled = true;
+  $('btnCancel').disabled = false;
+  clearLog();
+  $('player').classList.add('hidden');
+  $('dlWrap').classList.add('hidden');
+  $('vlist').classList.add('hidden');
+  $('barFill').style.width = '0%';
+  $('mStage').textContent = '提交中…';
+
+  try {
+    const d = await api('/api/jobs', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path: selected.path, params: collectParams() }),
+    });
+    sceneMode('calm');
+    setBarActive(true);
+    subscribe(d.id);
+  } catch (e) {
+    alert('提交失败: ' + e.message);
+    $('btnRun').disabled = false;
+    $('btnCancel').disabled = true;
+    sceneMode('full');
+  }
+};
+
+$('btnCancel').onclick = async () => {
+  if (!currentJob) return;
+  try { await api(`/api/jobs/${currentJob.id}/cancel`, { method: 'POST' }); }
+  catch (e) { alert(e.message); }
+};
+
+/* ==================== 模型档位 ==================== */
+async function loadModels() {
+  try {
+    const d = await api('/api/models');
+    const rec = paramInputs.model;
+    if (!rec) return;
+    rec.el.innerHTML = '';
+    for (const m of d.models || []) {
+      const o = document.createElement('option');
+      o.value = m.id;
+      o.textContent = m.name;          // 只显示"高精度 / 低精度"，不暴露文件名体积
+      rec.el.appendChild(o);
+    }
+    rec.el.value = d.default;
+    rec.def = d.default;                       // 让"已修改"判断以服务端默认为准
+    const wrap = rec.el.closest('.pitem');
+    const noteEl = wrap && wrap.querySelector('.tips .note');
+    if (noteEl) {
+      noteEl.textContent = (d.models || [])
+        .map((m) => `${m.name}：${m.note}`).join('；');
+    }
+    updateChangeHint();
+  } catch (e) {
+    console.warn('模型列表加载失败', e);
+  }
+}
+
+/* ==================== 参数预设 ==================== */
+let presets = [];
+
+async function loadPresets(selectId) {
+  try {
+    const d = await api('/api/presets');
+    presets = d.presets || [];
+  } catch (e) {
+    presets = [];
+  }
+  const sel = $('presetSel');
+  const keep = selectId !== undefined ? selectId : sel.value;
+  sel.innerHTML = '<option value="">— 未选择 —</option>';
+  for (const p of presets) {
+    const o = document.createElement('option');
+    o.value = p.id;
+    o.textContent = `${p.name}（${Object.keys(p.params || {}).length} 项）`;
+    sel.appendChild(o);
+  }
+  if (keep && presets.some((p) => p.id === keep)) sel.value = keep;
+  syncPresetButtons();
+}
+
+function currentPreset() {
+  const id = $('presetSel').value;
+  return presets.find((p) => p.id === id) || null;
+}
+
+function syncPresetButtons() {
+  const has = !!currentPreset();
+  $('btnApplyPreset').disabled = !has;
+  $('btnRenamePreset').disabled = !has;
+  $('btnDeletePreset').disabled = !has;
+}
+
+/** 把参数对象写回表单（先全部恢复默认，再套用预设值） */
+function applyParams(p) {
+  for (const r of Object.values(paramInputs)) {
+    if (r.type === 'checkbox') r.el.checked = !!r.def;
+    else if (r.type === 'select') r.el.value = r.def;
+    else r.el.value = r.def === '' ? '' : r.def;
+  }
+  for (const [k, v] of Object.entries(p || {})) {
+    const r = paramInputs[k];
+    if (!r) continue;
+    if (r.type === 'checkbox') r.el.checked = !!v;
+    else if (r.type === 'select') r.el.value = String(v);
+    else r.el.value = (v === null || v === undefined) ? '' : v;
+  }
+  refreshAvailability();
+  updateChangeHint();
+}
+
+/** 通用弹窗：输入命名 或 纯确认 */
+function openDialog({ title, message, value = '', hint = '', confirmText = '确定',
+                      danger = false, noInput = false, validate = null, onOk }) {
+  const mask = document.createElement('div');
+  mask.className = 'mask';
+  mask.innerHTML = `
+    <div class="modal dlg">
+      <div class="dlg-head">${title}</div>
+      <div class="dlg-body">
+        ${noInput ? `<div class="dlg-msg">${message || ''}</div>`
+                  : '<input type="text" id="dlgInput" spellcheck="false" />'}
+        ${noInput ? '' : '<div class="dlg-err" id="dlgErr"></div>'}
+        ${hint ? `<div class="dlg-hint">${hint}</div>` : ''}
+      </div>
+      <div class="dlg-foot">
+        <button class="ghost sm" id="dlgCancel">取消</button>
+        <button class="sm${danger ? ' danger' : ''}" id="dlgOk">${confirmText}</button>
+      </div>
+    </div>`;
+  document.body.appendChild(mask);
+
+  const input = mask.querySelector('#dlgInput');
+  const err = mask.querySelector('#dlgErr');
+  const close = () => mask.remove();
+
+  if (input) {
+    input.value = value;
+    setTimeout(() => { input.focus(); input.select(); }, 30);
+  }
+
+  const submit = () => {
+    let v = '';
+    if (input) {
+      v = input.value.trim();
+      if (validate) {
+        const msg = validate(v);
+        if (msg) { err.textContent = msg; input.focus(); return; }
+      }
+    }
+    close();
+    onOk(v);
+  };
+
+  const okBtn = mask.querySelector('#dlgOk');
+  if (noInput) okBtn.style.marginLeft = 'auto';
+  okBtn.onclick = submit;
+  mask.querySelector('#dlgCancel').onclick = close;
+  if (input) {
+    input.onkeydown = (e) => {
+      if (e.key === 'Enter') submit();
+      if (e.key === 'Escape') close();
+    };
+  }
+  mask.onclick = (e) => { if (e.target === mask) close(); };
+  setTimeout(() => (input ? input : okBtn).focus(), 30);
+}
+
+$('presetSel').onchange = syncPresetButtons;
+
+$('btnApplyPreset').onclick = () => {
+  const p = currentPreset();
+  if (!p) return;
+  applyParams(p.params || {});
+  $('presetHint').textContent = `已应用：${p.name}（${Object.keys(p.params || {}).length} 项）`;
+};
+
+$('btnSavePreset').onclick = () => {
+  const params = collectParams();
+  const n = Object.keys(params).length;
+  const d = new Date();
+  const stamp = `${d.getMonth() + 1}-${d.getDate()} ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+  openDialog({
+    title: '保存参数预设',
+    hint: `将保存当前生效的 ${n} 项参数（当前模式下不生效的参数不会被保存）`,
+    value: `预设 ${stamp}`,
+    confirmText: '保存',
+    validate: (v) => {
+      if (!v) return '请输入名称';
+      if (v.length > 40) return '名称最多 40 个字';
+      if (presets.some((p) => p.name === v)) return '已存在同名预设，换个名字';
+      return '';
+    },
+    onOk: async (name) => {
+      try {
+        const item = await api('/api/presets', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name, params }),
+        });
+        await loadPresets(item.id);
+        $('presetHint').textContent = `已保存：${item.name}`;
+      } catch (e) {
+        alert('保存失败: ' + e.message);
+      }
+    },
+  });
+};
+
+$('btnRenamePreset').onclick = () => {
+  const p = currentPreset();
+  if (!p) return;
+  openDialog({
+    title: '重命名预设',
+    value: p.name,
+    hint: `当前保存了 ${Object.keys(p.params || {}).length} 项参数`,
+    confirmText: '保存',
+    validate: (v) => {
+      if (!v) return '请输入名称';
+      if (v.length > 40) return '名称最多 40 个字';
+      if (presets.some((x) => x.name === v && x.id !== p.id)) return '已存在同名预设';
+      return '';
+    },
+    onOk: async (name) => {
+      try {
+        await api(`/api/presets/${p.id}`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name, params: {} }),
+        });
+        await loadPresets(p.id);
+        $('presetHint').textContent = `已重命名为：${name}`;
+      } catch (e) {
+        alert('重命名失败: ' + e.message);
+      }
+    },
+  });
+};
+
+$('btnDeletePreset').onclick = () => {
+  const p = currentPreset();
+  if (!p) return;
+  openDialog({
+    title: '删除预设',
+    message: `确定删除「${p.name}」吗？此操作不可撤销。`,
+    noInput: true,
+    confirmText: '删除',
+    danger: true,
+    onOk: async () => {
+      try {
+        await api(`/api/presets/${p.id}`, { method: 'DELETE' });
+        await loadPresets('');
+        $('presetHint').textContent = `已删除：${p.name}`;
+      } catch (e) {
+        alert('删除失败: ' + e.message);
+      }
+    },
+  });
+};
+
+/* ==================== 3D 场景联动 ==================== */
+$('btnShuffle').onclick = () => {
+  try { window.PingPongScene && window.PingPongScene.shuffle(); } catch (e) {}
+};
+window.addEventListener('pp:pair', (e) => {
+  $('heroPair').textContent = `${e.detail.left} vs ${e.detail.right} · 正在热桌`;
+});
+
+/* ==================== 自检 ==================== */
+api('/api/health').then(h => {
+  const loaded = (h.models || []).length;
+  $('health').innerHTML = [
+    `后端 <b>${h.backend}</b>`,
+    `精度档位 <b>${loaded} 档可选</b>`,
+    `ffmpeg <b>${h.ffmpeg ? '可用' : '缺失'}</b>`,
+    `可用磁盘 <b>${h.disk_free_gb} GB</b>`,
+    h.model_loaded ? '模型 <b>已加载</b>' : '模型 <b>未加载</b>',
+  ].join(' · ');
+  if (h.default_path) $('selPath').placeholder = `未选择（默认起点 ${h.default_path}）`;
+}).catch(e => { $('health').textContent = '自检失败: ' + e.message; });
+
+buildParams();
+loadModels();
+loadPresets();
+</script>
+<script type="module" src="/static/pingpong-scene.js"></script>
+</body>
+</html>

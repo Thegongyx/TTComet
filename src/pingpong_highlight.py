@@ -174,6 +174,9 @@ def parse_args():
     p.add_argument("--ball-conf", type=float, default=0.50,
                    help="乒乓球检测最小置信度, 低于该值的球候选在收集阶段直接丢弃")
     p.add_argument("--no-audio", action="store_true", help="不保留原声")
+    p.add_argument("--cut", action=argparse.BooleanOptionalAction, default=True,
+                   help="是否按回合剪辑（默认开启）。--no-cut 时整段视频加特效，"
+                        "不裁掉捡球/短回合片段；此时回合仍会用于落点标注")
     p.add_argument("--encoder", default="auto",
                    choices=["auto", "libx264", "h264_amf", "hevc_amf"],
                    help="输出编码器, auto=优先 AMD AMF 硬编")
@@ -3076,15 +3079,27 @@ def main():
                              no_bounce_timeout=args.no_bounce_timeout, debug=args.debug)
     log(f"   回合: {len(rallies)}, 事件: {len(events)}")
 
-    segments, rally_starts_by_seg = build_segments(
-        rallies, fps, total_frames, args,
-        bounce_halves=hl_bounce_halves,
-        min_bounce_count=args.min_rally_bounce_count,
-        ball_speed_table=ball_speed_table,
-        speed_top_n=args.min_rally_speed_top_n)
-    if not segments:
-        log("❌ 没有检测到有效回合, 无法生成高光。可尝试放宽 --min-rally-frames")
-        sys.exit(2)
+    if args.cut:
+        segments, rally_starts_by_seg = build_segments(
+            rallies, fps, total_frames, args,
+            bounce_halves=hl_bounce_halves,
+            min_bounce_count=args.min_rally_bounce_count,
+            ball_speed_table=ball_speed_table,
+            speed_top_n=args.min_rally_speed_top_n)
+        if not segments:
+            log("❌ 没有检测到有效回合, 无法生成高光。可尝试放宽 --min-rally-frames, "
+                "或用 --no-cut 输出整段加特效视频")
+            sys.exit(2)
+    else:
+        # --no-cut: 不裁剪，整段视频加特效（保留捡球/短回合/走动片段）。
+        # 回合仍然保留，只用于落点标注的分组边界，让特效与原剪辑模式一致。
+        if total_frames <= 0:
+            log("❌ --no-cut 需要已知总帧数，但当前视频帧数读取失败")
+            sys.exit(1)
+        segments = [(0, int(total_frames) - 1)]
+        rally_starts_by_seg = {0: sorted(int(r["start_frame"]) for r in rallies)}
+        log("✂️ 已关闭剪辑 (--no-cut): 整段视频加特效, 不剔除捡球/短回合片段")
+
     total_out = sum(e - s + 1 for s, e in segments)
     log(f"✂️  有效片段: {len(segments)} 个, 共 {total_out} 帧 (~{total_out / fps:.1f}s)")
     if args.debug:
@@ -3092,9 +3107,12 @@ def main():
             log(f"    片段{si}: [{s}-{e}]  内含回合起始帧={rally_starts_by_seg.get(si)}")
 
     # 选取球速最快的精彩回合作为前置
-    if args.no_highlight_prepend:
+    if args.no_highlight_prepend or not args.cut:
         top_segs, top_rally_starts = [], {}
-        log("ℹ️ 已通过 --no-highlight-prepend 关闭前置精彩回合功能")
+        if not args.cut:
+            log("ℹ️ --no-cut 模式下不做前置精彩集锦（整段即完整内容）")
+        else:
+            log("ℹ️ 已通过 --no-highlight-prepend 关闭前置精彩回合功能")
     else:
         top_segs, top_rally_starts = _pick_top_speed_segments(
             rallies, ball_speed_table, fps, total_frames,
