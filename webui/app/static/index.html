@@ -1434,7 +1434,6 @@ function loadHealth() {
       T('health.models', { n: loaded }),
       `${T('health.ffmpeg')} <b>${h.ffmpeg ? T('health.ffmpegOk') : T('health.ffmpegMissing')}</b>`,
       T('health.disk', { n: h.disk_free_gb }),
-      h.model_loaded ? T('health.modelLoaded') : T('health.modelIdle'),
     ].join(' · ');
     if (h.version) $('appVersion').textContent = 'v' + h.version;
     if (h.support_url) {

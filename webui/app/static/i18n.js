@@ -88,8 +88,6 @@
       'health.ffmpegOk': '可用',
       'health.ffmpegMissing': '缺失',
       'health.disk': '可用磁盘 {n} GB',
-      'health.modelLoaded': '模型 已加载',
-      'health.modelIdle': '模型 未加载',
       'health.fail': '自检失败: {msg}',
 
       // presets
@@ -386,8 +384,6 @@
       'health.ffmpegOk': 'ok',
       'health.ffmpegMissing': 'missing',
       'health.disk': '{n} GB free',
-      'health.modelLoaded': 'model loaded',
-      'health.modelIdle': 'model idle',
       'health.fail': 'Self-check failed: {msg}',
 
       'preset.label': 'Preset',
