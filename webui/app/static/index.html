@@ -300,6 +300,9 @@
   .footer b { color:var(--text); font-weight:600; }
   .footer .gh-icon { width:14px; height:14px; fill:currentColor; }
   .footer .spacer { flex:1; }
+  .footer .support-link { color:#ff9a9e; }
+  .footer .support-link:hover { color:#ffb3b8; }
+  .footer .support-link span:first-child { font-size:12px; }
 
   /* 右下角固定水印（很淡，不挡操作） */
   .watermark {
@@ -411,6 +414,11 @@
     </a>
     <span class="sep">·</span>
     <span><span data-i18n="footer.dev">开发者</span> <b>Thegongyx</b></span>
+    <span class="sep">·</span>
+    <a id="supportLink" href="https://ifdian.net/a/TTComet" target="_blank"
+       rel="noopener noreferrer" class="support-link">
+      <span>♥</span><span data-i18n="footer.support">支持项目</span>
+    </a>
     <span class="sep">·</span>
     <span><span data-i18n="footer.version">版本</span> <b id="appVersion">-</b></span>
     <span class="sep">·</span>
@@ -1317,6 +1325,7 @@ function loadHealth() {
       h.model_loaded ? T('health.modelLoaded') : T('health.modelIdle'),
     ].join(' · ');
     if (h.version) $('appVersion').textContent = 'v' + h.version;
+    if (h.support_url) $('supportLink').href = h.support_url;
     if (h.default_path) $('selPath').placeholder = T('input.placeholder');
   }).catch((e) => {
     $('health').textContent = T('health.fail', { msg: e.message });

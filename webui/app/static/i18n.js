@@ -118,6 +118,7 @@
 
       // dialogs
       'footer.project': '项目主页',
+      'footer.support': '支持项目',
       'footer.dev': '开发者',
       'footer.version': '版本',
       'footer.unsigned': '未签名构建',
@@ -407,6 +408,7 @@
       'preset.deleteFail': 'Delete failed: {msg}',
 
       'footer.project': 'Project',
+      'footer.support': 'Support',
       'footer.dev': 'Developer',
       'footer.version': 'Version',
       'footer.unsigned': 'unsigned build',

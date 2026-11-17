@@ -103,6 +103,7 @@ MODELS, MODEL_META, DEFAULT_MODEL = _resolve_models()
 
 APP_VERSION = "0.0.2"
 PROJECT_URL = "https://github.com/Thegongyx/TTComet"
+SUPPORT_URL = "https://ifdian.net/a/TTComet"
 
 app = FastAPI(title="TTComet")
 manager = JobManager(_resolve_workspace(), MODELS, DEFAULT_MODEL)
@@ -282,6 +283,7 @@ def health():
         "default_path": _default_browse_path(),
         "version": APP_VERSION,
         "project_url": PROJECT_URL,
+        "support_url": SUPPORT_URL,
     }
 
 
