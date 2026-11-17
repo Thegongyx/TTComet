@@ -60,3 +60,6 @@ runs_detr/
 train_data/**
 !train_data/README.md
 !train_data/.gitkeep
+
+# 本地 AI 协作规范 / 项目内部约定（不入库）
+AGENTS.md

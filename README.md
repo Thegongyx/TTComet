@@ -305,5 +305,4 @@ print(df[['epoch', 'metrics/mAP50-95(B)', 'metrics/mAP50(B)']].tail(20))
 
 ## 📚 更多
 
-构建与打包细节见 [`webui/app/README.md`](webui/app/README.md)，
-项目内部约定与开发规范见 [`AGENTS.md`](AGENTS.md)。
+构建、打包、参数与架构细节见 [`webui/app/README.md`](webui/app/README.md)。
