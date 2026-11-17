@@ -410,6 +410,8 @@ class JobManager:
                       if k not in ("model", "output_dir", "conf_ball", "iou",
                                    "conf_player", "conf_racket",
                                    "conf_table", "conf_net")}
+            # WebUI 默认输出详细日志；用户显式关掉时 params 里已有 False，不会覆盖
+            params.setdefault("debug", True)
             hl = run_highlight(highlight_video, inf["jsonl"], output, params,
                                log=job.add_log)
             item.result["highlight"] = hl

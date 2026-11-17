@@ -316,7 +316,7 @@
       'p.match_algo.label': '轨迹关联算法',
       'p.match_algo.note': '球多、轨迹混乱时可试 hungarian；想更快就 greedy',
       'p.debug.label': '输出调试信息',
-      'p.debug.note': '勾选：日志里额外输出球台几何、长边/短边坐标、落点等，排查问题时用',
+      'p.debug.note': '默认开启：额外输出球台几何、长边/短边坐标、落点等细节，方便排查；嫌日志太长可以取消勾选',
     },
 
     en: {
@@ -598,7 +598,7 @@
       'p.match_algo.label': 'Track association',
       'p.match_algo.note': 'Try hungarian when the track gets messy; use greedy for speed',
       'p.debug.label': 'Verbose debug output',
-      'p.debug.note': 'Checked: log table geometry, long/short edges and bounce coordinates — for troubleshooting',
+      'p.debug.note': 'On by default: logs table geometry, long/short edges, bounce coordinates. Uncheck to keep the log shorter.',
     },
   };
 
