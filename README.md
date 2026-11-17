@@ -47,18 +47,18 @@
 ```
 .
 ├── src/                                  # 命令行脚本链
-│   ├── inference_video.py                #   YOLO 逐帧推理 → raw_detections.jsonl
+│   ├── inference_video.py                #   逐帧推理 → raw_detections.jsonl
 │   ├── pingpong_highlight.py             #   高光特效剪辑（轨迹 + 彗尾 + 迷你球台）
 │   ├── run_pipeline.py                   #   推理 + 高光 一键串联（支持目录批量）
 │   ├── extract_missing_ball.py           #   漏检帧提取（球跳变帧）
 │   ├── extract_rejected_ball_frames.py   #   错误球帧收集（负样本）
 │   ├── random_sample_frames.py           #   通用随机抽帧（支持无日志）
-│   ├── train_pingpong_v2.py              #   YOLO 分割训练（bbox→polygon 自动转换）
+│   ├── train_pingpong_v2.py              #   分割模型训练（bbox→polygon 自动转换）
 │   ├── export_onnx.py                    #   .pt → .onnx 导出（支持 FP16 / NMS）
 │   ├── split_all1.py / split_all19.py    #   数据集拆分 / 增量合并
 │   └── convert_yolo_to_labelstudio.py    #   YOLO 标注 → Label Studio
 │
-├── src_detr/                             # RF-DETR 队列（与 YOLO 并行的一套实现）
+├── src_detr/                             # RF-DETR 队列（另一套检测实现）
 │   ├── train_detr.py                     #   微调（detect / seg）
 │   ├── inference_video_detr.py           #   推理（输出与 YOLO 版同 schema）
 │   ├── run_pipeline_detr.py              #   推理 + 高光
@@ -89,14 +89,17 @@
 
 ## 🚀 环境要求
 
-| 组件 | 说明 |
+> 下面的命令都假设你已经激活了**装好依赖的 Python 环境**（conda / venv 均可），
+> 也就是 `python` 指向该环境。
+
+| 依赖 | 说明 |
 |---|---|
-| Python | 3.10+ |
-| conda 环境 `yolo26` | PyTorch + ultralytics（YOLO 推理 / 训练） |
-| conda 环境 `rfdetr` | RF-DETR 训练 / 推理（由 `yolo26` 克隆） |
-| conda 环境 `label-studio` | 标注服务本体 |
-| ffmpeg | 抽帧 / 推理 / 剪辑必需（桌面版已内置） |
-| GPU | AMD（ROCm）或 NVIDIA（CUDA），ultralytics 自动检测 |
+| Python 3.10+ | 建议用 conda 或 venv 隔离 |
+| PyTorch + ultralytics | 抽帧推理 / 训练 |
+| `rfdetr` | 可选，只有跑 `src_detr/` 时才需要 |
+| `label-studio` | 可选，只有做标注时才需要 |
+| ffmpeg | 抽帧 / 推理 / 剪辑必需（桌面安装包已内置） |
+| GPU | AMD（ROCm）或 NVIDIA（CUDA），框架自动检测；也可纯 CPU 跑 |
 
 ---
 
@@ -104,13 +107,13 @@
 
 | 脚本 | 用途 |
 |---|---|
-| `inference_video.py` | YOLO 逐帧推理 → `raw_detections.jsonl` + 可视化 mp4 |
+| `inference_video.py` | 逐帧推理 → `raw_detections.jsonl` + 可视化 mp4 |
 | `pingpong_highlight.py` | 高光特效剪辑（需要 video + jsonl） |
 | `run_pipeline.py` | 一键流水线：推理 → 高光（单视频或目录批量） |
 | `extract_missing_ball.py` | 漏检帧提取（球跳变帧） |
 | `extract_rejected_ball_frames.py` | 错误球帧收集（A/B 两类负样本） |
 | `random_sample_frames.py` | 通用随机抽帧（`--ball-only` / `--no-player` / `--no-log`） |
-| `train_pingpong_v2.py` | YOLO 分割训练（best_class AP / mAP50 双追踪） |
+| `train_pingpong_v2.py` | 分割模型训练（best_class AP / mAP50 双追踪） |
 | `export_onnx.py` | `.pt` → `.onnx`（`--half` / `--dynamic` / `--simplify` / `--nms`） |
 | `split_all1.py` | 数据集拆分 train/val |
 | `split_all19.py` | 数据集增量合并拆分（专用） |
@@ -129,10 +132,10 @@
 
 ```powershell
 # 单个视频
-conda run -n yolo26 python src/run_pipeline.py --video Videos/match.mp4
+python src/run_pipeline.py --video Videos/match.mp4
 
 # 批量处理整个目录
-conda run -n yolo26 python src/run_pipeline.py --video Videos/
+python src/run_pipeline.py --video Videos/
 ```
 
 产物默认在 `inference_output/pipeline_<视频名>/`。
@@ -141,11 +144,11 @@ conda run -n yolo26 python src/run_pipeline.py --video Videos/
 
 ```powershell
 # 推理
-conda run -n yolo26 python src/inference_video.py `
+python src/inference_video.py `
     --video Videos/match.mp4 --model models/m960n.pt --output inference_output/
 
 # 剪辑（可反复调参，不用重跑推理）
-conda run -n yolo26 python src/pingpong_highlight.py `
+python src/pingpong_highlight.py `
     --video Videos/match.mp4 `
     --raw-detections inference_output/raw_detections.jsonl `
     --output highlight.mp4
@@ -155,11 +158,11 @@ conda run -n yolo26 python src/pingpong_highlight.py `
 
 ```powershell
 # 漏检帧（上一帧有球、当前无球、下一帧又有球）
-conda run -n yolo26 python src/extract_missing_ball.py `
+python src/extract_missing_ball.py `
     --log inference_output/raw_detections.jsonl --video Videos/match.mp4 --count 50
 
 # 随机抽帧（只抽有球场景 / 直接抽帧）
-conda run -n yolo26 python src/random_sample_frames.py `
+python src/random_sample_frames.py `
     --log inference_output/raw_detections.jsonl --video Videos/match.mp4 `
     --count 50 --ball-only
 ```
@@ -168,7 +171,7 @@ conda run -n yolo26 python src/random_sample_frames.py `
 
 ## 🧠 模型
 
-### YOLO 分割（6 类）
+### 分割模型（6 类）
 
 | class_id | 0 | 1 | 2 | 3 | 4 | 5 |
 |---|---|---|---|---|---|---|
@@ -184,7 +187,7 @@ conda run -n yolo26 python src/random_sample_frames.py `
 导出方式：
 
 ```powershell
-conda run -n yolo26 python src/export_onnx.py `
+python src/export_onnx.py `
     --model models/m960n.pt --output webui/models/m960n_fp16_nonms.onnx `
     --imgsz 960 --simplify --half --opset 17 --device 0
 ```
@@ -194,7 +197,7 @@ conda run -n yolo26 python src/export_onnx.py `
 ### RF-DETR（可选替代）
 
 ```powershell
-conda run -n rfdetr python src_detr/train_detr.py `
+python src_detr/train_detr.py `
     --data train_data/all22_split/data.yaml --size medium --task seg --name detr_v1
 ```
 
@@ -204,11 +207,11 @@ conda run -n rfdetr python src_detr/train_detr.py `
 
 ```powershell
 # 1. 拆分 train/val（必须）
-conda run -n yolo26 python src/split_all1.py `
+python src/split_all1.py `
     --src train_data/all22 --dst train_data/all22_split
 
 # 2. 训练
-conda run -n yolo26 python src/train_pingpong_v2.py `
+python src/train_pingpong_v2.py `
     --data train_data/all22_split/data.yaml `
     --pretrained yolo26x-seg.pt `
     --name my_run --epochs 100 --batch 4
@@ -227,10 +230,10 @@ conda run -n yolo26 python src/train_pingpong_v2.py `
 
 ```powershell
 # 标注服务（Windows 原生）
-conda run -n label-studio label-studio start --port 8080   # http://localhost:8080
+label-studio start --port 8080   # http://localhost:8080
 
 # ML 后端（自动预标注）
-conda run -n yolo26 python src_yls/_wsgi.py --port 9090 --host 0.0.0.0
+python src_yls/_wsgi.py --port 9090 --host 0.0.0.0
 ```
 
 标注数据导出为 YOLO 格式后放入 `train_data/<name>/`（`images/ + labels/ + data.yaml`）。
@@ -284,8 +287,8 @@ print(df[['epoch', 'metrics/mAP50-95(B)', 'metrics/mAP50(B)']].tail(20))
 
 ## ⚠️ 注意事项
 
-1. **所有 `src/` 脚本在 `yolo26` 环境运行**：`conda run -n yolo26 python src/<script>.py`
-2. **`src_detr/` 脚本在 `rfdetr` 环境运行**
+1. **先激活装好依赖的环境**，再执行 `python src/<script>.py`（conda 用 `conda activate <环境名>`）
+2. **`src_detr/` 额外需要 `rfdetr` 包**，与 YOLO 那套互不影响，可装在同一环境
 3. **训练启动后不要持续监控进程**：确认启动正常即可，持续查看会拖慢训练
 4. **标注格式**：YOLO txt（`class_id x_center y_center width height`，归一化）；也接受 polygon（9+ 值），训练脚本会自动转换
 5. **`data.yaml` 的 `path` 必须指向 `images/` `labels/` 的父目录**，且训练前必须拆分 train/val，否则会静默失败
