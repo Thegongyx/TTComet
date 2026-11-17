@@ -39,6 +39,13 @@
 certutil -hashfile ttComet-0.0.2-setup.exe SHA256
 ```
 
+本版本 SHA256 校验值：
+
+```
+2c643c9b500f048c85c3441a81b4ba2d620e8ec0154a46a64e8f61c7dd6b9881  ttComet-0.0.2-setup.exe
+ca11509d8973797cbfbf9494c8350c1fa9c5716b1f7e0081385f9050ed3881d6  ttComet.exe
+```
+
 ### 📦 安装包下载
 
 **Gitee 附件单个限制 100 MB**，所以安装包分成了 3 个分卷，需要下载后合并：
