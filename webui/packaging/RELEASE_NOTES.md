@@ -1,9 +1,9 @@
-## 乒乓彗星 TTComet v0.0.2
-
-> **品牌更名**：v0.0.1 名为 PingPong Studio，从本版起正式命名为 **乒乓彗星 TTComet**
-> （TT = table tennis，"彗星"取自产品最具辨识度的球速残影拖尾）。
+## 乒乓彗星 TTComet v0.1.0
 
 **本地运行的乒乓球视频自动高光剪辑工具**，无需安装 Python 或任何运行环境。
+
+> 本版把 v0.0.2 之后的所有改进打包发布：桌面体验（无控制台、托盘、输出目录）、
+> 界面（页脚署名、打赏入口、播放器可关闭）、日志（默认输出详细调试信息）等。
 
 ### 主要功能
 
@@ -11,15 +11,40 @@
 - **本地网页界面**：选择单个视频或整个文件夹批量处理，实时进度与日志，结果在线播放/下载
 - **中英双语界面**：右上角切换 中文 / English，参数说明与提示全部翻译
 - **两档精度模型**：高精度（识别更准）/ 低精度（快约 2.8 倍），可随时切换
-- **参数可调**：按业务分 8 组共 35 项，每项都标注"调高/调低"的效果；支持保存多套预设并重命名
+- **参数可调**：按业务分 9 组共 35 项，每项都标注"调高/调低"的效果；支持保存多套预设并重命名
 - **不剪辑模式**：可只给视频加特效、保留完整时长（不剔除捡球与空档）
+- **自定义输出目录**：留空用默认目录，也可指定任意文件夹；同名自动加序号，不覆盖
 - **自动化处理**：VFR 自动转 CFR，检测日志自动压缩（约 20:1）
+
+### 本版新增（相对 v0.0.2）
+
+**桌面体验**
+
+- **不再弹出控制台黑框**：双击启动只开界面；日志写入 `%LOCALAPPDATA%\TTComet\logs\app.log`（2 MB 滚动，保留 5 份）
+- **任务栏托盘图标**：左键打开界面，右键菜单可「打开界面 / 退出程序」
+- **界面右上角「退出程序」按钮**
+- **启动失败不再"双击没反应"**：弹原生提示框并给日志路径
+- 默认端口固定 `8760`（原实现端口设置有 bug，一直走随机端口），被占用才换随机端口
+
+**界面**
+
+- 页脚新增 **GitHub 项目地址 + 开发者署名 + 版本号 + 未签名提示**
+- 右下角淡色水印 `Thegongyx · TTComet`
+- **♥ 支持项目**：状态行右侧醒目标识 + 页脚入口，点开是打赏卡片（爱发电），只在点开时出现，不做弹窗骚扰
+- 首次成功出片后，右下角浮出一次淡色提示，15 秒自动消失，只提示一次
+- **视频播放器可关闭**：右上角 ✕ 折叠播放器并释放解码器（原来打开后无法收起）
+
+**日志**
+
+- **默认打开 `--debug`**：日志里额外输出球台四角坐标、长边/短边、走廊过滤统计、落点半台检测等细节；嫌太长可在参数「高级 · 几何与调试」里取消勾选
+- 去掉状态行「模型 未加载 / 已加载」—— 该状态反映的是进程内会话是否常驻，跑完任务不刷新，容易误导
 
 ### 安装
 
-- **无需管理员权限**（默认安装到当前用户目录）
+- **无需管理员权限**（默认装到 `%LOCALAPPDATA%\Programs\TTComet`）
 - **已内置 ffmpeg**，目标机不需要安装 Python 或任何运行环境
 - 安装完成后自动启动，浏览器会自动打开操作界面
+- 任务与成品数据在 `%LOCALAPPDATA%\TTComet\jobs\`
 
 ### ⚠️ 关于数字签名（请先看这段）
 
@@ -36,52 +61,56 @@
 
 ```powershell
 # 在下载目录执行，把输出与下方 SHA256 对比
-certutil -hashfile TTComet-0.0.2-setup.exe SHA256
+certutil -hashfile TTComet-0.1.0-setup.exe SHA256
 ```
 
 本版本 SHA256 校验值：
 
 ```
-b40b831d54fffb0c48cc9796be7fe76ccc15d27edc183e17b1bdca1f669f9223  TTComet-0.0.2-setup.exe
-10e0b7b2e4989b8101662d66f713e17f33a88acf0abd106f89ccbcd563bfa450  TTComet.exe
+8380dabc7dbf61946541cabeb9eec7cb745e35ed3904b978013a9bd244729c19  TTComet-0.1.0-setup.exe
+500d4581409c51bda25f6c229f355a48112b4aa2173d497dec3c80d5257912f5  TTComet.exe
 ```
 
 ### 📦 安装包下载
 
-**Gitee 附件单个限制 100 MB**，所以安装包分成了 3 个分卷，需要下载后合并：
+> **最省事的方式**：从 GitHub 直接下载完整安装包（不用合并）
+> https://github.com/Thegongyx/TTComet/releases/download/v0.1.0/TTComet-0.1.0-setup.exe
 
-1. 把 `TTComet-0.0.2-setup.exe.part1 / .part2 / .part3` 下载到**同一目录**
+**Gitee 附件单个限制 100 MB**，所以 Gitee 上的安装包分成了 3 个分卷，需要下载后合并：
+
+1. 把 `TTComet-0.1.0-setup.exe.part1 / .part2 / .part3` 下载到**同一目录**
 2. 在该目录打开命令行（地址栏输入 `cmd` 回车），执行：
 
 ```
-copy /b TTComet-0.0.2-setup.exe.part1 + TTComet-0.0.2-setup.exe.part2 + TTComet-0.0.2-setup.exe.part3 TTComet-0.0.2-setup.exe
+copy /b TTComet-0.1.0-setup.exe.part1 + TTComet-0.1.0-setup.exe.part2 + TTComet-0.1.0-setup.exe.part3 TTComet-0.1.0-setup.exe
 ```
 
-3. 得到完整的 `TTComet-0.0.2-setup.exe`，双击安装
+3. 得到完整的 `TTComet-0.1.0-setup.exe`，双击安装
 
-> **更省事的方式**：直接从 GitHub 下载完整安装包（不用合并）
-> https://github.com/Thegongyx/TTComet/releases/download/v0.0.2/TTComet-0.0.2-setup.exe
+合并后建议校验 SHA256，应与上面列出的值一致。
 
 ### 环境要求
 
 - Windows 10 / 11（64 位）
 - 推荐带独立显卡（AMD / NVIDIA 均可，走 DirectML 加速）；无独显也能运行，但速度明显更慢
-
-### 变更内容（相对 v0.0.1）
-
-- 应用更名为 **乒乓彗星 TTComet**，可执行文件改名 `TTComet.exe`
-- 全新设计图标（球速残影主题，16–256px 多尺寸，小尺寸使用简化版保证清晰）
-- **界面支持中英双语**，右上角切换，语言记忆到本地
-- 安装目录改为 `%LOCALAPPDATA%\Programs\TTComet`，数据目录改为 `%LOCALAPPDATA%\TTComet\jobs`
-- 浏览器标签页图标同步更新
+- 磁盘建议预留 2 GB 以上空闲空间（工作目录会存放转码中间文件）
 
 ### 已知限制
 
 - 程序**未做代码签名**（见上方说明）
 - 同一时间只允许运行一个实例（避免抢占 GPU）
-- **v0.0.1 的用户数据不会自动迁移**（目录名变了），如需保留请手动把 `%LOCALAPPDATA%\PingPongStudio\jobs` 内容拷到 `%LOCALAPPDATA%\TTComet\jobs`
+- 批量处理时逐个视频串行（推理 → 剪辑 → 下一个），不会并行占用多份 GPU/CPU
+- 暂不支持 GPU 型号选择，由 DirectML 自动挑选
 
 ### 技术说明
 
-- 推理基于 ONNX Runtime（DirectML），不依赖 PyTorch / ultralytics
+- 推理基于 ONNX Runtime（DirectML，CPU 自动回落），不依赖 PyTorch / ultralytics
 - 高光剪辑逻辑与仓库中的 `src/pingpong_highlight.py` 完全同源（运行时直接加载该脚本）
+- 两个模型档位：高精度约 20.5 ms/帧，低精度约 7.4 ms/帧（同一张卡实测）
+
+### 💗 支持项目
+
+如果这个工具帮你省了时间，可以到爱发电请作者喝瓶快乐水：
+<https://ifdian.net/a/TTComet>
+
+不打赏也完全没关系 —— 反馈问题、提建议、提 PR 一样是支持。
