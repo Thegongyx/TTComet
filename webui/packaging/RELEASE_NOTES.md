@@ -13,11 +13,25 @@
 
 ### 安装
 
-下载 `PingPongStudio-0.0.1-setup.exe`，双击安装。
-
 - **无需管理员权限**（默认安装到当前用户目录）
 - **已内置 ffmpeg**，目标机不需要安装 Python 或任何运行环境
 - 安装完成后自动启动，浏览器会自动打开操作界面
+
+### 📦 安装包下载（重要）
+
+**Gitee 附件单个限制 100 MB**，所以安装包分成了 3 个分卷，需要下载后合并：
+
+1. 把 `PingPongStudio-0.0.1-setup.exe.part1 / .part2 / .part3` 三个文件下载到**同一目录**
+2. 在该目录打开命令行（地址栏输入 `cmd` 回车），执行：
+
+```
+copy /b PingPongStudio-0.0.1-setup.exe.part1 + PingPongStudio-0.0.1-setup.exe.part2 + PingPongStudio-0.0.1-setup.exe.part3 PingPongStudio-0.0.1-setup.exe
+```
+
+3. 得到完整的 `PingPongStudio-0.0.1-setup.exe`（239 MB），双击安装
+
+> **更省事的方式**：直接从 GitHub 下载完整安装包（不用合并）
+> https://github.com/Thegongyx/tt_ylov/releases/download/v0.0.1/PingPongStudio-0.0.1-setup.exe
 
 ### 环境要求
 
