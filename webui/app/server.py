@@ -101,6 +101,9 @@ def _resolve_models() -> tuple[dict[str, str], list[dict], str]:
 
 MODELS, MODEL_META, DEFAULT_MODEL = _resolve_models()
 
+APP_VERSION = "0.0.2"
+PROJECT_URL = "https://github.com/Thegongyx/TTComet"
+
 app = FastAPI(title="TTComet")
 manager = JobManager(_resolve_workspace(), MODELS, DEFAULT_MODEL)
 # three.js 与场景脚本走静态目录（已本地化，不依赖 CDN）
@@ -277,6 +280,8 @@ def health():
         "disk_free_gb": round(du.free / 1024 ** 3, 1),
         "workspace": manager.workspace,
         "default_path": _default_browse_path(),
+        "version": APP_VERSION,
+        "project_url": PROJECT_URL,
     }
 
 

@@ -117,6 +117,10 @@
       'preset.deleteFail': '删除失败: {msg}',
 
       // dialogs
+      'footer.project': '项目主页',
+      'footer.dev': '开发者',
+      'footer.version': '版本',
+      'footer.unsigned': '未签名构建',
       'quit.button': '退出程序',
       'quit.title': '退出程序',
       'quit.msg': '退出后会停止本地服务并关闭程序窗口，正在运行的任务会被中断。确定退出吗？',
@@ -402,6 +406,10 @@
       'preset.renameFail': 'Rename failed: {msg}',
       'preset.deleteFail': 'Delete failed: {msg}',
 
+      'footer.project': 'Project',
+      'footer.dev': 'Developer',
+      'footer.version': 'Version',
+      'footer.unsigned': 'unsigned build',
       'quit.button': 'Quit',
       'quit.title': 'Quit application',
       'quit.msg': 'This stops the local service and closes the app. Running jobs will be interrupted. Quit?',
