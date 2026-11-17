@@ -18,12 +18,8 @@
 
 ### 下载安装
 
-| 平台 | 位置 | 说明 |
-|---|---|---|
-| GitHub Releases | `Thegongyx/TTComet` → Releases | 完整安装包（约 240 MB） |
-| Gitee Releases | `gongyxu/TTComet` → Releases | 分 3 个卷，需下载后合并 |
-
-> Gitee 附件单卷上限 100 MB，合并命令见该页说明。
+从 [Releases](https://github.com/Thegongyx/TTComet/releases) 下载 `TTComet-*-setup.exe`（约 240 MB），
+双击安装即可。安装包已内置 ffmpeg，目标机不需要装 Python 或任何运行环境。
 
 安装**不需要管理员权限**（装到 `%LOCALAPPDATA%\Programs\TTComet`）。
 数据（任务、预设、成品）在 `%LOCALAPPDATA%\TTComet\jobs\`。
