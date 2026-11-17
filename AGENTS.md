@@ -111,7 +111,7 @@ YOLO 视频帧提取、推理与模型微调工具集。从检测日志中抽帧
 | ONNX 推理引擎 | `webui/app/onnx_engine.py` | 预处理 + NMS + mask→polygon，DirectML 加速 |
 | 打包 exe / 安装包 | `webui/packaging/build.ps1` | `-WithFFmpeg -Installer`，产物在 `webui/dist` |
 | 界面文案（中/英） | `webui/app/static/i18n.js` | 所有 UI 与参数说明的翻译源 |
-| 图标设计 | `webui/design/make_ico.py` | 生成 `ttComet.ico` / `favicon.ico` |
+| 图标设计 | `webui/design/make_ico.py` | 生成 `TTComet.ico` / `favicon.ico` |
 | 查找训练结果 | `runs/<name>/weights/best.pt` | 同时保存 best_class_*_ap.pt 和 best_class_*_map50.pt |
 | 训练配置 | `train_data/*/data.yaml` | nc, names, path 字段 |
 

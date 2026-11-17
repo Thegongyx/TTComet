@@ -36,31 +36,31 @@
 
 ```powershell
 # 在下载目录执行，把输出与下方 SHA256 对比
-certutil -hashfile ttComet-0.0.2-setup.exe SHA256
+certutil -hashfile TTComet-0.0.2-setup.exe SHA256
 ```
 
 本版本 SHA256 校验值：
 
 ```
-2c643c9b500f048c85c3441a81b4ba2d620e8ec0154a46a64e8f61c7dd6b9881  ttComet-0.0.2-setup.exe
-ca11509d8973797cbfbf9494c8350c1fa9c5716b1f7e0081385f9050ed3881d6  ttComet.exe
+b40b831d54fffb0c48cc9796be7fe76ccc15d27edc183e17b1bdca1f669f9223  TTComet-0.0.2-setup.exe
+10e0b7b2e4989b8101662d66f713e17f33a88acf0abd106f89ccbcd563bfa450  TTComet.exe
 ```
 
 ### 📦 安装包下载
 
 **Gitee 附件单个限制 100 MB**，所以安装包分成了 3 个分卷，需要下载后合并：
 
-1. 把 `ttComet-0.0.2-setup.exe.part1 / .part2 / .part3` 下载到**同一目录**
+1. 把 `TTComet-0.0.2-setup.exe.part1 / .part2 / .part3` 下载到**同一目录**
 2. 在该目录打开命令行（地址栏输入 `cmd` 回车），执行：
 
 ```
-copy /b ttComet-0.0.2-setup.exe.part1 + ttComet-0.0.2-setup.exe.part2 + ttComet-0.0.2-setup.exe.part3 ttComet-0.0.2-setup.exe
+copy /b TTComet-0.0.2-setup.exe.part1 + TTComet-0.0.2-setup.exe.part2 + TTComet-0.0.2-setup.exe.part3 TTComet-0.0.2-setup.exe
 ```
 
-3. 得到完整的 `ttComet-0.0.2-setup.exe`，双击安装
+3. 得到完整的 `TTComet-0.0.2-setup.exe`，双击安装
 
 > **更省事的方式**：直接从 GitHub 下载完整安装包（不用合并）
-> https://github.com/Thegongyx/ttComet/releases/download/v0.0.2/ttComet-0.0.2-setup.exe
+> https://github.com/Thegongyx/TTComet/releases/download/v0.0.2/TTComet-0.0.2-setup.exe
 
 ### 环境要求
 
@@ -69,7 +69,7 @@ copy /b ttComet-0.0.2-setup.exe.part1 + ttComet-0.0.2-setup.exe.part2 + ttComet-
 
 ### 变更内容（相对 v0.0.1）
 
-- 应用更名为 **乒乓彗星 TTComet**，可执行文件改名 `ttComet.exe`
+- 应用更名为 **乒乓彗星 TTComet**，可执行文件改名 `TTComet.exe`
 - 全新设计图标（球速残影主题，16–256px 多尺寸，小尺寸使用简化版保证清晰）
 - **界面支持中英双语**，右上角切换，语言记忆到本地
 - 安装目录改为 `%LOCALAPPDATA%\Programs\TTComet`，数据目录改为 `%LOCALAPPDATA%\TTComet\jobs`

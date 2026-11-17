@@ -4,16 +4,16 @@
   三种用法：
 
   1) 正式证书（PFX 文件，最常见）
-       .\packaging\sign.ps1 -Target dist\ttComet -Pfx C:\secure\mycert.pfx -Password 123456
+       .\packaging\sign.ps1 -Target dist\TTComet -Pfx C:\secure\mycert.pfx -Password 123456
 
   2) 证书已安装在个人证书库（有指纹）
-       .\packaging\sign.ps1 -Target dist\ttComet -Thumbprint ABCDEF...
+       .\packaging\sign.ps1 -Target dist\TTComet -Thumbprint ABCDEF...
 
   3) 自签名证书（内部测试用；外部用户仍会看到"未知发布者"）
-       .\packaging\sign.ps1 -Target dist\ttComet -SelfSigned
+       .\packaging\sign.ps1 -Target dist\TTComet -SelfSigned
 
   说明：
-    - 只签 exe 文件（PyInstaller 的 ttComet.exe + Inno 的安装包）
+    - 只签 exe 文件（PyInstaller 的 TTComet.exe + Inno 的安装包）
     - 用 SHA256 + RFC3161 时间戳（证书过期后已签文件仍然有效）
     - 签完会逐个 verify，失败会明确报错
 #>

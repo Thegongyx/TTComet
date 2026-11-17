@@ -2,7 +2,7 @@
 
 ## 最终图标
 
-![ttComet](ttComet-256.png)
+![TTComet](TTComet-256.png)
 
 **设计**：深海军蓝圆角方块（与 WebUI 配色一致）+ 白色乒乓球 + 青→蓝的彗星拖尾。
 拖尾对应产品的核心视觉特色（球速残影），也是名字「乒乓彗星 / TTComet」的由来。
@@ -15,10 +15,10 @@
 | `make_ico.py` | 生成最终 `.ico`（16/24/32/48/64/128/256 七个尺寸） |
 | `candidates.png` | 四个方案的设计记录（含 16/32/48px 可读性对比） |
 | `ico_preview.png` | 最终图标各尺寸平铺预览 |
-| `ttComet-256.png` | 最终图标 256px 源图 |
+| `TTComet-256.png` | 最终图标 256px 源图 |
 
 生成的图标会同时写入：
-- `webui/packaging/ttComet.ico` —— 打包进 exe（PyInstaller `icon=`）与安装包（Inno `SetupIconFile`）
+- `webui/packaging/TTComet.ico` —— 打包进 exe（PyInstaller `icon=`）与安装包（Inno `SetupIconFile`）
 - `webui/app/static/favicon.ico` —— 浏览器标签页
 
 ## 关键取舍

@@ -6,14 +6,14 @@
 ;  或：
 ;      .\packaging\build.ps1 -WithFFmpeg -Installer
 ;
-;  产物：dist\installer\ttComet-0.0.2-setup.exe
+;  产物：dist\installer\TTComet-0.0.2-setup.exe
 ; ============================================================
 
 #define MyAppName "乒乓彗星"
 #define MyAppVersion "0.0.2"
 #define MyAppPublisher "Thegongyx"
-#define MyAppExeName "ttComet.exe"
-#define SrcDir "..\dist\ttComet"
+#define MyAppExeName "TTComet.exe"
+#define SrcDir "..\dist\TTComet"
 
 [Setup]
 AppId={{C41B7E52-9A3D-4F68-B0E7-2D5A8C41F390}
@@ -32,7 +32,7 @@ AllowNoIcons=yes
 
 ; 输出
 OutputDir=..\dist\installer
-OutputBaseFilename=ttComet-{#MyAppVersion}-setup
+OutputBaseFilename=TTComet-{#MyAppVersion}-setup
 Compression=lzma2/normal
 SolidCompression=yes
 WizardStyle=modern
@@ -49,7 +49,7 @@ RestartApplications=no
 
 UninstallDisplayIcon={app}\{#MyAppExeName}
 UninstallDisplayName={#MyAppName} {#MyAppVersion}
-SetupIconFile=ttComet.ico
+SetupIconFile=TTComet.ico
 
 ; 中文界面
 [Languages]

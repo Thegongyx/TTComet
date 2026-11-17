@@ -18,7 +18,7 @@
 | `static/index.html` | 单页界面 |
 | `static/pingpong-scene.js` | three.js 场景：两只小动物打乒乓球（纯程序化建模） |
 | `static/vendor/three.module.min.js` | three.js 0.160.0（本地化，离线可用，655 KB） |
-| `../run_server.py` | 启动器：本地起服务 + 打开浏览器（`ttComet.exe` 的入口） |
+| `../run_server.py` | 启动器：本地起服务 + 打开浏览器（`TTComet.exe` 的入口） |
 | `../models/m960n_fp16_nonms.onnx` | 高精度档（fp16、稠密输出、batch=1，45.2 MB） |
 | `../models/s960n_fp16_nonms.onnx` | 高速档（同上格式，20.1 MB） |
 
@@ -263,8 +263,8 @@ cd webui
 .\packaging\build.ps1 -WithFFmpeg -Clean
 ```
 
-产物：`webui/dist/ttComet/`（onedir，整个文件夹一起分发），
-内含 `ttComet.exe`、`使用说明.txt`、`_internal/`（运行时、模型、静态页、ffmpeg）。
+产物：`webui/dist/TTComet/`（onedir，整个文件夹一起分发），
+内含 `TTComet.exe`、`使用说明.txt`、`_internal/`（运行时、模型、静态页、ffmpeg）。
 
 打包相关说明：
 

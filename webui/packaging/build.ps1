@@ -14,8 +14,8 @@
     .\packaging\build.ps1 -WithFFmpeg -Installer -SelfSigned      # 仅内部测试用
 
   产物：
-    webui\dist\ttComet\                                  （onedir 目录）
-    webui\dist\installer\ttComet-0.0.2-setup.exe         （-Installer 时）
+    webui\dist\TTComet\                                  （onedir 目录）
+    webui\dist\installer\TTComet-0.0.2-setup.exe         （-Installer 时）
     webui\dist\SHA256SUMS.txt                            （始终生成，用于校验下载完整性）
 #>
 param(
@@ -58,9 +58,9 @@ if (-not $SkipBuild) {
     & ".\.venv\Scripts\pyinstaller.exe" @pyiArgs
     if ($LASTEXITCODE -ne 0) { throw "PyInstaller 失败 (exit $LASTEXITCODE)" }
 
-    Copy-Item "packaging\使用说明.txt" "dist\ttComet\使用说明.txt" -Force
+    Copy-Item "packaging\使用说明.txt" "dist\TTComet\使用说明.txt" -Force
 
-    $dir = "dist\ttComet"
+    $dir = "dist\TTComet"
     $size = (Get-ChildItem $dir -Recurse -File | Measure-Object -Property Length -Sum).Sum
     Write-Host ("[build] exe 包: {0:N1} MB / {1} 个文件" -f ($size / 1MB), (Get-ChildItem $dir -Recurse -File).Count) -ForegroundColor Green
 }
@@ -87,7 +87,7 @@ if ($Installer) {
 # ---------------- 3. 签名 ----------------
 if ($wantSign) {
     # 只签不带私钥的可执行文件：exe + 安装包（DLL 太多，逐个签会很慢，且对 SmartScreen 意义不大）
-    $signArgs = @{ Target = "dist\ttComet" }
+    $signArgs = @{ Target = "dist\TTComet" }
     if ($Pfx) { $signArgs.Pfx = $Pfx }
     if ($Password) { $signArgs.Password = $Password }
     if ($Thumbprint) { $signArgs.Thumbprint = $Thumbprint }
@@ -106,10 +106,10 @@ if ($setupExe) {
     $h = (Get-FileHash $setupExe.FullName -Algorithm SHA256).Hash.ToLower()
     $lines += "$h  $($setupExe.Name)"
 }
-$exe = Get-Item "dist\ttComet\ttComet.exe" -ErrorAction SilentlyContinue
+$exe = Get-Item "dist\TTComet\TTComet.exe" -ErrorAction SilentlyContinue
 if ($exe) {
     $h = (Get-FileHash $exe.FullName -Algorithm SHA256).Hash.ToLower()
-    $lines += "$h  ttComet.exe"
+    $lines += "$h  TTComet.exe"
 }
 if ($lines.Count -gt 0) {
     $lines | Set-Content -Path $sumPath -Encoding ascii

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-生成最终图标 ttComet.ico
+生成最终图标 TTComet.ico
 ========================
 - 大尺寸（48+）用完整版（细节彗尾）
 - 小尺寸（16/24/32）用简化版（球更大、尾更短更实），避免缩小时糊成一团
@@ -10,7 +10,7 @@
 用法：
     webui\.venv\Scripts\python.exe webui\design\make_ico.py
 输出：
-    webui\packaging\ttComet.ico         （exe / 安装包用）
+    webui\packaging\TTComet.ico         （exe / 安装包用）
     webui\app\static\favicon.ico        （浏览器标签页用）
 """
 
@@ -170,13 +170,13 @@ def main():
         src = small if s <= 32 else big
         frames[s] = src.resize((s, s), Image.LANCZOS).convert("RGBA")
 
-    ico_packaging = os.path.join(ROOT, "packaging", "ttComet.ico")
+    ico_packaging = os.path.join(ROOT, "packaging", "TTComet.ico")
     ico_static = os.path.join(ROOT, "app", "static", "favicon.ico")
     make_ico(frames, ico_packaging)
     make_ico(frames, ico_static)
 
     # 256 的 PNG 也留一份，方便做宣传图/商店素材
-    big.resize((256, 256), Image.LANCZOS).save(os.path.join(HERE, "ttComet-256.png"))
+    big.resize((256, 256), Image.LANCZOS).save(os.path.join(HERE, "TTComet-256.png"))
 
     # 预览图：各尺寸平铺在深色底上
     pad, cell = 24, 150
@@ -189,7 +189,7 @@ def main():
 
     print("生成完成:")
     for p in (ico_packaging, ico_static,
-              os.path.join(HERE, "ttComet-256.png"),
+              os.path.join(HERE, "TTComet-256.png"),
               os.path.join(HERE, "ico_preview.png")):
         print(f"  {p}  ({os.path.getsize(p) // 1024} KB)")
 
