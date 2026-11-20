@@ -10,7 +10,7 @@
 ; ============================================================
 
 #define MyAppName "乒乓彗星"
-#define MyAppVersion "0.1.1"
+#define MyAppVersion "0.2.0"
 #define MyAppPublisher "Thegongyx"
 #define MyAppExeName "TTComet.exe"
 #define SrcDir "..\dist\TTComet"

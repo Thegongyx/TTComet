@@ -125,7 +125,7 @@ webui\.venv\Scripts\python.exe webui\run_server.py
 接口：`GET/POST /api/presets`、`PUT/DELETE /api/presets/{id}`，
 重名返回 409，不存在返回 404。
 
-### 可调参数（37 项，8 组，默认全部折叠）
+### 可调参数（37 项，9 组，默认全部折叠）
 | 分组 | 业务含义 | 参数 |
 |---|---|---|
 | **剪辑与输出** | 成片形态 | 是否按回合剪辑、输出高度、编码器、去原声 |
