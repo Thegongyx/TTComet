@@ -5,11 +5,16 @@ pingpong_highlight.py  (优化版 v4.16 - 物理抛物线轨迹净化与平滑 +
 乒乓球比赛 → 自动特效精华集锦
 
 v4.16 在 v4.15 基础上的改动:
-  ★ 重力抛物线轨迹净化与平滑 (消除误检造成的残影折线):
+  ★ 重力抛物线轨迹净化与平滑 + 多球台邻台球隔离 (消除误检折线与隔壁台串球):
+    - 隔壁球台干扰空域提取 (_extract_neighbor_table_zones): 自动识别非主球台的常驻背景台/侧边台打球区,
+      结合主球台表面亲和度、景深球框视直径比例、过网有效高度窗及恢复严格 IoU>=0.15 主判据, 彻底过滤邻台独立轨迹。
+    - 防跨台吸球与时空交汇切断 (assoc_cost / _split_switched_subsegs / _ballistic_fill_gap):
+      收紧多帧缺口预测门限并拦截非弹跳反重力上窜; 对跨缺口两侧子弧做时空交汇最小距离检验 (δ_meet),
+      一旦前景落网球误吸咐到背景隔壁台球立即切断并剔除悬空邻台段; 补帧阶段拒绝强反重力缺口硬连斜直线。
     - 物理重力标定 (estimate_gravity_px_per_frame2): 由球台透视四角反推中台比例尺与俯仰角,
       结合实测干净弧段中位数自动标定像素重力加速度 g_frame (px/帧²)。
     - 关联与主轨迹合并升级 (build_main_ball_track): 多点速度+重力预测、运动学方向代价惩罚、
-      短回合台内包含度保留 (overlap_self>=0.5)、按得分时序排他合并 (杜绝多条重叠轨迹逐帧交替跳变)。
+      按得分时序排他合并 (杜绝多条重叠轨迹逐帧交替跳变)。
     - 多轮物理抛物线离群点剔除 (clean_ball_track_parabolic): 先裁首尾误检折钩, 再用双侧支撑
       (各≥2点) Leave-Block-Out 抛物线桥接剔除 1~3 帧空中误检尖刺, 100% 保护真实台面弹跳与球拍击球顶点。
     - 分段自由飞行抛物线平滑 + 弹跳缺口解析补帧 (interpolate_track):
@@ -814,6 +819,99 @@ def build_corridor(far_left, far_right, near_left, near_right,
     return corridor
 
 
+def _extract_neighbor_table_zones(sample_frames, main_quad, img_hw, debug=False):
+    """从采样帧检出的其他非主球台中聚合常驻邻台干扰区 [(x1, y1, x2, y2), ...]。
+
+    用于在多球台球馆场景下识别背景球台/侧边球台的打球空域, 防止隔壁台乒乓球混入主球轨迹与残影。
+    """
+    if main_quad is None or not sample_frames:
+        return []
+    h, w = img_hw
+    diag = math.hypot(w, h)
+    mq_x1, mq_y1 = float(main_quad[:, 0].min()), float(main_quad[:, 1].min())
+    mq_x2, mq_y2 = float(main_quad[:, 0].max()), float(main_quad[:, 1].max())
+    mq_w = max(1.0, mq_x2 - mq_x1)
+    mq_h = max(1.0, mq_y2 - mq_y1)
+    mq_area = mq_w * mq_h
+    min_sep = max(15.0, 0.08 * min(mq_w, mq_h))
+
+    raw_boxes = []
+    for fr in sample_frames:
+        for det in fr.get("detections", []):
+            if det.get("class") != "table" or det.get("confidence", 0.0) < 0.40:
+                continue
+            b = det.get("bbox")
+            if not b or len(b) != 4:
+                continue
+            bx1, by1, bx2, by2 = float(b[0]), float(b[1]), float(b[2]), float(b[3])
+            bw, bh = bx2 - bx1, by2 - by1
+            if bw < 20.0 or bh < 6.0:
+                continue
+            bcx, bcy = 0.5 * (bx1 + bx2), 0.5 * (by1 + by2)
+            # 中心在主球台内或与主球台包围盒高度重叠的视为主球台自身
+            dist_mq = cv2.pointPolygonTest(main_quad.reshape(-1, 1, 2), (bcx, bcy), True)
+            if dist_mq >= -min_sep:
+                continue
+            ix1, iy1 = max(mq_x1, bx1), max(mq_y1, by1)
+            ix2, iy2 = min(mq_x2, bx2), min(mq_y2, by2)
+            if ix1 < ix2 and iy1 < iy2:
+                inter = (ix2 - ix1) * (iy2 - iy1)
+                iou = inter / (mq_area + bw * bh - inter + 1e-6)
+                if iou >= 0.15:
+                    continue
+            raw_boxes.append((bcx, bcy, bx1, by1, bx2, by2))
+
+    if not raw_boxes:
+        return []
+
+    # 按邻台中心聚类, 仅保留跨多帧稳定出现的真实隔壁球台
+    cluster_rad = diag * 0.08
+    clusters = []  # [[box_tuple, ...], ...]
+    for item in raw_boxes:
+        placed = False
+        for cl in clusters:
+            mcx = sum(x[0] for x in cl) / len(cl)
+            mcy = sum(x[1] for x in cl) / len(cl)
+            if math.hypot(item[0] - mcx, item[1] - mcy) <= cluster_rad:
+                cl.append(item)
+                placed = True
+                break
+        if not placed:
+            clusters.append([item])
+
+    min_hits = max(2, len(sample_frames) // 30)
+    zones = []
+    for cl in clusters:
+        if len(cl) < min_hits:
+            continue
+        arr = np.array([[x[2], x[3], x[4], x[5]] for x in cl], dtype=np.float64)
+        nx1, ny1, nx2, ny2 = np.median(arr, axis=0).tolist()
+        nw = max(10.0, nx2 - nx1)
+        nh = max(nw * 0.18, ny2 - ny1)
+        # 覆盖邻台桌面及其上方击球空域、两侧挥拍区
+        zx1 = max(0.0, nx1 - 0.25 * nw)
+        zy1 = max(0.0, ny1 - 1.15 * nh)
+        zx2 = min(float(w), nx2 + 0.25 * nw)
+        zy2 = min(float(h), ny2 + 0.20 * nh)
+        zones.append((zx1, zy1, zx2, zy2))
+
+    if debug and zones:
+        log(f"  ◆ 识别到 {len(zones)} 个隔壁球台干扰空域, 已启用邻台球隔离")
+    return zones
+
+
+def _point_in_neighbor_zones(x, y, neighbor_zones, main_quad=None, safe_main_tol=22.0):
+    if not neighbor_zones:
+        return False
+    if main_quad is not None:
+        if cv2.pointPolygonTest(main_quad.reshape(-1, 1, 2), (float(x), float(y)), True) >= -safe_main_tol:
+            return False
+    for zx1, zy1, zx2, zy2 in neighbor_zones:
+        if zx1 <= x <= zx2 and zy1 <= y <= zy2:
+            return True
+    return False
+
+
 def _point_in_corridor(pt, corridor):
     if corridor is None:
         return True
@@ -1001,6 +1099,7 @@ def extract_table_geometry(frames, img_hw, debug=False, persp_blend=0.0,
     corridor = build_corridor(far_left, far_right, near_left, near_right,
                               corridor_margin=corridor_margin,
                               corridor_extend=corridor_extend, img_hw=img_hw, debug=debug)
+    neighbor_zones = _extract_neighbor_table_zones(sample_frames, quad, img_hw, debug=debug)
     if debug:
         log(f"  球台四角: {quad.tolist()}")
         log(f"  球网线: {net_line}")
@@ -1016,6 +1115,7 @@ def extract_table_geometry(frames, img_hw, debug=False, persp_blend=0.0,
 
     return {"quad": quad, "net_line": net_line, "homography": H,
             "net_side_sign": net_side_sign, "corridor": corridor, "rebuilt": was_rebuilt,
+            "neighbor_zones": neighbor_zones,
             "far_left": np.array(far_left, dtype=np.float32),
             "far_right": np.array(far_right, dtype=np.float32),
             "near_left": np.array(near_left, dtype=np.float32),
@@ -1456,17 +1556,66 @@ def build_main_ball_track(ball_cands, fps, frame_w, frame_h, table_geo=None, deb
         py = y1 + vy * dt_eff + 0.5 * g_prior * dt_eff * dt_eff
         return px, py, vx, vy
 
-    def assoc_cost(tr, pred_info, tol, gap, cx, cy):
-        px, py, vx, _vy = pred_info
-        x1, y1 = tr["pts"][-1][1], tr["pts"][-1][2]
-        # 限制跨缺口的绝对位移上限, 防止速度外推在长缺口上瞬移抓到远端噪点
+    main_quad = table_geo.get("quad") if table_geo else None
+    neighbor_zones = (table_geo.get("neighbor_zones") or []) if table_geo else []
+    if main_quad is not None:
+        mq_x1, mq_y1 = float(main_quad[:, 0].min()), float(main_quad[:, 1].min())
+        mq_x2, mq_y2 = float(main_quad[:, 0].max()), float(main_quad[:, 1].max())
+        mq_w = max(1.0, mq_x2 - mq_x1)
+        mq_h = max(1.0, mq_y2 - mq_y1)
+    else:
+        mq_x1 = mq_y1 = mq_x2 = mq_y2 = mq_w = mq_h = 0.0
+
+    def _bbox_minor(b):
+        if not b or len(b) != 4:
+            return None
+        return max(1.0, min(abs(float(b[2]) - float(b[0])), abs(float(b[3]) - float(b[1]))))
+
+    def _dist_main_quad(x, y):
+        if main_quad is None:
+            return 0.0
+        # pointPolygonTest >= 0 在四边形内; 返回到主球台的距离 (>=0, 台内为 0)
+        sd = cv2.pointPolygonTest(main_quad.reshape(-1, 1, 2), (float(x), float(y)), True)
+        return 0.0 if sd >= 0.0 else -float(sd)
+
+    def assoc_cost(tr, pred_info, tol, gap, cx, cy, cand_bbox=None):
+        px, py, vx, vy = pred_info
+        pts = tr["pts"]
+        x1, y1 = pts[-1][1], pts[-1][2]
+        # 限制跨缺口的绝对位移上限, 防止速度外推在长缺口上瞬移抓到远端/隔壁台噪点
         d_last = math.hypot(cx - x1, cy - y1)
-        max_abs_jump = max_jump * (1.0 + 0.35 * min(gap - 1, 4))
+        max_abs_jump = max_jump * (1.0 + 0.30 * min(gap - 1, 3))
         if d_last > max_abs_jump:
             return None
         d_pred = math.hypot(cx - px, cy - py)
         if d_pred >= tol:
             return None
+
+        # 邻台空域隔离: 从非邻台轨迹跨入邻台空域时, 除非严格落在当前前景抛物线预测点上(如前景高球掠过背景台前方), 否则拒绝串联!
+        if neighbor_zones and _point_in_neighbor_zones(cx, cy, neighbor_zones, main_quad):
+            prev_in_nb = _point_in_neighbor_zones(x1, y1, neighbor_zones, main_quad)
+            if (not prev_in_nb) or gap >= 2:
+                if d_pred > max(18.0, diag * 0.012):
+                    return None
+
+        # 反重力上窜与景深突变拦截(含 gap==1 单帧遮挡瞬间!):
+        # 防止前景球擦网/被遮挡仅 1 帧时, 活跃轨迹直接跳上 100+px 外的背景球台球而被劫持跑偏
+        if len(pts) >= 2 and gap >= 1:
+            if vy is not None and vy >= -1.0 and cy < y1 - max(26.0, diag * 0.020):
+                on_bounce_surface = (main_quad is not None and _dist_main_quad(x1, y1) <= max(24.0, 0.15 * mq_h))
+                if not on_bounce_surface and d_pred > max(28.0, diag * 0.020):
+                    return None
+            # 景深视直径突变拦截: 偏离预测较大且球框短轴尺寸骤缩(远端背景台小球)或骤增(近景邻台大球)时拒绝串联
+            if cand_bbox is not None and d_pred > max(24.0, diag * 0.016):
+                recent_b = [_bbox_minor(p[4]) for p in pts[-4:] if len(p) > 4 and p[4]]
+                recent_b = [v for v in recent_b if v is not None]
+                cb = _bbox_minor(cand_bbox)
+                if recent_b and cb is not None:
+                    med_b = float(np.median(recent_b))
+                    ratio_b = cb / max(med_b, 1.0)
+                    if ratio_b < 0.54 or ratio_b > 1.90:
+                        return None
+
         cost_val = d_pred
         # 已建立明确横向速度时, 对反向跳变施加软惩罚(同帧有真球时优先选顺向抛物线点, 无真球时仍允许真实击球折返)
         if vx is not None and abs(vx) > 3.0:
@@ -1480,10 +1629,10 @@ def build_main_ball_track(ball_cands, fps, frame_w, frame_h, table_geo=None, deb
     def greedy_assign(fidx, active, cands, used, preds, tols, gaps):
         for i, tr in enumerate(active):
             best_j, best_c = -1, _BIG
-            for j, (cx, cy, _c, _b) in enumerate(cands):
+            for j, (cx, cy, _c, b) in enumerate(cands):
                 if used[j]:
                     continue
-                cval = assoc_cost(tr, preds[i], tols[i], gaps[i], cx, cy)
+                cval = assoc_cost(tr, preds[i], tols[i], gaps[i], cx, cy, b)
                 if cval is not None and cval < best_c:
                     best_c, best_j = cval, j
             if best_j >= 0:
@@ -1499,18 +1648,24 @@ def build_main_ball_track(ball_cands, fps, frame_w, frame_h, table_geo=None, deb
             for tr in active:
                 gap = fidx - tr["pts"][-1][0]
                 preds.append(predict(tr, fidx))
-                if len(tr["pts"]) == 1 and gap > 2:
-                    tols.append(max_jump * 0.75)
+                if len(tr["pts"]) == 1:
+                    tols.append(max_jump * (0.90 if gap == 1 else 0.65))
+                elif gap == 1:
+                    tols.append(max_jump * 0.90)
                 else:
-                    tols.append(max_jump * (1.0 + 0.08 * (gap - 1)))
+                    # 已建立速度矢量的轨迹在多帧缺口上收紧预测门限, 防止球死网后跨空抓取隔壁台球
+                    last_x, last_y = tr["pts"][-1][1], tr["pts"][-1][2]
+                    near_endline = (main_quad is None or _dist_main_quad(last_x, last_y) <= max(45.0, 0.35 * mq_w))
+                    base_pred_tol = max(42.0, diag * (0.042 if (near_endline and gap <= 3) else 0.032))
+                    tols.append(min(max_jump * 0.85, base_pred_tol * (1.0 + 0.14 * (gap - 1))))
                 gaps.append(gap)
             done = False
             if algo == "hungarian":
                 n_a, n_c = len(active), len(cands)
                 cost = np.full((n_a, n_c), _BIG, dtype=np.float64)
                 for i, tr in enumerate(active):
-                    for j, (cx, cy, _c, _b) in enumerate(cands):
-                        cval = assoc_cost(tr, preds[i], tols[i], gaps[i], cx, cy)
+                    for j, (cx, cy, _c, b) in enumerate(cands):
+                        cval = assoc_cost(tr, preds[i], tols[i], gaps[i], cx, cy, b)
                         if cval is not None:
                             cost[i, j] = cval
                 try:
@@ -1540,19 +1695,50 @@ def build_main_ball_track(ball_cands, fps, frame_w, frame_h, table_geo=None, deb
         if net_line is None:
             return 0
         (nx1, ny1), (nx2, ny2) = net_line
-        count, prev_side = 0, None
+        count, prev_side, prev_pt = 0, None, None
         for p in pts:
             side = ((nx2 - nx1) * (p[2] - ny1) - (ny2 - ny1) * (p[1] - nx1)) > 0
-            if prev_side is not None and side != prev_side:
-                count += 1
-            prev_side = side
+            if prev_side is not None and side != prev_side and prev_pt is not None:
+                mx, my = 0.5 * (prev_pt[1] + p[1]), 0.5 * (prev_pt[2] + p[2])
+                # 仅统计主球台有效上空范围内的过网(排除球网直线无限延伸穿过背景球台造成的伪过网加分)
+                valid_cross = True
+                if main_quad is not None:
+                    if not (mq_x1 - 0.30 * mq_w <= mx <= mq_x2 + 0.30 * mq_w
+                            and mq_y1 - 1.60 * mq_h <= my <= mq_y2 + 0.25 * mq_h):
+                        valid_cross = False
+                    elif _point_in_neighbor_zones(mx, my, neighbor_zones, main_quad):
+                        valid_cross = False
+                if valid_cross:
+                    count += 1
+            prev_side, prev_pt = side, p
         return count
+
+    def _track_main_table_stats(pts):
+        """返回 (min_dist_to_main_quad, frac_in_neighbor_zones, med_bbox_minor)。"""
+        if not pts:
+            return 1e9, 0.0, None
+        min_d = min(_dist_main_quad(p[1], p[2]) for p in pts) if main_quad is not None else 0.0
+        nb_cnt = (sum(1 for p in pts if _point_in_neighbor_zones(p[1], p[2], neighbor_zones, main_quad))
+                  if neighbor_zones else 0)
+        frac_nb = nb_cnt / len(pts)
+        bmins = [_bbox_minor(p[4]) for p in pts if len(p) > 4 and p[4]]
+        bmins = [v for v in bmins if v is not None]
+        med_b = float(np.median(bmins)) if bmins else None
+        return min_d, frac_nb, med_b
 
     def score(tr):
         pts = tr["pts"]
         n = len(pts)
         if n < 3:
             return 0.0
+        min_d, frac_nb, _ = _track_main_table_stats(pts)
+        # 绝大部分点落在隔壁球台空域且从未接触主球台的轨迹直接判 0 分
+        if main_quad is not None:
+            if frac_nb >= 0.45 and min_d > max(20.0, 0.12 * mq_h):
+                return 0.0
+            # 全程远离主球台面(如悬在挡板后方背景台或前景角落邻台)的孤立轨迹大幅降权/淘汰
+            if min_d > max(55.0, 0.55 * mq_h):
+                return 0.0
         span = pts[-1][0] - pts[0][0] + 1
         coverage = n / span
         motion = sum(math.hypot(pts[i][1] - pts[i - 1][1], pts[i][2] - pts[i - 1][2])
@@ -1560,8 +1746,13 @@ def build_main_ball_track(ball_cands, fps, frame_w, frame_h, table_geo=None, deb
         avg_conf = float(np.mean([p[3] for p in pts]))
         base = n * (0.4 + coverage) * (1 + math.log1p(motion)) * (0.5 + avg_conf)
         net_boost = 1.0 + min(2.0, net_cross_count(pts) * 0.5)
-        return base * net_boost
+        # 紧贴/落入主球台面的轨迹给予主台亲和加成, 确保 anchor 必为主球台回合
+        table_affinity = 1.25 if (main_quad is not None and min_d <= max(18.0, 0.10 * mq_h)) else 1.0
+        return base * net_boost * table_affinity
 
+    tracks = [tr for tr in tracks if score(tr) >= 6.0]
+    if not tracks:
+        return {}
     tracks.sort(key=score, reverse=True)
     n_before_filter = len(tracks)
     if len(tracks) >= 2 and table_geo is not None:
@@ -1570,7 +1761,9 @@ def build_main_ball_track(ball_cands, fps, frame_w, frame_h, table_geo=None, deb
         ax_min, ay_min = anchor_pts.min(axis=0)
         ax_max, ay_max = anchor_pts.max(axis=0)
         anchor_area = max((ax_max - ax_min) * (ay_max - ay_min), 1.0)
+        _, _, anchor_bmin = _track_main_table_stats(anchor["pts"])
         filtered = [anchor]
+        n_nb_rejected = 0
         for tr in tracks[1:]:
             tr_pts = np.array([[p[1], p[2]] for p in tr["pts"]])
             tx_min, ty_min = tr_pts.min(axis=0)
@@ -1578,18 +1771,36 @@ def build_main_ball_track(ball_cands, fps, frame_w, frame_h, table_geo=None, deb
             tr_area = (tx_max - tx_min) * (ty_max - ty_min)
             if tr_area <= 0:
                 continue
+            min_d, frac_nb, tr_bmin = _track_main_table_stats(tr["pts"])
+            if frac_nb >= 0.40 and min_d > max(18.0, 0.10 * mq_h):
+                n_nb_rejected += 1
+                continue
+            # 景深球体尺寸比校验: 排除远端背景小台球(<0.55x)与超近景邻台大球(>1.85x)
+            if anchor_bmin and tr_bmin:
+                sz_ratio = tr_bmin / max(anchor_bmin, 1.0)
+                if (sz_ratio < 0.55 or sz_ratio > 1.85) and min_d > max(15.0, 0.08 * mq_h):
+                    n_nb_rejected += 1
+                    continue
             ix_min, iy_min = max(ax_min, tx_min), max(ay_min, ty_min)
             ix_max, iy_max = min(ax_max, tx_max), min(ay_max, ty_max)
             if ix_min < ix_max and iy_min < iy_max:
                 inter_area = (ix_max - ix_min) * (iy_max - iy_min)
                 iou = inter_area / (anchor_area + tr_area - inter_area)
-                overlap_self = inter_area / tr_area
-                # 同时保留完全落在主台域内的短快球轨迹 (overlap_self>=0.5), 避免被大包络框稀释 IoU 误删
-                if iou >= 0.15 or overlap_self >= 0.50:
+                # 主判据恢复严格 IoU>=0.15(防止背景台小包络框落入 anchor 上空大框被误放行);
+                # 短快球豁免仅限真实触达主球台桌面(min_d<=20px)且跨度合理的片段
+                touches_main_surface = (
+                    min_d <= max(20.0, 0.12 * mq_h)
+                    and len(tr["pts"]) >= 4
+                    and (tx_max - tx_min) >= 0.18 * mq_w
+                )
+                if iou >= 0.15 or touches_main_surface:
                     filtered.append(tr)
+                else:
+                    n_nb_rejected += 1
         tracks = filtered
         if debug:
-            log(f"  空间共域投票: {n_before_filter} → {len(tracks)} 条轨迹 (IoU≥0.15 或 台域包含≥0.50)")
+            log(f"  空间共域+主台亲和过滤: {n_before_filter} → {len(tracks)} 条轨迹 "
+                f"(剔除邻台/非共域 {n_nb_rejected})")
 
     # 时序排他合并: 按轨迹得分由高到低认领时间区间, 禁止并发误检轨迹与主球轨迹逐帧交替穿插造成折线
     score_min = 6.0
@@ -1688,12 +1899,77 @@ def clean_ball_track_parabolic(main_track, fps, frame_w, frame_h, g_frame,
     tol_outlier = max(18.0, diag * 0.013)
     tol_dx_rev = max(9.0, diag * 0.006)
     quad = table_geo.get("quad") if table_geo else None
+    neighbor_zones = (table_geo.get("neighbor_zones") or []) if table_geo else []
+    mq_h = (max(1.0, float(quad[:, 1].max() - quad[:, 1].min()))
+            if quad is not None else 0.0)
 
     def _near_table(x, y, margin_px):
         if quad is None:
             return True
         return cv2.pointPolygonTest(quad.reshape(-1, 1, 2),
                                     (float(x), float(y)), True) >= -margin_px
+
+    def _split_switched_subsegs(seg_frames):
+        """时空交汇检验 (δ_meet): 若同一轨迹段在缺口/大跳变两侧的子弧在 [f_i, f_{i+1}] 任意时刻均无法在空间相交,
+        说明发生了跨球串轨(典型如前景球死网消失后吸咐到背景隔壁台正在打的球), 立即在此处切断!
+        """
+        m_s = len(seg_frames)
+        if m_s < 6:
+            return [seg_frames]
+        s_f = np.array(seg_frames, dtype=np.float64)
+        s_x = np.array([main_track[k][0] for k in seg_frames], dtype=np.float64)
+        s_y = np.array([main_track[k][1] for k in seg_frames], dtype=np.float64)
+        s_c = np.array([main_track[k][2] for k in seg_frames], dtype=np.float64)
+        cut_after = []
+        for idx in range(2, m_s - 3):
+            df = float(s_f[idx + 1] - s_f[idx])
+            step_d = math.hypot(float(s_x[idx + 1] - s_x[idx]), float(s_y[idx + 1] - s_y[idx]))
+            if df < 2.0 and step_d < max(45.0, diag * 0.032):
+                continue
+            # 取左侧最多 4 点与右侧最多 4 点各自拟合局部抛物线
+            l_idx = [idx]
+            j = idx
+            while len(l_idx) < 4 and j - 1 >= 0 and (s_f[j] - s_f[j - 1]) <= short_gap:
+                j -= 1
+                l_idx.append(j)
+            l_idx.reverse()
+            r_idx = [idx + 1]
+            j = idx + 1
+            while len(r_idx) < 4 and j + 1 < m_s and (s_f[j + 1] - s_f[j]) <= short_gap:
+                j += 1
+                r_idx.append(j)
+            if len(l_idx) < 3 or len(r_idx) < 3:
+                continue
+            m_l = _fit_constrained_parabola(
+                s_f[l_idx], s_x[l_idx], s_y[l_idx], weights=np.clip(s_c[l_idx], 0.25, 1.0) ** 2,
+                ay_min=-0.25 * g_frame, ay_max=3.2 * g_frame, ax_max=0.85 * g_frame)
+            m_r = _fit_constrained_parabola(
+                s_f[r_idx], s_x[r_idx], s_y[r_idx], weights=np.clip(s_c[r_idx], 0.25, 1.0) ** 2,
+                ay_min=-0.25 * g_frame, ay_max=3.2 * g_frame, ax_max=0.85 * g_frame)
+            err_l = float(np.max(np.hypot(s_x[l_idx] - _eval_parabola(m_l, s_f[l_idx])[0],
+                                          s_y[l_idx] - _eval_parabola(m_l, s_f[l_idx])[1])))
+            err_r = float(np.max(np.hypot(s_x[r_idx] - _eval_parabola(m_r, s_f[r_idx])[0],
+                                          s_y[r_idx] - _eval_parabola(m_r, s_f[r_idx])[1])))
+            if err_l > tol_support * 1.4 or err_r > tol_support * 1.4:
+                continue
+            t_grid = np.linspace(float(s_f[idx]), float(s_f[idx + 1]), max(7, int(df) * 2 + 1))
+            xl, yl = _eval_parabola(m_l, t_grid)
+            xr, yr = _eval_parabola(m_r, t_grid)
+            d_meet = float(np.min(np.hypot(xl - xr, yl - yr)))
+            in_nb = (neighbor_zones and (
+                _point_in_neighbor_zones(s_x[idx], s_y[idx], neighbor_zones, quad)
+                or _point_in_neighbor_zones(s_x[idx + 1], s_y[idx + 1], neighbor_zones, quad)))
+            meet_lim = (max(26.0, diag * 0.018) + 1.8 * df) if in_nb else (max(38.0, diag * 0.026) + 3.0 * df)
+            if d_meet > meet_lim:
+                cut_after.append(idx)
+        if not cut_after:
+            return [seg_frames]
+        out_s, prev = [], 0
+        for c_i in cut_after:
+            out_s.append(seg_frames[prev:c_i + 1])
+            prev = c_i + 1
+        out_s.append(seg_frames[prev:])
+        return out_s
 
     keys = sorted(main_track.keys())
     raw_segs, cur = [], [keys[0]]
@@ -1878,7 +2154,7 @@ def clean_ball_track_parabolic(main_track, fps, frame_w, frame_h, g_frame,
             if not changed:
                 break
 
-        # 再次按短缺口切分, 剔除长度 < 3 的孤立残片
+        # 再次按短缺口 + 跨球串轨时空交汇检验切分, 剔除孤立残片及脱离主球台的邻台尾段
         if len(cur_seg) < 3:
             n_removed_orphan += len(cur_seg)
             continue
@@ -1890,10 +2166,24 @@ def clean_ball_track_parabolic(main_track, fps, frame_w, frame_h, g_frame,
                 sub_segs.append(sub_cur)
                 sub_cur = [k]
         sub_segs.append(sub_cur)
+        final_sub_segs = []
         for ss in sub_segs:
+            final_sub_segs.extend(_split_switched_subsegs(ss))
+        for ss in final_sub_segs:
             if len(ss) < 3:
                 n_removed_orphan += len(ss)
                 continue
+            if quad is not None:
+                # 切断后若某一段全程悬在背景/侧边邻台而从未靠近主球台面, 直接整段丢弃
+                near_any = any(_near_table(main_track[k][0], main_track[k][1], max(50.0, 0.50 * mq_h))
+                               for k in ss)
+                nb_frac = (sum(1 for k in ss if _point_in_neighbor_zones(
+                               main_track[k][0], main_track[k][1], neighbor_zones, quad)) / len(ss)
+                           if neighbor_zones else 0.0)
+                if (not near_any) or (nb_frac >= 0.45 and not any(
+                        _near_table(main_track[k][0], main_track[k][1], max(18.0, 0.10 * mq_h)) for k in ss)):
+                    n_removed_orphan += len(ss)
+                    continue
             for k in ss:
                 cleaned[k] = main_track[k]
 
@@ -2142,7 +2432,12 @@ def _ballistic_fill_gap(seg_f, seg_x, seg_y, i, frame_w, frame_h,
         a_cands.append(2.0 * (y0 - y1 + vy1 * D) / (D * D))
     if a_cands:
         a_raw = sum(a_cands) / len(a_cands)
-        a = _clamp(a_raw if math.isfinite(a_raw) else g_frame, 0.20 * g_frame, 2.8 * g_frame)
+        if not math.isfinite(a_raw):
+            return [], "skipped"
+        # 若跨缺口需要强反重力向上加速(且未通过上方台面弹跳双弧检验, 如从前景落网球跳到高处背景台球), 拒绝硬连直线!
+        if D >= 2 and a_raw < -0.65 * g_frame:
+            return [], "skipped"
+        a = _clamp(a_raw, 0.20 * g_frame, 2.8 * g_frame)
     else:
         a = g_frame
     vy0_eff = (y1 - y0 - 0.5 * a * D * D) / D
@@ -3443,7 +3738,7 @@ def render(args, segments, rally_starts_by_seg, filled_track, events, table_geo,
         player_fx = PlayerFX(fps, out_w, out_h, intensity=fx_intensity) if enable_player_fx else None
         # 残影 (球拖尾) 时长 ≈ 0.2s; 下限 4 帧保证可平滑/绘制
         TRAIL_LEN = max(4, int(fps * 0.2))
-        max_trail_step = getattr(args, "max_jump_ratio", 0.10) * math.hypot(out_w, out_h) * 1.15
+        max_trail_step = getattr(args, "max_jump_ratio", 0.10) * math.hypot(out_w, out_h) * 0.85
 
         prepend_frame_count = sum(e - ps + 1 for ps, e in (prepend_segments or []))
         black_frame_count = int(round(fps * black_gap_sec)) if prepend_segments else 0
