@@ -25,8 +25,10 @@
 
 ### 下载安装
 
-从 [Releases](https://github.com/Thegongyx/TTComet/releases) 下载 `TTComet-*-setup.exe`（约 240 MB），
+从 [最新版本](https://github.com/TheGongyx/TTComet/releases/latest) 下载 `TTComet-*-setup.exe`（约 240 MB），
 双击安装即可。安装包已内置 ffmpeg，目标机不需要装 Python 或任何运行环境。
+
+> 这个链接始终指向最新正式版；已安装旧版的话，程序启动时也会自动检查更新，可直接在界面里下载安装。
 
 安装**不需要管理员权限**（装到 `%LOCALAPPDATA%\Programs\TTComet`）。
 数据（任务、预设、成品）在 `%LOCALAPPDATA%\TTComet\jobs\`。
