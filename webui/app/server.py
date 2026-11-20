@@ -11,6 +11,10 @@
 接口:
     GET  /                            页面
     GET  /api/health                  环境自检
+    GET  /api/update                  检查 GitHub 最新版本（缓存）
+    POST /api/update/download         下载新版安装包（后台线程）
+    GET  /api/update/download         下载进度
+    POST /api/update/install          启动安装程序并退出本程序
     GET  /api/fs/roots                盘符 / 常用起点
     GET  /api/fs/list?path=...        目录浏览（子目录 + 视频文件）
     POST /api/jobs                    {path, params} -> 建任务（文件或目录）
@@ -24,14 +28,20 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import queue
 import shutil
 import string
+import subprocess
 import sys
+import tempfile
 import threading
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 import uuid
 
 from fastapi import FastAPI, Header, HTTPException
@@ -101,9 +111,22 @@ def _resolve_models() -> tuple[dict[str, str], list[dict], str]:
 
 MODELS, MODEL_META, DEFAULT_MODEL = _resolve_models()
 
-APP_VERSION = "0.2.0"
+APP_VERSION = "0.2.1"
 PROJECT_URL = "https://github.com/Thegongyx/TTComet"
 SUPPORT_URL = "https://ifdian.net/a/TTComet"
+
+# ---- 在线更新（只查 GitHub Releases；Gitee 仓库不公开，不作为更新源）----
+UPDATE_REPO = "TheGongyx/TTComet"
+UPDATE_API = f"https://api.github.com/repos/{UPDATE_REPO}/releases/latest"
+UPDATE_USER_AGENT = f"TTComet/{APP_VERSION}"
+UPDATE_OK_TTL = 6 * 3600          # 查询成功缓存 6 小时
+UPDATE_FAIL_TTL = 30 * 60         # 失败也缓存 30 分钟，避免频繁打接口
+UPDATE_ALLOWED_HOSTS = (
+    "github.com",
+    "objects.githubusercontent.com",
+    "release-assets.githubusercontent.com",
+)
+
 
 app = FastAPI(title="TTComet")
 manager = JobManager(_resolve_workspace(), MODELS, DEFAULT_MODEL)
@@ -186,6 +209,238 @@ def shutdown(x_ttcomet_request: str = Header(default="")):
 
     threading.Thread(target=_exit, name="shutdown", daemon=True).start()
     return {"ok": True}
+
+
+# ----------------------------------------------------------------------
+# 在线更新（只查 GitHub；用户确认后才下载，安装时退出本程序）
+# ----------------------------------------------------------------------
+_update_lock = threading.Lock()
+_update_cache: dict = {"ts": 0.0, "ok": False, "data": None}
+
+_dl_lock = threading.Lock()
+_dl_state: dict = {
+    "state": "idle",      # idle / downloading / done / error
+    "downloaded": 0,
+    "total": 0,
+    "percent": 0.0,
+    "path": "",
+    "error": "",
+    "version": "",
+    "digest": "",
+}
+
+
+def _ver_tuple(v: str) -> tuple[int, ...]:
+    """把 "v0.2.1" / "0.2.1-beta" 解析成可比较的整数三元组。"""
+    out: list[int] = []
+    for part in (v or "").strip().lstrip("vV").split("."):
+        num = ""
+        for ch in part:
+            if ch.isdigit():
+                num += ch
+            else:
+                break
+        if not num:
+            break
+        out.append(int(num))
+    while len(out) < 3:
+        out.append(0)
+    return tuple(out[:3])
+
+
+def _pick_update_asset(rel: dict) -> dict | None:
+    assets = rel.get("assets") or []
+    exes = [a for a in assets if str(a.get("name", "")).lower().endswith(".exe")]
+    setup = [a for a in exes if "setup" in str(a.get("name", "")).lower()]
+    picked = setup or exes
+    return picked[0] if picked else None
+
+
+def _fetch_latest_release() -> dict:
+    req = urllib.request.Request(UPDATE_API, headers={
+        "User-Agent": UPDATE_USER_AGENT,
+        "Accept": "application/vnd.github+json",
+    })
+    with urllib.request.urlopen(req, timeout=5) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def _check_update(force: bool = False) -> dict:
+    """查询 GitHub 最新 Release（带缓存）。失败不抛异常，仅返回 ok=False。"""
+    now = time.time()
+    with _update_lock:
+        age = now - float(_update_cache["ts"] or 0)
+        ttl = UPDATE_OK_TTL if _update_cache["ok"] else UPDATE_FAIL_TTL
+        cached = _update_cache["data"]
+        if not force and cached is not None and age < ttl:
+            return cached
+
+    data: dict = {
+        "current": APP_VERSION,
+        "latest": None,
+        "has_update": False,
+        "ok": False,
+        "error": "",
+        "url": "",
+        "published_at": "",
+        "asset_url": "",
+        "asset_name": "",
+        "asset_size": 0,
+        "digest": "",
+    }
+    try:
+        rel = _fetch_latest_release()
+        latest = str(rel.get("tag_name") or "").strip().lstrip("vV")
+        asset = _pick_update_asset(rel)
+        data.update({
+            "ok": True,
+            "latest": latest or None,
+            "has_update": bool(latest) and _ver_tuple(latest) > _ver_tuple(APP_VERSION),
+            "url": rel.get("html_url") or "",
+            "published_at": rel.get("published_at") or "",
+        })
+        if asset:
+            data.update({
+                "asset_url": asset.get("browser_download_url") or "",
+                "asset_name": asset.get("name") or "",
+                "asset_size": int(asset.get("size") or 0),
+                "digest": str(asset.get("digest") or ""),
+            })
+    except urllib.error.HTTPError as e:
+        data["error"] = f"GitHub HTTP {e.code}"
+    except Exception as e:  # 断网/超时/DNS/证书
+        data["error"] = f"{type(e).__name__}"
+
+    with _update_lock:
+        _update_cache.update({"ts": time.time(), "ok": data["ok"], "data": data})
+    return data
+
+
+def _download_target(name: str, latest: str) -> str:
+    base = os.path.basename(name or "") or f"TTComet-{latest or 'update'}-setup.exe"
+    base = "".join(ch for ch in base if ch.isalnum() or ch in "._-") or "TTComet-update.exe"
+    folder = os.path.join(tempfile.gettempdir(), "TTComet-update")
+    os.makedirs(folder, exist_ok=True)
+    return os.path.join(folder, base)
+
+
+def _download_worker(url: str, name: str, latest: str, digest: str) -> None:
+    tmp_path = ""
+    try:
+        parsed = urllib.parse.urlparse(url)
+        if parsed.scheme != "https" or parsed.hostname not in UPDATE_ALLOWED_HOSTS:
+            raise ValueError(f"不允许的下载地址: {parsed.hostname or url}")
+        target = _download_target(name, latest)
+        tmp_path = target + ".part"
+        req = urllib.request.Request(url, headers={"User-Agent": UPDATE_USER_AGENT})
+        done = 0
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            final_host = urllib.parse.urlparse(resp.geturl()).hostname or ""
+            if final_host not in UPDATE_ALLOWED_HOSTS:
+                raise ValueError(f"重定向到非 GitHub 域名: {final_host}")
+            total = int(resp.headers.get("Content-Length") or 0)
+            with _dl_lock:
+                _dl_state.update({"total": total, "downloaded": 0, "percent": 0.0,
+                                  "path": "", "error": ""})
+            with open(tmp_path, "wb") as f:
+                while True:
+                    chunk = resp.read(1 << 20)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    done += len(chunk)
+                    with _dl_lock:
+                        _dl_state["downloaded"] = done
+                        _dl_state["percent"] = round(done * 100.0 / total, 1) if total else 0.0
+
+        if digest.lower().startswith("sha256:"):
+            want = digest.split(":", 1)[1].strip().lower()
+            got = hashlib.sha256()
+            with open(tmp_path, "rb") as f:
+                for block in iter(lambda: f.read(1 << 20), b""):
+                    got.update(block)
+            if got.hexdigest() != want:
+                raise ValueError("安装包校验失败（SHA256 不匹配），请重试")
+
+        os.replace(tmp_path, target)
+        with _dl_lock:
+            _dl_state.update({"state": "done", "path": target, "percent": 100.0})
+    except Exception as e:
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+        with _dl_lock:
+            _dl_state.update({"state": "error", "error": f"{type(e).__name__}: {e}"})
+
+
+@app.get("/api/update")
+def check_update(force: int = 0):
+    return _check_update(force=bool(force))
+
+
+@app.post("/api/update/download")
+def start_update_download(x_ttcomet_request: str = Header(default="")):
+    if x_ttcomet_request != "1":
+        raise HTTPException(403, "missing confirmation header")
+    with _dl_lock:
+        if _dl_state["state"] == "downloading":
+            return dict(_dl_state)
+
+    info = _check_update(force=True)
+    if not info.get("has_update"):
+        raise HTTPException(400, "当前已是最新版本，没有可下载的更新")
+    if not info.get("asset_url"):
+        raise HTTPException(502, "最新版本没有可下载的安装包")
+
+    with _dl_lock:
+        _dl_state.update({
+            "state": "downloading", "downloaded": 0, "percent": 0.0,
+            "total": int(info.get("asset_size") or 0), "path": "", "error": "",
+            "version": info.get("latest") or "", "digest": info.get("digest") or "",
+        })
+    threading.Thread(
+        target=_download_worker,
+        args=(info["asset_url"], info.get("asset_name") or "",
+              info.get("latest") or "", info.get("digest") or ""),
+        name="update-download", daemon=True,
+    ).start()
+    with _dl_lock:
+        return dict(_dl_state)
+
+
+@app.get("/api/update/download")
+def update_download_status():
+    with _dl_lock:
+        return dict(_dl_state)
+
+
+@app.post("/api/update/install")
+def install_update(x_ttcomet_request: str = Header(default="")):
+    if x_ttcomet_request != "1":
+        raise HTTPException(403, "missing confirmation header")
+    if manager.has_active_jobs():
+        raise HTTPException(409, "有任务正在运行，请等待完成或取消后再安装")
+    with _dl_lock:
+        state = _dl_state["state"]
+        path = _dl_state["path"]
+    if state != "done" or not path or not os.path.exists(path):
+        raise HTTPException(400, "安装包尚未下载完成")
+
+    flags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    try:
+        subprocess.Popen([path, "/CLOSEAPPLICATIONS", "/NORESTART"],
+                         close_fds=True, creationflags=flags)
+    except Exception as e:
+        raise HTTPException(500, f"无法启动安装程序: {e}")
+
+    def _exit() -> None:
+        time.sleep(1.5)   # 等 HTTP 响应写完，再释放文件句柄
+        os._exit(0)
+
+    threading.Thread(target=_exit, name="update-exit", daemon=True).start()
+    return {"ok": True, "path": path}
 
 
 @app.post("/api/presets")

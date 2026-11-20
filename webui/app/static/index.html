@@ -386,6 +386,28 @@
   .support-toast .msg { flex:1; min-width:180px; }
   .support-toast button { flex:0 0 auto; }
 
+  /* 状态行右侧：检查更新 + 支持项目 */
+  .health-right { margin-left:auto; display:flex; align-items:center; gap:8px; }
+  .health-right .support-chip { margin-left:0; }
+  .update-banner {
+    position:fixed; right:16px; bottom:92px; z-index:61;
+    display:flex; align-items:center; gap:10px; flex-wrap:wrap;
+    max-width:520px; padding:10px 12px; border-radius:12px;
+    background:linear-gradient(180deg, rgba(30,46,72,.98), rgba(18,29,47,.98));
+    border:1px solid var(--line-strong);
+    box-shadow:0 14px 34px rgba(4,10,20,.55);
+    font-size:12px; color:var(--text);
+    animation:fadeUp .3s ease both;
+  }
+  .update-banner .msg { flex:1; min-width:200px; line-height:1.5; }
+  .update-banner .msg b { color:var(--cyan); font-weight:600; }
+  .update-banner .bar { flex-basis:100%; height:4px; border-radius:4px;
+    background:rgba(255,255,255,.12); overflow:hidden; }
+  .update-banner .bar i { display:block; height:100%; width:0;
+    background:var(--cyan); transition:width .2s ease; }
+  .update-banner a { color:var(--muted); text-decoration:none; }
+  .update-banner a:hover { color:var(--cyan); }
+
   /* 右下角固定水印（很淡，不挡操作） */
   .watermark {
     position:fixed; right:14px; bottom:10px; z-index:5;
@@ -413,10 +435,13 @@
   </div>
   <div class="health">
     <span id="health">…</span>
-    <a id="supportChip" class="support-chip" href="https://ifdian.net/a/TTComet"
-       target="_blank" rel="noopener noreferrer">
-      <span class="heart">♥</span><span data-i18n="footer.support">支持项目</span>
-    </a>
+    <div class="health-right">
+      <button class="ghost sm" id="btnCheckUpdate" data-i18n="update.check">检查更新</button>
+      <a id="supportChip" class="support-chip" href="https://ifdian.net/a/TTComet"
+         target="_blank" rel="noopener noreferrer">
+        <span class="heart">♥</span><span data-i18n="footer.support">支持项目</span>
+      </a>
+    </div>
   </div>
 
   <!-- ============ three.js 动画区 ============ -->
@@ -814,6 +839,7 @@ function applyLang(lang) {
   loadModels(true);
   loadHealth();
   updateHeroPair(lastPair);
+  if (updateBanner) renderUpdateBanner(updateBanner);
 }
 
 document.querySelectorAll('.lang-switch button').forEach((b) => {
@@ -1615,11 +1641,158 @@ function loadHealth() {
   });
 }
 
+/* ==================== 在线更新（只查 GitHub） ==================== */
+let updateState = null;      // 最近一次 /api/update 返回
+let updateBanner = null;     // 当前 banner 描述（切换语言时用它重绘）
+let updatePollTimer = null;
+
+function _updateMsg(spec) {
+  const d = spec.data || {};
+  switch (spec.kind) {
+    case 'available': return T('update.available', { latest: d.latest, current: d.current });
+    case 'latest': return T('update.latest', { ver: d.current });
+    case 'checkFail': return T('update.fail', { msg: d.error || '-' });
+    case 'starting': return T('update.starting');
+    case 'progress': return T('update.downloading', { pct: d.pct, mb: d.mb, total: d.total });
+    case 'ready': return T('update.ready', { ver: d.version || '' });
+    case 'downloadFail': return T('update.downloadFail', { msg: d.error || '-' });
+    case 'installing': return T('update.installing');
+    case 'exiting': return T('update.exiting');
+    case 'installFail': return T('update.installFail', { msg: d.error || '-' });
+    default: return '';
+  }
+}
+
+function renderUpdateBanner(spec) {
+  updateBanner = spec;
+  const old = $('updateBanner');
+  if (!spec) { if (old) old.remove(); return; }
+
+  let el = old;
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'updateBanner';
+    el.className = 'update-banner';
+    document.body.appendChild(el);
+  }
+
+  const d = spec.data || {};
+  const actions = [];
+  if (spec.kind === 'available') {
+    actions.push(`<button class="sm" id="ubInstall">${T('update.download')}</button>`);
+    if (d.url) actions.push(`<a href="${d.url}" target="_blank" rel="noopener noreferrer">${T('update.notes')}</a>`);
+  }
+  if (spec.kind === 'ready') {
+    actions.push(`<button class="sm" id="ubInstallNow">${T('update.installNow')}</button>`);
+  }
+  if (spec.close) actions.push(`<button class="ghost sm" id="ubClose">✕</button>`);
+
+  const percent = (spec.kind === 'progress') ? (d.pct || 0) : null;
+  const bar = percent === null ? ''
+    : `<div class="bar"><i style="width:${Math.max(0, Math.min(100, percent))}%"></i></div>`;
+
+  el.innerHTML = `<span class="msg">${_updateMsg(spec)}</span>${actions.join('')}${bar}`;
+
+  const bInstall = $('ubInstall');
+  if (bInstall) bInstall.onclick = startUpdateDownload;
+  const bInstallNow = $('ubInstallNow');
+  if (bInstallNow) bInstallNow.onclick = installUpdate;
+  const bClose = $('ubClose');
+  if (bClose) bClose.onclick = () => renderUpdateBanner(null);
+
+  if (spec.autoHide) {
+    const me = spec;
+    setTimeout(() => { if (updateBanner === me) renderUpdateBanner(null); }, spec.autoHide);
+  }
+}
+
+async function checkForUpdate(force) {
+  const btn = $('btnCheckUpdate');
+  if (!btn) return;
+  btn.disabled = true;
+  btn.textContent = T('update.checking');
+  try {
+    const info = await api('/api/update' + (force ? '?force=1' : ''));
+    updateState = info;
+    if (info.has_update) {
+      renderUpdateBanner({
+        kind: 'available', close: true,
+        data: { latest: info.latest, current: info.current, url: info.url },
+      });
+    } else if (force) {
+      renderUpdateBanner(info.ok
+        ? { kind: 'latest', close: true, autoHide: 6000, data: { current: info.current } }
+        : { kind: 'checkFail', close: true, autoHide: 12000, data: { error: info.error } });
+    }
+  } catch (e) {
+    if (force) {
+      renderUpdateBanner({ kind: 'checkFail', close: true, autoHide: 12000, data: { error: e.message } });
+    }
+  } finally {
+    btn.disabled = false;
+    btn.textContent = T('update.check');
+  }
+}
+
+async function startUpdateDownload() {
+  renderUpdateBanner({ kind: 'starting', close: false });
+  try {
+    await api('/api/update/download', { method: 'POST', headers: { 'X-TTComet-Request': '1' } });
+  } catch (e) {
+    renderUpdateBanner({ kind: 'downloadFail', close: true, data: { error: e.message } });
+    return;
+  }
+  pollUpdateDownload();
+}
+
+async function pollUpdateDownload() {
+  if (updatePollTimer) { clearTimeout(updatePollTimer); updatePollTimer = null; }
+  try {
+    const st = await api('/api/update/download');
+    if (st.state === 'downloading') {
+      renderUpdateBanner({
+        kind: 'progress', close: false,
+        data: {
+          pct: Number(st.percent || 0).toFixed(1),
+          mb: ((st.downloaded || 0) / 1048576).toFixed(1),
+          total: ((st.total || 0) / 1048576).toFixed(0),
+        },
+      });
+      updatePollTimer = setTimeout(pollUpdateDownload, 700);
+    } else if (st.state === 'done') {
+      renderUpdateBanner({ kind: 'ready', close: true, data: { version: st.version } });
+    } else if (st.state === 'error') {
+      renderUpdateBanner({ kind: 'downloadFail', close: true, data: { error: st.error } });
+    }
+  } catch (e) {
+    renderUpdateBanner({ kind: 'downloadFail', close: true, data: { error: e.message } });
+  }
+}
+
+async function installUpdate() {
+  renderUpdateBanner({ kind: 'installing', close: false });
+  try {
+    await api('/api/update/install', { method: 'POST', headers: { 'X-TTComet-Request': '1' } });
+  } catch (e) {
+    renderUpdateBanner({ kind: 'installFail', close: true, data: { error: e.message } });
+    return;
+  }
+  renderUpdateBanner({ kind: 'exiting', close: false });
+  setTimeout(() => {
+    document.body.innerHTML =
+      `<div style="display:flex;height:100vh;align-items:center;justify-content:center;
+                   background:#0f1723;color:#cfd8e3;font:14px/1.9 system-ui;text-align:center">
+         <div>${T('update.exiting')}</div>
+       </div>`;
+  }, 1600);
+}
+
 /* ==================== 初始化 ==================== */
 applyLang(window.I18N.lang);
 loadModels();
 loadPresets();
 loadHealth();
+checkForUpdate(false);
 loadHistory(true);
 </script>
 <script type="module" src="/static/pingpong-scene.js"></script>

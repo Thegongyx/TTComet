@@ -111,6 +111,22 @@ webui\.venv\Scripts\python.exe webui\run_server.py
   本服务不放行 CORS，所以其它网页无法偷偷调用这个接口关掉程序
 - 也可以直接关控制台窗口（等价，但不会清理得更干净）
 
+### 在线更新
+
+启动时自动检查一次（静默，失败不提示），也可以点状态栏右侧「检查更新」手动查。
+
+- **只查询 GitHub Releases**（`TheGongyx/TTComet` 的 `/releases/latest`），Gitee 仓库不公开，不作为更新源
+- 查询成功缓存 6 小时，失败缓存 30 分钟；超时 5 秒，断网/被墙都只是静默失败，不影响出片
+- 发现新版本时状态栏下方弹出提示：**下载并安装** / 更新说明 / 关闭
+- 点「下载并安装」后后台线程下载安装包到 `%TEMP%\TTComet-update\`，前端显示百分比进度；
+  下载地址限定 GitHub 域名，若 Release 提供 `sha256` 摘要会自动校验，不匹配则删除并报错
+- 下载完成后点「立即安装」：启动安装包（`/CLOSEAPPLICATIONS /NORESTART`），本程序随即退出，
+  避免安装程序无法覆盖正在运行的文件；安装完成后重新打开即可
+- 有任务在运行时拒绝安装（409），与「退出程序」一致
+
+接口：`GET /api/update?force=1`、`POST /api/update/download`、`GET /api/update/download`、
+`POST /api/update/install`（后两个 POST 需要 `X-TTComet-Request: 1`）。
+
 ### 参数预设
 
 调好一套参数后可以存下来反复用：
@@ -184,6 +200,10 @@ webui\.venv\Scripts\python.exe webui\run_server.py
 | GET | `/api/jobs/{id}/videos/{idx}` | 单个结果视频（支持 Range） |
 | POST | `/api/jobs/{id}/cancel` | 取消 |
 | POST | `/api/shutdown` | 退出程序（需 `X-TTComet-Request: 1` 头；有任务在跑时返回 409） |
+| GET | `/api/update?force=1` | 检查 GitHub 最新版本（带缓存，失败静默） |
+| POST | `/api/update/download` | 下载新版安装包（需确认头；后台线程） |
+| GET | `/api/update/download` | 下载进度 `{state, percent, path, error}` |
+| POST | `/api/update/install` | 启动安装程序并退出本程序（需确认头；有任务时 409） |
 
 
 ## 高光逻辑一致性
