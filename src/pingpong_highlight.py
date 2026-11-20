@@ -1,8 +1,14 @@
 #!/usr/bin/env python3
 """
-pingpong_highlight.py  (优化版 v4.16 - 物理抛物线轨迹净化与平滑 + 脚本缺陷修复)
+pingpong_highlight.py  (优化版 v4.17 - 残影时长参数化)
 =====================================================================
 乒乓球比赛 → 自动特效精华集锦
+
+v4.17 在 v4.16 基础上的改动:
+  ★ 球残影 (拖尾/彗尾) 停留时长参数化:
+    - 新增 --trail-sec (秒, 默认 0.3; 旧版硬编码 0.2), <=0 表示关闭残影
+    - 帧数按 round(fps * trail_sec) 换算, 下限 4 帧保证可抛光/绘制
+    - WebUI「视觉效果」组同步提供「球残影时长（秒）」输入框
 
 v4.16 在 v4.15 基础上的改动:
   ★ 重力抛物线轨迹净化与平滑 + 多球台邻台球隔离 (消除误检折线与隔壁台串球):
@@ -211,6 +217,9 @@ def parse_args():
                    help="track↔detection 关联算法")
     p.add_argument("--fx-level", default="normal", choices=["minimal", "normal", "max"],
                    help="特效强度")
+    p.add_argument("--trail-sec", type=float, default=0.3,
+                   help="球残影 (拖尾/彗尾) 停留时长 (秒, 默认 0.3); <=0 关闭残影; "
+                        "帧数=round(fps*值), 下限 4 帧")
     p.add_argument("--no-player-fx", action="store_true", help="关闭选手移动特效 (脚下光环)")
     p.add_argument("--highlight-top-n", type=int, default=7,
                    help="前置精彩回合数量 (按平均球速降序取前 N 个, 默认 7)")
@@ -3736,8 +3745,9 @@ def render(args, segments, rally_starts_by_seg, filled_track, events, table_geo,
         flash = SpeedFlash()
         trail_renderer = SpeedTrailRenderer(intensity=fx_intensity)
         player_fx = PlayerFX(fps, out_w, out_h, intensity=fx_intensity) if enable_player_fx else None
-        # 残影 (球拖尾) 时长 ≈ 0.2s; 下限 4 帧保证可平滑/绘制
-        TRAIL_LEN = max(4, int(fps * 0.2))
+        # 残影 (球拖尾) 时长: --trail-sec (默认 0.3s); <=0 关闭残影; 下限 4 帧保证可平滑/绘制
+        trail_sec = float(getattr(args, "trail_sec", 0.3))
+        TRAIL_LEN = 0 if trail_sec <= 0 else max(4, int(round(fps * trail_sec)))
         max_trail_step = getattr(args, "max_jump_ratio", 0.10) * math.hypot(out_w, out_h) * 0.85
 
         prepend_frame_count = sum(e - ps + 1 for ps, e in (prepend_segments or []))
@@ -4060,7 +4070,7 @@ def main():
     if out_parent:
         os.makedirs(out_parent, exist_ok=True)
     log("=" * 60)
-    log("🏓 PingPong Highlight Generator (v4.16 物理抛物线净化+平滑)")
+    log("🏓 PingPong Highlight Generator (v4.17 物理抛物线净化+平滑 | 残影时长可调)")
     log("=" * 60)
     cap = cv2.VideoCapture(args.video)
     if not cap.isOpened():

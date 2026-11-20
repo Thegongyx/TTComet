@@ -62,6 +62,7 @@ _PARAM_FLAGS = {
     "no_highlight_prepend": "--no-highlight-prepend",
     # 特效
     "fx_level": "--fx-level",
+    "trail_sec": "--trail-sec",
     "no_player_fx": "--no-player-fx",
 }
 

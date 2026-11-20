@@ -300,6 +300,10 @@
       // ---- 视觉 ----
       'p.fx_level.label': '特效强度',
       'p.fx_level.note': '极简最省性能（关闭部分叠加效果）；最强特效最丰富但渲染更慢',
+      'p.trail_sec.label': '球残影时长（秒）',
+      'p.trail_sec.up': '调高：彗尾拉得更长，高速球轨迹看得更清楚，但画面更花',
+      'p.trail_sec.dn': '调低：残影更短更干净；设为 0 关闭残影',
+      'p.trail_sec.note': '默认 0.3 秒（旧版固定 0.2）；实际帧数按 fps 四舍五入，至少 4 帧',
       'p.no_player_fx.label': '关闭球员脚下光环',
       'p.no_player_fx.note': '勾选：画面更干净、渲染略快，也不再需要球员检测结果',
 
@@ -590,6 +594,10 @@
 
       'p.fx_level.label': 'Effect intensity',
       'p.fx_level.note': 'Minimal is the cheapest (drops some overlays); Maximum is the richest but slowest to render',
+      'p.trail_sec.label': 'Ball trail duration (s)',
+      'p.trail_sec.up': 'Higher: longer comet tail, high-speed shots are easier to follow but the frame looks busier',
+      'p.trail_sec.dn': 'Lower: shorter and cleaner trail; 0 disables the trail',
+      'p.trail_sec.note': 'Default 0.3s (was hard-coded 0.2s); frames = round(fps * value), minimum 4',
       'p.no_player_fx.label': 'Disable player glow',
       'p.no_player_fx.note': 'Checked: cleaner image, slightly faster render, player detections no longer needed',
 
