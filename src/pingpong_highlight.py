@@ -1,8 +1,28 @@
 #!/usr/bin/env python3
 """
-pingpong_highlight.py  (优化版 v4.15 - 残影更透明更细)
+pingpong_highlight.py  (优化版 v4.16 - 物理抛物线轨迹净化与平滑 + 脚本缺陷修复)
 =====================================================================
 乒乓球比赛 → 自动特效精华集锦
+
+v4.16 在 v4.15 基础上的改动:
+  ★ 重力抛物线轨迹净化与平滑 (消除误检造成的残影折线):
+    - 物理重力标定 (estimate_gravity_px_per_frame2): 由球台透视四角反推中台比例尺与俯仰角,
+      结合实测干净弧段中位数自动标定像素重力加速度 g_frame (px/帧²)。
+    - 关联与主轨迹合并升级 (build_main_ball_track): 多点速度+重力预测、运动学方向代价惩罚、
+      短回合台内包含度保留 (overlap_self>=0.5)、按得分时序排他合并 (杜绝多条重叠轨迹逐帧交替跳变)。
+    - 多轮物理抛物线离群点剔除 (clean_ball_track_parabolic): 先裁首尾误检折钩, 再用双侧支撑
+      (各≥2点) Leave-Block-Out 抛物线桥接剔除 1~3 帧空中误检尖刺, 100% 保护真实台面弹跳与球拍击球顶点。
+    - 分段自由飞行抛物线平滑 + 弹跳缺口解析补帧 (interpolate_track):
+      在击球/弹跳断点及跨事件缺口处切分自由飞行子弧, 段内做带重力上下界约束的抛物线平滑消除检测框抖动;
+      缺口补帧限制重力上界防过冲跑飞, 支持缺口内单次台面弹跳的双段抛物线闭式重建, 拒绝跨击球反向缺口硬连直线。
+    - 渲染拖尾断续保护 (render): 修复缺口期间 trail 残留最后 1 个幽灵点导致跨屏拉直线的 bug,
+      帧号不连续或跨段时自动清空旧残影。
+  ★ 脚本层面其他问题修复:
+    - 修复侧拍梯形球台 extract_table_geometry 长边对角扭曲(沙漏化)及 build_corridor 顶部开放导致右侧走廊坍缩的问题
+    - 修复 detect_bounce_events 击球判定误限桌面 quad (改为走廊区域)、跨长缺口伪落点/伪击球及 1 帧过短弹跳冷却的问题
+    - 修复渲染在分段剪辑切换时粒子/文字/闪屏残留串场、前置集锦无进度输出及未启用特效列表内存泄漏
+    - load_detections 支持 .jsonl.gz 透明读取并裁剪无用字段省内存, 主流程提取后及时释放 frames
+    - 修复静止球过滤固定窗口边界漏检、回合回退分支缺 duration 字段、Windows 超长音频滤镜命令行上限等问题
 
 v4.15 在 v4.14 基础上的改动:
   ★ 残影 (球拖尾) 透明度与粗细整体 ×0.77:
@@ -83,6 +103,7 @@ out-of-table-timeout 默认放宽至 2.0s。
 
 import os
 import sys
+import gzip
 import json
 import math
 import shutil
@@ -192,11 +213,13 @@ def parse_args():
                    help="前置精彩回合的最小合并前时长 (秒, 默认 6.0)")
     p.add_argument("--highlight-min-bounce-count", type=int, default=4,
                    help="前置精彩回合的落点条件: 落点较少半台的落点数 > 该值"
-                        " (与时长条件取或, 满足任一即可入选, 默认 5)")
+                        " (与时长条件取或, 满足任一即可入选, 默认 4)")
     p.add_argument("--highlight-black-gap", type=float, default=1.0,
                    help="前置精彩回合与全顺序视频之间的黑幕间隔 (秒, 默认 1.0)")
     p.add_argument("--no-highlight-prepend", action="store_true",
                    help="关闭前置精彩回合功能 (只输出全顺序视频)")
+    p.add_argument("--no-track-smooth", action="store_true",
+                   help="关闭分段重力抛物线平滑 (仅保留离群误检剔除与弹道补帧, 排查对比用)")
     p.add_argument("--debug", action="store_true", help="输出调试信息")
     return p.parse_args()
 
@@ -322,9 +345,16 @@ def _enc_args(enc):
 # =====================================================================
 #  1) 读取日志
 # =====================================================================
+def _open_text_maybe_gz(path):
+    if str(path).lower().endswith(".gz"):
+        return gzip.open(path, "rt", encoding="utf-8", errors="replace")
+    return open(path, "r", encoding="utf-8", errors="replace")
+
+
 def load_detections(path):
     frames = {}
-    with open(path, "r", encoding="utf-8") as f:
+    keep_classes = {"pingpangball", "table", "net"} | set(_PLAYER_CLASS_NAMES)
+    with _open_text_maybe_gz(path) as f:
         for line in f:
             line = line.strip()
             if not line:
@@ -336,7 +366,21 @@ def load_detections(path):
             fidx = obj.get("frame")
             if fidx is None:
                 continue
-            frames[fidx] = obj
+            raw_dets = obj.get("detections") or []
+            slim_dets = []
+            for d in raw_dets:
+                cls_name = str(d.get("class", ""))
+                if cls_name not in keep_classes and cls_name.lower() not in _PLAYER_CLASS_NAMES:
+                    continue
+                item = {
+                    "class": cls_name,
+                    "confidence": float(d.get("confidence", 0.0)),
+                    "bbox": d.get("bbox"),
+                }
+                if cls_name in ("table", "net") and d.get("polygon"):
+                    item["polygon"] = d["polygon"]
+                slim_dets.append(item)
+            frames[int(fidx)] = {"frame": int(fidx), "detections": slim_dets}
     if not frames:
         raise RuntimeError("raw_detections.jsonl 为空或无法解析")
     return [frames[k] for k in sorted(frames.keys())]
@@ -740,18 +784,28 @@ def build_corridor(far_left, far_right, near_left, near_right,
     # 飞出走廊上边界的场景; 射线几乎水平时退化为直接钳 Y, 避免除零
     top_y = -10.0
     if open_top:
-        for near_pt, far_pt in ((near_left_ext, far_left_ext),
-                                (near_right_ext, far_right_ext)):
-            d = far_pt - near_pt
-            if abs(d[1]) < 1e-6:
-                far_pt[1] = top_y          # 射线几乎水平 → 直接钳 Y
+        u_long = _unit(ul + ur)
+        # 纵拍/端线视角 (far 显著在 near 上方): 沿左右两条斜边射线向上延伸到 y=top_y
+        if u_long[1] < -0.5:
+            for near_pt, far_pt in ((near_left_ext, far_left_ext),
+                                    (near_right_ext, far_right_ext)):
+                d = far_pt - near_pt
+                if d[1] < -1e-6:
+                    t = (top_y - near_pt[1]) / d[1]
+                    if t > 0:
+                        far_pt[0] = near_pt[0] + d[0] * t
+                        far_pt[1] = top_y
+        else:
+            # 横拍/侧视或平视角 (near/far 分处左右两端): 将走廊上侧长边的两个端点抬至 y=top_y,
+            # 保留下侧长边在球台下方以继续拦截地面误检, 避免误把右侧上下角同时钳到 y=-10 造成走廊坍缩成斜楔形
+            mean_y_left = 0.5 * (near_left_ext[1] + far_left_ext[1])
+            mean_y_right = 0.5 * (near_right_ext[1] + far_right_ext[1])
+            if mean_y_left <= mean_y_right:
+                near_left_ext[1] = min(near_left_ext[1], top_y)
+                far_left_ext[1] = min(far_left_ext[1], top_y)
             else:
-                t = (top_y - near_pt[1]) / d[1]
-                if t > 0:
-                    far_pt[0] = near_pt[0] + d[0] * t
-                    far_pt[1] = top_y      # 沿射线求与 y=top_y 的交点
-                else:
-                    far_pt[1] = top_y      # 射线朝下 (几何异常) → 兜底钳 Y
+                near_right_ext[1] = min(near_right_ext[1], top_y)
+                far_right_ext[1] = min(far_right_ext[1], top_y)
     corridor = np.array([far_left_ext, far_right_ext, near_right_ext, near_left_ext],
                         dtype=np.float32)
     if debug:
@@ -874,8 +928,16 @@ def extract_table_geometry(frames, img_hw, debug=False, persp_blend=0.0,
         elif debug:
             log("  ⚠️ 球网仍与相邻边相交, 回退到角度法判定端边")
     if not found_end_edges:
-        edge_info.sort(key=lambda x: x[2])
-        near_a, near_b, far_a, far_b = _pick_near_far(edge_info[:2])
+        # 端边必为四边形的一组对边 (0,2) 或 (1,3), 严禁按单边排序选出相邻两条边!
+        if nd is not None:
+            ang_02 = 0.5 * (edge_info[0][2] + edge_info[2][2])
+            ang_13 = 0.5 * (edge_info[1][2] + edge_info[3][2])
+            pair_idx = (0, 2) if ang_02 <= ang_13 else (1, 3)
+        else:
+            len_02 = 0.5 * (edge_info[0][1] + edge_info[2][1])
+            len_13 = 0.5 * (edge_info[1][1] + edge_info[3][1])
+            pair_idx = (0, 2) if len_02 <= len_13 else (1, 3)
+        near_a, near_b, far_a, far_b = _pick_near_far([edge_info[pair_idx[0]], edge_info[pair_idx[1]]])
 
     if far_a[0] > far_b[0]:
         far_left, far_right = far_b, far_a
@@ -885,6 +947,9 @@ def extract_table_geometry(frames, img_hw, debug=False, persp_blend=0.0,
         near_left, near_right = near_b, near_a
     else:
         near_left, near_right = near_a, near_b
+    # 防止平视侧拍梯形球台因左右短边反向倾斜导致独立按 x 排序把两条长边扭成对角线沙漏(bowtie)
+    if _segments_intersect(far_left, near_left, far_right, near_right):
+        near_left, near_right = near_right, near_left
 
     if persp_blend > 0:
         near_width = float(near_right[0] - near_left[0])
@@ -1041,9 +1106,11 @@ def filter_static_ball_candidates(ball_cands, fps, frame_w, frame_h,
                                   min_static_count=10, debug=False):
     if not ball_cands:
         return ball_cands
-    window_frames = 600
+    window_frames = max(300, int(round(fps * 15.0)))
+    step_frames = max(150, window_frames // 2)
     img_diag = math.hypot(frame_w, frame_h)
-    static_threshold = max(img_diag * 0.0008, 2.0)
+    # 兼容 FP16 / 缩放还原后静止假球 2~4px 的检测框中心微抖
+    static_threshold = max(img_diag * 0.002, 3.5)
     cell = max(static_threshold, 1.0)
     flat = []
     for fidx, cands in ball_cands:
@@ -1052,15 +1119,16 @@ def filter_static_ball_candidates(ball_cands, fps, frame_w, frame_h,
     if not flat:
         return ball_cands
     flat.sort(key=lambda x: x[0])
+    flat_frames = [r[0] for r in flat]
     removed_set = set()
-    n, idx = len(flat), 0
-    while idx < n:
-        anchor_f = flat[idx][0]
-        win_end = anchor_f + window_frames
-        win = []
-        while idx < n and flat[idx][0] <= win_end:
-            win.append(flat[idx])
-            idx += 1
+    min_f, max_f = flat_frames[0], flat_frames[-1]
+    win_start = min_f
+    while win_start <= max_f:
+        win_end = win_start + window_frames
+        lo = bisect.bisect_left(flat_frames, win_start)
+        hi = bisect.bisect_right(flat_frames, win_end)
+        win = flat[lo:hi]
+        win_start += step_frames
         if len(win) < min_static_count:
             continue
         grid = defaultdict(list)
@@ -1068,7 +1136,7 @@ def filter_static_ball_candidates(ball_cands, fps, frame_w, frame_h,
             _f, _d, cx, cy = rec
             grid[(int(cx / cell), int(cy / cell))].append(rec)
         handled = set()
-        for (gx, gy), bucket in grid.items():
+        for (gx, gy), _bucket in grid.items():
             if (gx, gy) in handled:
                 continue
             neigh = []
@@ -1082,10 +1150,13 @@ def filter_static_ball_candidates(ball_cands, fps, frame_w, frame_h,
             mcx, mcy = float(np.median(cxs)), float(np.median(cys))
             d = np.hypot(cxs - mcx, cys - mcy)
             close = [neigh[i] for i in range(len(neigh)) if d[i] <= static_threshold]
-            if len(close) >= min_static_count:
+            distinct_frames = {r[0] for r in close}
+            if len(distinct_frames) >= min_static_count:
                 for _f, _d, _cx, _cy in close:
                     removed_set.add((_f, _d))
                 handled.add((gx, gy))
+        if win_end >= max_f:
+            break
     if not removed_set:
         return ball_cands
     filtered = []
@@ -1093,7 +1164,7 @@ def filter_static_ball_candidates(ball_cands, fps, frame_w, frame_h,
         remaining = [det for di, det in enumerate(cands) if (fidx, di) not in removed_set]
         filtered.append((fidx, remaining))
     if debug:
-        log(f"  ★ 静止球过滤(网格哈希): 剔除 {len(removed_set)} 个静止球坐标")
+        log(f"  ★ 静止球过滤(滑动窗口网格哈希): 剔除 {len(removed_set)} 个静止球坐标")
     return filtered
 
 
@@ -1197,26 +1268,157 @@ def cluster_ball_by_court(ball_cands, frame_w, frame_h, debug=False):
     return filtered
 
 
-def _greedy_match(active, cands, used, preds, tols):
-    for i, tr in enumerate(active):
-        px, py = preds[i]
-        best_j, best_d = -1, 1e18
-        for j, (cx, cy, _c, _b) in enumerate(cands):
-            if used[j]:
+def estimate_gravity_px_per_frame2(table_geo, track_dict, fps, frame_w, frame_h, debug=False):
+    """结合球台透视几何与干净轨迹弧段标定图像竖直向下重力加速度 g_frame (px/帧²)。"""
+    diag = math.hypot(frame_w, frame_h)
+    fps_sq = max(float(fps) * float(fps), 1.0)
+    if table_geo is not None and table_geo.get("near_left") is not None:
+        fl = np.asarray(table_geo["far_left"], dtype=np.float64)
+        fr = np.asarray(table_geo["far_right"], dtype=np.float64)
+        nl = np.asarray(table_geo["near_left"], dtype=np.float64)
+        nr = np.asarray(table_geo["near_right"], dtype=np.float64)
+        ew = 0.5 * ((nr - nl) + (fr - fl))
+        el = 0.5 * ((nl - fl) + (nr - fr))
+        px = float(ew[0]) / TABLE_WID_M
+        qx = float(el[0]) / TABLE_LEN_M
+        s_horiz = math.hypot(px, qx)
+        s_edge = max(float(np.linalg.norm(ew)) / TABLE_WID_M,
+                     float(np.linalg.norm(el)) / TABLE_LEN_M)
+        s_px_m = _clamp(max(s_horiz, s_edge), diag * 0.05, diag * 0.65)
+        py = float(ew[1]) / TABLE_WID_M
+        qy = float(el[1]) / TABLE_LEN_M
+        sin_pitch = _clamp(math.hypot(py, qy) / (s_px_m + 1e-6), 0.0, 0.80)
+        cos_pitch = math.sqrt(max(0.12, 1.0 - sin_pitch * sin_pitch))
+        g_geo = 9.81 * s_px_m * cos_pitch / fps_sq
+    else:
+        s_px_m = diag * 0.16
+        g_geo = 9.81 * s_px_m * 0.92 / fps_sq
+
+    g_geo = _clamp(g_geo, 0.04, max(0.5, diag * 0.025))
+
+    # 从实测单向无弹跳弧段中提取中位数重力做自适应校准
+    a_samples = []
+    if isinstance(track_dict, dict) and len(track_dict) >= 10:
+        keys = sorted(track_dict.keys())
+        runs, cur = [], [keys[0]]
+        for k in keys[1:]:
+            if k - cur[-1] <= 2:
+                cur.append(k)
+            else:
+                if len(cur) >= 6:
+                    runs.append(cur)
+                cur = [k]
+        if len(cur) >= 6:
+            runs.append(cur)
+
+        win = max(6, min(12, int(round(fps * 0.20))))
+        step = max(3, win // 2)
+        rms_lim = max(4.5, diag * 0.0035)
+        for r in runs:
+            if len(r) < win:
                 continue
-            d = math.hypot(cx - px, cy - py)
-            if d < best_d:
-                best_d, best_j = d, j
-        if best_j >= 0 and best_d < tols[i]:
-            cx, cy, conf, b = cands[best_j]
-            tr["pts"].append((fidx_of := active[i]["pts"][-1][0], cx, cy, conf, b))  # placeholder
-    # note: replaced below by explicit frame passing
+            rf = np.array(r, dtype=np.float64)
+            rx = np.array([track_dict[k][0] for k in r], dtype=np.float64)
+            ry = np.array([track_dict[k][1] for k in r], dtype=np.float64)
+            for s in range(0, len(r) - win + 1, step):
+                wf = rf[s:s + win]
+                wx = rx[s:s + win]
+                wy = ry[s:s + win]
+                dx = np.diff(wx)
+                if not ((dx > 0.5).all() or (dx < -0.5).all()):
+                    continue
+                # 排除窗口内部含台面弹跳极值点
+                dy = np.diff(wy)
+                if any(dy[j] > 1.0 and dy[j + 1] < -1.0 for j in range(len(dy) - 1)):
+                    continue
+                tau = wf - wf.mean()
+                try:
+                    coef = np.polyfit(tau, wy, 2)
+                except Exception:
+                    continue
+                a_emp = 2.0 * float(coef[0])
+                rms = float(np.sqrt(np.mean((wy - np.polyval(coef, tau)) ** 2)))
+                if rms <= rms_lim and (0.18 * g_geo <= a_emp <= 3.0 * g_geo):
+                    a_samples.append(a_emp)
+
+    if len(a_samples) >= 3:
+        med_a = float(np.median(a_samples))
+        g_final = (0.4 * g_geo + 0.6 * med_a) if table_geo is not None else med_a
+    else:
+        g_final = g_geo
+
+    g_final = _clamp(g_final, 0.04, max(0.5, diag * 0.025))
+    if debug:
+        emp_note = (f", 实测弧段样本={len(a_samples)} 中位={float(np.median(a_samples)):.3f}"
+                    if len(a_samples) >= 3 else f", 实测样本不足({len(a_samples)})")
+        log(f"  ◆ 重力标定: 比例尺≈{s_px_m:.0f}px/m, 几何g={g_geo:.3f}px/帧²"
+            f"{emp_note} → 采用 g={g_final:.3f}px/帧²")
+    return g_final, s_px_m
+
+
+def _fit_constrained_parabola(fs, xs, ys, weights=None,
+                              ay_min=0.0, ay_max=5.0, ax_max=2.0):
+    """闭式加权有界抛物线拟合:
+        x(τ) = cx + vx·τ + ½·ax·τ²,  ax ∈ [-ax_max, +ax_max]
+        y(τ) = cy + vy·τ + ½·ay·τ²,  ay ∈ [ay_min,  ay_max]
+    目标函数关于 (a, v, c) 严格凸二次: 无约束最优越界时, 精确全局约束最优必落在边界!
+    返回 dict(t0, ax, vx, cx, ay, vy, cy)。
+    """
+    fs = np.asarray(fs, dtype=np.float64)
+    xs = np.asarray(xs, dtype=np.float64)
+    ys = np.asarray(ys, dtype=np.float64)
+    t0 = float(fs.mean())
+    tau = fs - t0
+    sw = np.sqrt(np.clip(weights, 1e-4, None)) if weights is not None else None
+
+    def _solve_1d(vals, a_lo, a_hi):
+        if len(tau) >= 3 and float(np.ptp(tau)) >= 1.8:
+            M = np.column_stack([0.5 * tau * tau, tau, np.ones_like(tau)])
+            try:
+                if sw is not None:
+                    theta, *_ = np.linalg.lstsq(M * sw[:, None], vals * sw, rcond=None)
+                else:
+                    theta, *_ = np.linalg.lstsq(M, vals, rcond=None)
+                a_hat, v_hat, c_hat = float(theta[0]), float(theta[1]), float(theta[2])
+                if a_lo <= a_hat <= a_hi and math.isfinite(a_hat):
+                    return a_hat, v_hat, c_hat
+                a_c = _clamp(a_hat if math.isfinite(a_hat) else 0.0, a_lo, a_hi)
+            except Exception:
+                a_c = _clamp(0.0, a_lo, a_hi)
+        else:
+            a_c = _clamp(0.5 * (a_lo + a_hi) if a_lo > 0 else 0.0, a_lo, a_hi)
+
+        rem = vals - 0.5 * a_c * tau * tau
+        if len(tau) >= 2 and float(np.ptp(tau)) >= 0.5:
+            M2 = np.column_stack([tau, np.ones_like(tau)])
+            try:
+                if sw is not None:
+                    th2, *_ = np.linalg.lstsq(M2 * sw[:, None], rem * sw, rcond=None)
+                else:
+                    th2, *_ = np.linalg.lstsq(M2, rem, rcond=None)
+                return a_c, float(th2[0]), float(th2[1])
+            except Exception:
+                pass
+        return a_c, 0.0, float(np.mean(rem))
+
+    ax, vx, cx = _solve_1d(xs, -abs(ax_max), abs(ax_max))
+    ay, vy, cy = _solve_1d(ys, ay_min, ay_max)
+    return {"t0": t0, "ax": ax, "vx": vx, "cx": cx, "ay": ay, "vy": vy, "cy": cy}
+
+
+def _eval_parabola(model, f_eval):
+    dt = np.asarray(f_eval, dtype=np.float64) - model["t0"]
+    xh = model["cx"] + model["vx"] * dt + 0.5 * model["ax"] * dt * dt
+    yh = model["cy"] + model["vy"] * dt + 0.5 * model["ay"] * dt * dt
+    return xh, yh
 
 
 def build_main_ball_track(ball_cands, fps, frame_w, frame_h, table_geo=None, debug=False,
                           max_jump_ratio=0.05, match_algo="auto"):
-    max_jump = max_jump_ratio * math.hypot(frame_w, frame_h)
+    diag = math.hypot(frame_w, frame_h)
+    max_jump = max_jump_ratio * diag
     max_gap_frames = max(1, int(fps * 0.5))
+    g_prior, _ = estimate_gravity_px_per_frame2(table_geo, None, fps, frame_w, frame_h, debug=False)
     tracks = []
     algo = (match_algo or "auto").lower()
     if algo == "hungarian" and not _HAS_SCIPY_LSA:
@@ -1230,28 +1432,61 @@ def build_main_ball_track(ball_cands, fps, frame_w, frame_h, table_geo=None, deb
 
     def predict(track, fidx):
         pts = track["pts"]
+        f1, x1, y1 = pts[-1][0], pts[-1][1], pts[-1][2]
         if len(pts) == 1:
-            return pts[-1][1], pts[-1][2]
-        (f0, x0, y0, *_), (f1, x1, y1, *_) = pts[-2], pts[-1]
-        df = max(1, f1 - f0)
-        vx, vy = (x1 - x0) / df, (y1 - y0) / df
+            return x1, y1, None, None
+        f0, x0, y0 = pts[-2][0], pts[-2][1], pts[-2][2]
+        df1 = max(1, f1 - f0)
+        # 弦速度对应区间中点时刻, 加上 ½·g·df1 还原 f1 时刻瞬时竖直速度
+        vx = (x1 - x0) / df1
+        vy = (y1 - y0) / df1 + 0.5 * g_prior * df1
+        if len(pts) >= 3:
+            fp, xp, yp = pts[-3][0], pts[-3][1], pts[-3][2]
+            df0 = max(1, f0 - fp)
+            vx0 = (x0 - xp) / df0
+            vy0_at_f1 = (y0 - yp) / df0 + g_prior * (0.5 * df0 + df1)
+            # 同向且未发生台面弹跳翻转时, 融合前一步速度抑制单帧检测框抖动
+            if vx0 * vx > 0 and not (vy0_at_f1 > 1.5 and vy < -1.0) and df0 <= 4 and df1 <= 4:
+                vx = 0.65 * vx + 0.35 * vx0
+                vy = 0.65 * vy + 0.35 * vy0_at_f1
         dt = fidx - f1
-        decay = 0.85 ** max(0, dt - 1)
-        return x1 + vx * dt * decay, y1 + vy * dt * decay
+        decay = 0.88 ** max(0, dt - 1)
+        dt_eff = dt * decay
+        px = x1 + vx * dt_eff
+        py = y1 + vy * dt_eff + 0.5 * g_prior * dt_eff * dt_eff
+        return px, py, vx, vy
+
+    def assoc_cost(tr, pred_info, tol, gap, cx, cy):
+        px, py, vx, _vy = pred_info
+        x1, y1 = tr["pts"][-1][1], tr["pts"][-1][2]
+        # 限制跨缺口的绝对位移上限, 防止速度外推在长缺口上瞬移抓到远端噪点
+        d_last = math.hypot(cx - x1, cy - y1)
+        max_abs_jump = max_jump * (1.0 + 0.35 * min(gap - 1, 4))
+        if d_last > max_abs_jump:
+            return None
+        d_pred = math.hypot(cx - px, cy - py)
+        if d_pred >= tol:
+            return None
+        cost_val = d_pred
+        # 已建立明确横向速度时, 对反向跳变施加软惩罚(同帧有真球时优先选顺向抛物线点, 无真球时仍允许真实击球折返)
+        if vx is not None and abs(vx) > 3.0:
+            dx = cx - x1
+            if dx * vx < 0 and abs(dx) > 8.0:
+                cost_val += 0.30 * abs(dx)
+        return cost_val
 
     _BIG = 1e9
 
-    def greedy_assign(fidx, active, cands, used, preds, tols):
+    def greedy_assign(fidx, active, cands, used, preds, tols, gaps):
         for i, tr in enumerate(active):
-            px, py = preds[i]
-            best_j, best_d = -1, 1e18
+            best_j, best_c = -1, _BIG
             for j, (cx, cy, _c, _b) in enumerate(cands):
                 if used[j]:
                     continue
-                d = math.hypot(cx - px, cy - py)
-                if d < best_d:
-                    best_d, best_j = d, j
-            if best_j >= 0 and best_d < tols[i]:
+                cval = assoc_cost(tr, preds[i], tols[i], gaps[i], cx, cy)
+                if cval is not None and cval < best_c:
+                    best_c, best_j = cval, j
+            if best_j >= 0:
                 cx, cy, conf, b = cands[best_j]
                 tr["pts"].append((fidx, cx, cy, conf, b))
                 used[best_j] = True
@@ -1260,21 +1495,24 @@ def build_main_ball_track(ball_cands, fps, frame_w, frame_h, table_geo=None, deb
         used = [False] * len(cands)
         active = [tr for tr in tracks if 0 < (fidx - tr["pts"][-1][0]) <= max_gap_frames]
         if active and cands:
-            preds, tols = [], []
+            preds, tols, gaps = [], [], []
             for tr in active:
                 gap = fidx - tr["pts"][-1][0]
                 preds.append(predict(tr, fidx))
-                tols.append(max_jump * (1 + 0.1 * (gap - 1)))
+                if len(tr["pts"]) == 1 and gap > 2:
+                    tols.append(max_jump * 0.75)
+                else:
+                    tols.append(max_jump * (1.0 + 0.08 * (gap - 1)))
+                gaps.append(gap)
             done = False
             if algo == "hungarian":
                 n_a, n_c = len(active), len(cands)
                 cost = np.full((n_a, n_c), _BIG, dtype=np.float64)
-                for i, (px, py) in enumerate(preds):
-                    ti = tols[i]
+                for i, tr in enumerate(active):
                     for j, (cx, cy, _c, _b) in enumerate(cands):
-                        d = math.hypot(cx - px, cy - py)
-                        if d < ti:
-                            cost[i, j] = d
+                        cval = assoc_cost(tr, preds[i], tols[i], gaps[i], cx, cy)
+                        if cval is not None:
+                            cost[i, j] = cval
                 try:
                     row_ind, col_ind = _linear_sum_assignment(cost)
                 except Exception as e:
@@ -1289,7 +1527,7 @@ def build_main_ball_track(ball_cands, fps, frame_w, frame_h, table_geo=None, deb
                         used[j] = True
                     done = True
             if not done:
-                greedy_assign(fidx, active, cands, used, preds, tols)
+                greedy_assign(fidx, active, cands, used, preds, tols, gaps)
         for j, (cx, cy, conf, b) in enumerate(cands):
             if not used[j]:
                 tracks.append({"pts": [(fidx, cx, cy, conf, b)]})
@@ -1345,36 +1583,331 @@ def build_main_ball_track(ball_cands, fps, frame_w, frame_h, table_geo=None, deb
             if ix_min < ix_max and iy_min < iy_max:
                 inter_area = (ix_max - ix_min) * (iy_max - iy_min)
                 iou = inter_area / (anchor_area + tr_area - inter_area)
-                if iou >= 0.15:
+                overlap_self = inter_area / tr_area
+                # 同时保留完全落在主台域内的短快球轨迹 (overlap_self>=0.5), 避免被大包络框稀释 IoU 误删
+                if iou >= 0.15 or overlap_self >= 0.50:
                     filtered.append(tr)
         tracks = filtered
         if debug:
-            log(f"  空间共域投票: {n_before_filter} → {len(tracks)} 条轨迹 (IoU≥0.15)")
+            log(f"  空间共域投票: {n_before_filter} → {len(tracks)} 条轨迹 (IoU≥0.15 或 台域包含≥0.50)")
 
+    # 时序排他合并: 按轨迹得分由高到低认领时间区间, 禁止并发误检轨迹与主球轨迹逐帧交替穿插造成折线
     score_min = 6.0
     main, n_used = {}, 0
+    claimed_spans = []  # [(start_f, end_f), ...]
+
+    def _in_claimed(f, margin=1):
+        for s_f, e_f in claimed_spans:
+            if (s_f - margin) <= f <= (e_f + margin):
+                return True
+        return False
+
     for tr in tracks:
         if score(tr) < score_min:
             continue
+        free_pts = [p for p in tr["pts"] if not _in_claimed(p[0], margin=1)]
+        if len(free_pts) < 3:
+            continue
+        # 若被已认领区间截断成多段, 仅保留点数 >= 3 的有效子段
+        sub_runs, cur_sub = [], [free_pts[0]]
+        for p in free_pts[1:]:
+            if p[0] - cur_sub[-1][0] <= max_gap_frames:
+                cur_sub.append(p)
+            else:
+                if len(cur_sub) >= 3:
+                    sub_runs.append(cur_sub)
+                cur_sub = [p]
+        if len(cur_sub) >= 3:
+            sub_runs.append(cur_sub)
+        if not sub_runs:
+            continue
         n_used += 1
-        for (fidx, x, y, conf, b) in tr["pts"]:
-            if fidx not in main or conf > main[fidx][2]:
+        for sub in sub_runs:
+            # 校验与紧邻已采用点的边界跳变是否物理相容, 不相容则裁掉边界冲突帧留出干净缺口
+            while len(sub) >= 3:
+                f_head, x_head, y_head = sub[0][0], sub[0][1], sub[0][2]
+                conflict = False
+                for df_chk in range(1, max_gap_frames + 1):
+                    prev_pt = main.get(f_head - df_chk)
+                    if prev_pt is not None:
+                        lim = max_jump * (1.0 + 0.12 * (df_chk - 1))
+                        if math.hypot(x_head - prev_pt[0], y_head - prev_pt[1]) > lim:
+                            conflict = True
+                        break
+                if conflict and df_chk <= int(fps * 0.3):
+                    sub.pop(0)
+                else:
+                    break
+            while len(sub) >= 3:
+                f_tail, x_tail, y_tail = sub[-1][0], sub[-1][1], sub[-1][2]
+                conflict = False
+                for df_chk in range(1, max_gap_frames + 1):
+                    next_pt = main.get(f_tail + df_chk)
+                    if next_pt is not None:
+                        lim = max_jump * (1.0 + 0.12 * (df_chk - 1))
+                        if math.hypot(next_pt[0] - x_tail, next_pt[1] - y_tail) > lim:
+                            conflict = True
+                        break
+                if conflict and df_chk <= int(fps * 0.3):
+                    sub.pop()
+                else:
+                    break
+            if len(sub) < 3:
+                continue
+            claimed_spans.append((sub[0][0], sub[-1][0]))
+            for (fidx, x, y, conf, b) in sub:
                 main[fidx] = (x, y, conf, b)
+
     if debug:
         log(f"  候选轨迹数={n_before_filter}, 采用={n_used}, 去重后点数={len(main)}")
     return main
 
 
 # =====================================================================
-#  4) 补帧
+#  3b) 物理抛物线离群误检净化
 # =====================================================================
-def _local_diff_velocity(frames, vals, idx, direction, span=3):
-    """用 idx 一侧 (含 idx, 且与 idx **帧号连续**) 最多 span 个点做中值差分, 返回 px/帧。
+def clean_ball_track_parabolic(main_track, fps, frame_w, frame_h, g_frame,
+                               table_geo=None, max_jump_ratio=0.10, debug=False):
+    """剔除主轨迹中破坏重力抛物线的误检折线点 (1~3 帧离群尖刺、双反转折角、首尾误检折钩)。
 
-    direction=-1 取缺口左侧 (idx 及之前), direction=+1 取缺口右侧 (idx 及之后)。
-    只使用连续帧, 避免把"另一个缺口两端"的位移当成速度; 取多个一阶差分的中值以
-    抑制单帧检测抖动。点不足 2 个返回 None。
+    核心判据 (Leave-Block-Out 抛物线桥接检验):
+      对可疑块 B (长度 1~3 帧), 取其前后紧邻支撑点集 P_pre ∪ P_post 拟合带重力约束的抛物线。
+      - 若 P_pre ∪ P_post 自身高度吻合同一条自由飞行抛物线 (残差 <= tol_support),
+        而 B 中各点显著偏离该抛物线 (残差 > tol_outlier), 则 B 必为空中误检 (如球拍/白鞋/球网高光)!
+      - 真实台面弹跳 (下降转上升, 需强反重力才能单弧拟合) 与真实击球折返 (vx 反向)
+        均无法用单条重力抛物线同时拟合 P_pre ∪ P_post, 因此真实弹跳/击球顶点 100% 免疫误删!
     """
+    if not main_track or len(main_track) < 3:
+        return dict(main_track) if main_track else {}
+
+    diag = math.hypot(frame_w, frame_h)
+    max_assoc_gap = max(2, int(round(fps * 0.50)))
+    short_gap = max(4, int(round(fps * 0.20)))
+    bridge_max_gap = max(6, int(round(fps * 0.35)))
+    tol_support = max(10.0, diag * 0.007)
+    tol_outlier = max(18.0, diag * 0.013)
+    tol_dx_rev = max(9.0, diag * 0.006)
+    quad = table_geo.get("quad") if table_geo else None
+
+    def _near_table(x, y, margin_px):
+        if quad is None:
+            return True
+        return cv2.pointPolygonTest(quad.reshape(-1, 1, 2),
+                                    (float(x), float(y)), True) >= -margin_px
+
+    keys = sorted(main_track.keys())
+    raw_segs, cur = [], [keys[0]]
+    for k in keys[1:]:
+        if k - cur[-1] <= max_assoc_gap:
+            cur.append(k)
+        else:
+            raw_segs.append(cur)
+            cur = [k]
+    raw_segs.append(cur)
+
+    cleaned = {}
+    n_removed_bridge = 0
+    n_removed_end = 0
+    n_removed_orphan = 0
+
+    for seg in raw_segs:
+        cur_seg = list(seg)
+        # 多轮迭代: 先裁首尾孤立折钩, 再用双侧(各≥2点)抛物线桥接摘除段内 1~3 帧误检块
+        for _pass in range(3):
+            changed = False
+            # A) 首尾孤立折钩裁剪 (例如球被遮挡后首/尾单帧抓到球员白鞋/护腕/球拍)
+            for _end_pass in range(2):
+                m = len(cur_seg)
+                if m < 5:
+                    break
+                fs = np.array(cur_seg, dtype=np.float64)
+                xs = np.array([main_track[k][0] for k in cur_seg], dtype=np.float64)
+                ys = np.array([main_track[k][1] for k in cur_seg], dtype=np.float64)
+                cs = np.array([main_track[k][2] for k in cur_seg], dtype=np.float64)
+                dropped_end = False
+
+                # 检查末端点 m - 1
+                if fs[-2] - fs[-5] <= bridge_max_gap:
+                    sup = slice(m - 5, m - 1)
+                    model = _fit_constrained_parabola(
+                        fs[sup], xs[sup], ys[sup], weights=np.clip(cs[sup], 0.25, 1.0) ** 2,
+                        ay_min=-0.25 * g_frame, ay_max=3.2 * g_frame, ax_max=0.85 * g_frame)
+                    sxh, syh = _eval_parabola(model, fs[sup])
+                    if float(np.max(np.hypot(xs[sup] - sxh, ys[sup] - syh))) <= tol_support:
+                        px_t, py_t = _eval_parabola(model, fs[-1])
+                        dt_t = max(1.0, float(fs[-1] - fs[-2]))
+                        err_t = math.hypot(float(xs[-1] - px_t), float(ys[-1] - py_t))
+                        vx_end = model["vx"] + model["ax"] * (float(fs[-2]) - model["t0"])
+                        dx_last = float(xs[-1] - xs[-2])
+                        dy_dev = float(ys[-1] - py_t)
+                        lim_t = max(24.0, diag * 0.017) * (1.0 + 0.15 * (dt_t - 1.0))
+                        is_rev = (dx_last * vx_end < 0 and abs(dx_last) > tol_dx_rev)
+                        is_dive = (dy_dev > max(22.0, diag * 0.015))
+                        is_sky_jump = (dy_dev < -max(32.0, diag * 0.022)
+                                       and not _near_table(xs[-2], ys[-2], max(45.0, diag * 0.03)))
+                        if err_t > lim_t and (is_rev or is_dive or is_sky_jump):
+                            cur_seg.pop()
+                            n_removed_end += 1
+                            dropped_end = True
+                            changed = True
+
+                # 检查首端点 0
+                m = len(cur_seg)
+                if m >= 5:
+                    fs = np.array(cur_seg, dtype=np.float64)
+                    if fs[4] - fs[1] <= bridge_max_gap:
+                        sup = slice(1, 5)
+                        xs = np.array([main_track[k][0] for k in cur_seg], dtype=np.float64)
+                        ys = np.array([main_track[k][1] for k in cur_seg], dtype=np.float64)
+                        cs = np.array([main_track[k][2] for k in cur_seg], dtype=np.float64)
+                        model = _fit_constrained_parabola(
+                            fs[sup], xs[sup], ys[sup], weights=np.clip(cs[sup], 0.25, 1.0) ** 2,
+                            ay_min=-0.25 * g_frame, ay_max=3.2 * g_frame, ax_max=0.85 * g_frame)
+                        sxh, syh = _eval_parabola(model, fs[sup])
+                        if float(np.max(np.hypot(xs[sup] - sxh, ys[sup] - syh))) <= tol_support:
+                            px_h, py_h = _eval_parabola(model, fs[0])
+                            dt_h = max(1.0, float(fs[1] - fs[0]))
+                            err_h = math.hypot(float(xs[0] - px_h), float(ys[0] - py_h))
+                            vx_beg = model["vx"] + model["ax"] * (float(fs[1]) - model["t0"])
+                            dx_first = float(xs[1] - xs[0])
+                            dy_dev = float(ys[0] - py_h)
+                            lim_h = max(24.0, diag * 0.017) * (1.0 + 0.15 * (dt_h - 1.0))
+                            is_rev = (dx_first * vx_beg < 0 and abs(dx_first) > tol_dx_rev)
+                            is_dive = (dy_dev > max(22.0, diag * 0.015))
+                            is_sky_jump = (dy_dev < -max(32.0, diag * 0.022)
+                                           and not _near_table(xs[1], ys[1], max(45.0, diag * 0.03)))
+                            if err_h > lim_h and (is_rev or is_dive or is_sky_jump):
+                                cur_seg.pop(0)
+                                n_removed_end += 1
+                                dropped_end = True
+                                changed = True
+
+                if not dropped_end:
+                    break
+
+            # B) 段内 Leave-Block-Out 双侧支撑抛物线桥接检验 (严格要求左右两侧各 ≥2 个支撑点)
+            m = len(cur_seg)
+            if m < 5:
+                break
+            fs = np.array(cur_seg, dtype=np.float64)
+            xs = np.array([main_track[k][0] for k in cur_seg], dtype=np.float64)
+            ys = np.array([main_track[k][1] for k in cur_seg], dtype=np.float64)
+            cs = np.array([main_track[k][2] for k in cur_seg], dtype=np.float64)
+
+            candidates = []  # (score, start_idx, end_idx_excl)
+            for w in (1, 2, 3):
+                if m < w + 4:
+                    continue
+                for i in range(2, m - w - 1):
+                    # 收集左侧紧邻支撑点 (2~4 个)
+                    if fs[i] - fs[i - 1] > bridge_max_gap:
+                        continue
+                    pre_idx = [i - 1]
+                    j = i - 1
+                    while len(pre_idx) < 4 and j - 1 >= 0:
+                        if fs[j] - fs[j - 1] > short_gap:
+                            break
+                        j -= 1
+                        pre_idx.append(j)
+                    if len(pre_idx) < 2:
+                        continue
+                    pre_idx.reverse()
+
+                    # 收集右侧紧邻支撑点 (2~4 个)
+                    r0 = i + w
+                    if fs[r0] - fs[i + w - 1] > bridge_max_gap:
+                        continue
+                    if fs[r0] - fs[pre_idx[-1]] > bridge_max_gap + 2:
+                        continue
+                    post_idx = [r0]
+                    j = r0
+                    while len(post_idx) < 4 and j + 1 < m:
+                        if fs[j + 1] - fs[j] > short_gap:
+                            break
+                        j += 1
+                        post_idx.append(j)
+                    if len(post_idx) < 2:
+                        continue
+
+                    sup_idx = pre_idx + post_idx
+                    sf = fs[sup_idx]
+                    sx = xs[sup_idx]
+                    sy = ys[sup_idx]
+                    sw = np.clip(cs[sup_idx], 0.25, 1.0) ** 2
+                    model = _fit_constrained_parabola(
+                        sf, sx, sy, weights=sw,
+                        ay_min=-0.25 * g_frame, ay_max=3.2 * g_frame,
+                        ax_max=0.85 * g_frame)
+                    sxh, syh = _eval_parabola(model, sf)
+                    err_s = np.hypot(sx - sxh, sy - syh)
+                    sup_max = float(err_s.max())
+                    sup_rms = float(np.sqrt(np.mean(err_s ** 2)))
+                    if sup_max > tol_support:
+                        continue
+
+                    blk_slice = slice(i, i + w)
+                    bxh, byh = _eval_parabola(model, fs[blk_slice])
+                    err_b = np.hypot(xs[blk_slice] - bxh, ys[blk_slice] - byh)
+                    eff_tol = tol_outlier
+                    if w == 1:
+                        dx1 = xs[i] - xs[i - 1]
+                        dx2 = xs[i + 1] - xs[i]
+                        if dx1 * dx2 < 0 and abs(xs[i] - bxh[0]) > tol_dx_rev:
+                            eff_tol = max(12.0, tol_outlier * 0.72)
+                    thresh = max(eff_tol, 3.0 * sup_rms)
+                    if float(err_b.min()) > thresh:
+                        sc = float(err_b.mean()) / (sup_max + 2.0)
+                        candidates.append((sc, i, i + w))
+
+            if candidates:
+                candidates.sort(key=lambda item: item[0], reverse=True)
+                to_drop = set()
+                locked = set()
+                for _sc, bi, bj in candidates:
+                    if any(k in locked for k in range(max(0, bi - 1), min(m, bj + 1))):
+                        continue
+                    for k in range(bi, bj):
+                        to_drop.add(k)
+                    for k in range(max(0, bi - 2), min(m, bj + 2)):
+                        locked.add(k)
+                if to_drop:
+                    n_removed_bridge += len(to_drop)
+                    cur_seg = [cur_seg[k] for k in range(m) if k not in to_drop]
+                    changed = True
+
+            if not changed:
+                break
+
+        # 再次按短缺口切分, 剔除长度 < 3 的孤立残片
+        if len(cur_seg) < 3:
+            n_removed_orphan += len(cur_seg)
+            continue
+        sub_segs, sub_cur = [], [cur_seg[0]]
+        for k in cur_seg[1:]:
+            if k - sub_cur[-1] <= max_assoc_gap:
+                sub_cur.append(k)
+            else:
+                sub_segs.append(sub_cur)
+                sub_cur = [k]
+        sub_segs.append(sub_cur)
+        for ss in sub_segs:
+            if len(ss) < 3:
+                n_removed_orphan += len(ss)
+                continue
+            for k in ss:
+                cleaned[k] = main_track[k]
+
+    if debug:
+        log(f"  ★ 抛物线离群净化: {len(main_track)} → {len(cleaned)} 帧 "
+            f"(剔除桥接尖刺 {n_removed_bridge}, 首尾折钩 {n_removed_end}, 孤立残片 {n_removed_orphan})")
+    return cleaned
+
+
+# =====================================================================
+#  4) 分段自由飞行抛物线平滑 + 物理弹道补帧
+# =====================================================================
+def _local_diff_velocity(frames, vals, idx, direction, span=3, max_step=2):
+    """用 idx 一侧 (含 idx, 相邻间隔 <= max_step) 最多 span 个点做中值差分, 返回 px/帧。"""
     n = len(frames)
     js = [idx]
     j = idx
@@ -1382,7 +1915,7 @@ def _local_diff_velocity(frames, vals, idx, direction, span=3):
         j += direction
         if not (0 <= j < n):
             break
-        if abs(frames[js[-1]] - frames[j]) != 1:   # 跨缺口 → 不再向外扩
+        if abs(frames[js[-1]] - frames[j]) > max_step:
             break
         js.append(j)
     js.sort()
@@ -1396,60 +1929,243 @@ def _local_diff_velocity(frames, vals, idx, direction, span=3):
     return float(np.median(dv)) if dv else None
 
 
-def _ballistic_fill_gap(seg_f, seg_x, seg_y, i, frame_w, frame_h):
-    """缺口 (seg_f[i], seg_f[i+1]) 的内部插值点: x 走弦, y 走端点钉死的弹道抛物线。
+def _detect_arc_breakpoints(seg_f, seg_x, seg_y, g_frame, diag):
+    """在连续检测段内识别物理接触断点 (击球折返 'hit' / 台面弹跳 'bounce')。
+    返回 {idx: 'hit' | 'bounce'}。
+    """
+    m = len(seg_f)
+    if m < 3:
+        return {}
+    raw_bps = []  # (idx, kind, strength)
+    dvx_thresh = max(9.0, diag * 0.007)
+    dvy_thresh = max(2.5, 1.6 * g_frame)
+    for i in range(1, m - 1):
+        vx_l = _local_diff_velocity(seg_f, seg_x, i, -1, span=3, max_step=3)
+        vx_r = _local_diff_velocity(seg_f, seg_x, i, +1, span=3, max_step=3)
+        vy_l = _local_diff_velocity(seg_f, seg_y, i, -1, span=3, max_step=3)
+        vy_r = _local_diff_velocity(seg_f, seg_y, i, +1, span=3, max_step=3)
 
-    模型 (图像坐标 y 向下, 重力使 a > 0):
-        x(τ) = x0 + (x1 - x0)·τ/D                    静止机位下 x(t) 本就近似线性
-        y(τ) = y0 + v0'·τ + ½·a·τ²
-    其中加速度 a 由缺口两侧实测速度分别反解后取均值:
-        a_v = 2·(y1 - y0 - v·D) / D²        (由"初速 v 且必须过 y1"反解)
-    再由 a 反解等效初速, 保证曲线**严格过两端点**:
-        v0' = (y1 - y0 - ½·a·D²) / D
+        if vx_l is not None and vx_r is not None:
+            if (vx_l * vx_r < 0 and (abs(vx_l) > 1.5 or abs(vx_r) > 1.5)) or abs(vx_r - vx_l) > dvx_thresh:
+                raw_bps.append((i, "hit", abs(vx_r - vx_l)))
+                continue
 
-    这样补出的点: ① 过真实检测点 → 缺口边界无台阶; ② 两端切线速度与实测一致 →
-    无折角; ③ 只在窗口内取值 → 不存在多项式那样的窗口外过冲/跑飞。
-    退化保护: 两侧都取不到速度 / a 非有限 / a <= 0 (反重力) → 该缺口 y 退回线性弦。
+        if vy_l is not None and vy_r is not None:
+            is_y_peak = (seg_y[i] >= seg_y[i - 1] - 1.5 and seg_y[i] >= seg_y[i + 1] - 1.5)
+            if is_y_peak and vy_l > 0.8 and vy_r < -0.8 and (vy_r - vy_l) < -dvy_thresh:
+                raw_bps.append((i, "bounce", abs(vy_r - vy_l)))
 
-    返回 (pts, mode): pts 为 [[x, y], ...] 对应帧 seg_f[i]+1 ... seg_f[i+1]-1,
-    mode ∈ {"ballistic", "chord"}。
+    # 合并相邻 1 帧内的重复极值点, 取强度最大者
+    bps = {}
+    for idx, kind, strength in raw_bps:
+        if (idx - 1) in bps:
+            prev_kind, prev_str = bps[idx - 1]
+            if strength > prev_str:
+                del bps[idx - 1]
+                bps[idx] = (kind, strength)
+        else:
+            bps[idx] = (kind, strength)
+    return {k: v[0] for k, v in bps.items()}
+
+
+def _smooth_segment_parabolic(seg_f, seg_x, seg_y, seg_c, bps, g_frame, fps, frame_w, frame_h):
+    """在接触断点切分出的每一段自由飞行弧内执行带重力约束的抛物线平滑, 并严格钉住弹跳/击球顶点。"""
+    m = len(seg_f)
+    if m < 3:
+        return seg_x.copy(), seg_y.copy()
+
+    diag = math.hypot(frame_w, frame_h)
+    sx = seg_x.copy()
+    sy = seg_y.copy()
+    # 构建自由飞行子弧区间列表 [(b0, b1), ...]:
+    #   - 显式接触断点 idx 处左右两侧共享顶点: (..., idx) 与 (idx, ...)
+    #   - 若缺口 (i, i+1) 内部发生了弹跳(下降→上升)或击球折返(vx 变号), 则从缺口两侧断开为 (..., i) 与 (i+1, ...),
+    #     严禁跨弹跳/跨击球缺口强行拟合单条抛物线把两侧真实速度抹平!
+    gap_splits = set()
+    for i in range(m - 1):
+        if seg_f[i + 1] - seg_f[i] >= 2:
+            vx0 = _local_diff_velocity(seg_f, seg_x, i, -1, span=3, max_step=2)
+            vx1 = _local_diff_velocity(seg_f, seg_x, i + 1, +1, span=3, max_step=2)
+            vy0 = _local_diff_velocity(seg_f, seg_y, i, -1, span=3, max_step=2)
+            vy1 = _local_diff_velocity(seg_f, seg_y, i + 1, +1, span=3, max_step=2)
+            if (vx0 is not None and vx1 is not None and vx0 * vx1 < 0
+                    and (abs(vx0) > 1.5 or abs(vx1) > 1.5)):
+                gap_splits.add(i)
+            elif vy0 is not None and vy1 is not None and vy0 > 1.0 and vy1 < -1.0:
+                gap_splits.add(i)
+
+    arc_ranges = []
+    cur_start = 0
+    for i in range(m - 1):
+        if i in bps and i > cur_start:
+            arc_ranges.append((cur_start, i))
+            cur_start = i
+        if i in gap_splits:
+            if i >= cur_start:
+                arc_ranges.append((cur_start, i))
+            cur_start = i + 1
+    if (m - 1) >= cur_start:
+        arc_ranges.append((cur_start, m - 1))
+
+    max_single_span = max(8, int(round(fps * 0.38)))
+    hw_frames = max(4.0, fps * 0.16)
+    max_dev_allow = max(20.0, diag * 0.014)
+
+    for b0, b1 in arc_ranges:
+        if b1 - b0 < 2:
+            continue
+        af = seg_f[b0:b1 + 1]
+        ax_in = seg_x[b0:b1 + 1]
+        ay_in = seg_y[b0:b1 + 1]
+        aw = np.clip(seg_c[b0:b1 + 1], 0.25, 1.0) ** 2
+        if b0 in bps or (b0 - 1) in gap_splits:
+            aw[0] *= 4.0
+        if b1 in bps or b1 in gap_splits:
+            aw[-1] *= 4.0
+
+        span_f = float(af[-1] - af[0])
+        use_local = (span_f > max_single_span)
+        if not use_local:
+            model = _fit_constrained_parabola(
+                af, ax_in, ay_in, weights=aw,
+                ay_min=-0.18 * g_frame, ay_max=3.0 * g_frame, ax_max=0.75 * g_frame)
+            xh, yh = _eval_parabola(model, af)
+            if float(np.max(np.hypot(ax_in - xh, ay_in - yh))) <= max_dev_allow:
+                sx[b0:b1 + 1] = xh
+                sy[b0:b1 + 1] = yh
+            else:
+                use_local = True
+
+        if use_local:
+            for k in range(len(af)):
+                dt = np.abs(af - af[k])
+                mask = dt <= hw_frames
+                if int(mask.sum()) < 3:
+                    order = np.argsort(dt)[:min(5, len(af))]
+                    mask = np.zeros(len(af), dtype=bool)
+                    mask[order] = True
+                u = np.clip(dt[mask] / ( float(dt[mask].max()) + 1.0 ), 0.0, 0.999)
+                tricube = (1.0 - u ** 3) ** 3
+                wk = aw[mask] * tricube
+                model = _fit_constrained_parabola(
+                    af[mask], ax_in[mask], ay_in[mask], weights=wk,
+                    ay_min=-0.18 * g_frame, ay_max=3.0 * g_frame, ax_max=0.75 * g_frame)
+                xk, yk = _eval_parabola(model, af[k])
+                if math.hypot(float(ax_in[k] - xk), float(ay_in[k] - yk)) <= max_dev_allow:
+                    sx[b0 + k] = float(xk)
+                    sy[b0 + k] = float(yk)
+
+    # 钉住真实接触断点, 确保台面弹跳极值不被削平而漏触发落点事件
+    for idx, kind in bps.items():
+        sx[idx] = seg_x[idx]
+        sy[idx] = seg_y[idx]
+        if kind == "bounce" and 0 < idx < m - 1:
+            floor_y = max(sy[idx - 1], sy[idx + 1]) + 0.25
+            if sy[idx] < floor_y:
+                sy[idx] = max(seg_y[idx], floor_y)
+
+    sx = np.clip(sx, 0.0, frame_w - 1.0)
+    sy = np.clip(sy, 0.0, frame_h - 1.0)
+    return sx, sy
+
+
+def _ballistic_fill_gap(seg_f, seg_x, seg_y, i, frame_w, frame_h,
+                        g_frame=0.5, table_geo=None, bps=None):
+    """缺口 (seg_f[i], seg_f[i+1]) 的物理弹道插值:
+      1) 跨击球反向缺口 (D>=3 且两侧 vx 异号): 拒绝用直线硬连以免产生跨空折线, 返回空列表留白。
+      2) 缺口内含单次台面弹跳 (左侧下降 vy0>0、右侧上升 vy1<0): 闭式求解精确弹跳时刻 τ_b,
+         拼接落地前/弹起后两段重力抛物线 (消除旧版弹跳缺口退化为悬空水平弦的问题)。
+      3) 常规自由飞行缺口: x 走弦, y 走端点钉死且重力加速度有界的抛物线
+         a ∈ [0.20·g_frame, 2.8·g_frame] (无实测速度时采用标定重力 g_frame), 彻底杜绝反重力直弦与失控过冲。
+    返回 (pts, mode): mode ∈ {"ballistic", "bounce_2arc", "skipped"}。
     """
     f0, f1 = int(seg_f[i]), int(seg_f[i + 1])
     x0, y0 = float(seg_x[i]), float(seg_y[i])
     x1, y1 = float(seg_x[i + 1]), float(seg_y[i + 1])
     D = float(f1 - f0)
-    if D <= 0:
-        return [], "chord"
+    if D <= 1:
+        return [], "skipped"
 
-    v0 = _local_diff_velocity(seg_f, seg_y, i, -1)
-    v1 = _local_diff_velocity(seg_f, seg_y, i + 1, +1)
+    bps = bps or {}
+    # 若 i 是断点, 左侧不再跨越 i 向前取速度; 若 i+1 是断点, 右侧同理
+    vx0 = None if i in bps else _local_diff_velocity(seg_f, seg_x, i, -1, span=3, max_step=2)
+    vx1 = None if (i + 1) in bps else _local_diff_velocity(seg_f, seg_x, i + 1, +1, span=3, max_step=2)
+    vy0 = None if i in bps else _local_diff_velocity(seg_f, seg_y, i, -1, span=3, max_step=2)
+    vy1 = None if (i + 1) in bps else _local_diff_velocity(seg_f, seg_y, i + 1, +1, span=3, max_step=2)
+
+    # 1) 缺口内发生球拍击球横向折返: D>=3 时不硬连斜弦
+    if D >= 3:
+        dx_gap = x1 - x0
+        if vx0 is not None and vx1 is not None and vx0 * vx1 < 0 and (abs(vx0) > 2.0 or abs(vx1) > 2.0):
+            return [], "skipped"
+        if vx0 is not None and abs(vx0) > 4.0 and dx_gap * vx0 < 0 and abs(dx_gap) > 10.0:
+            return [], "skipped"
+        if vx1 is not None and abs(vx1) > 4.0 and dx_gap * vx1 < 0 and abs(dx_gap) > 10.0:
+            return [], "skipped"
+
+    # 2) 缺口内含单次台面弹跳 (下降 -> 弹起): 双段重力抛物线闭式重建
+    if vy0 is not None and vy1 is not None and vy0 > 1.5 and vy1 < -1.5:
+        denom = vy0 - vy1 + g_frame * D
+        if denom > 1e-6:
+            tau_b = ((y1 - y0) - vy1 * D + 0.5 * g_frame * D * D) / denom
+            if 0.4 <= tau_b <= (D - 0.4):
+                xb = x0 + (x1 - x0) * (tau_b / D)
+                yb = y0 + vy0 * tau_b + 0.5 * g_frame * tau_b * tau_b
+                quad = table_geo.get("quad") if table_geo else None
+                diag = math.hypot(frame_w, frame_h)
+                near_tbl = (True if quad is None else
+                            cv2.pointPolygonTest(quad.reshape(-1, 1, 2),
+                                                 (float(xb), float(yb)), True) >= -max(60.0, diag * 0.04))
+                if yb > max(y0, y1) and yb < frame_h and near_tbl:
+                    vy0_in = (yb - y0 - 0.5 * g_frame * tau_b * tau_b) / tau_b
+                    d2 = D - tau_b
+                    vy_out = (y1 - yb - 0.5 * g_frame * d2 * d2) / d2
+                    pts = []
+                    for f in range(f0 + 1, f1):
+                        t = float(f - f0)
+                        xi = x0 + (x1 - x0) * (t / D)
+                        if t <= tau_b:
+                            yi = y0 + vy0_in * t + 0.5 * g_frame * t * t
+                        else:
+                            u = t - tau_b
+                            yi = yb + vy_out * u + 0.5 * g_frame * u * u
+                        pts.append([_clamp(xi, 0, frame_w - 1), _clamp(yi, 0, frame_h - 1)])
+                    return pts, "bounce_2arc"
+        if D >= 4:
+            return [], "skipped"
+
+    # 3) 常规同弧自由飞行缺口: 端点钉死 + 有界物理重力
     a_cands = []
-    if v0 is not None:
-        a_cands.append(2.0 * (y1 - y0 - v0 * D) / (D * D))
-    if v1 is not None:
-        a_cands.append(2.0 * (y0 - y1 + v1 * D) / (D * D))
-    a = (sum(a_cands) / len(a_cands)) if a_cands else 0.0
-
-    mode = "ballistic"
-    if not math.isfinite(a) or a <= 0.0:
-        mode, a = "chord", 0.0      # 反重力/无速度 → 退化为直线
-    vy0 = (y1 - y0 - 0.5 * a * D * D) / D
+    if vy0 is not None:
+        a_cands.append(2.0 * (y1 - y0 - vy0 * D) / (D * D))
+    if vy1 is not None:
+        a_cands.append(2.0 * (y0 - y1 + vy1 * D) / (D * D))
+    if a_cands:
+        a_raw = sum(a_cands) / len(a_cands)
+        a = _clamp(a_raw if math.isfinite(a_raw) else g_frame, 0.20 * g_frame, 2.8 * g_frame)
+    else:
+        a = g_frame
+    vy0_eff = (y1 - y0 - 0.5 * a * D * D) / D
 
     pts = []
     for f in range(f0 + 1, f1):
-        t = f - f0
+        t = float(f - f0)
         xi = x0 + (x1 - x0) * t / D
-        yi = y0 + vy0 * t + 0.5 * a * t * t
+        yi = y0 + vy0_eff * t + 0.5 * a * t * t
         pts.append([_clamp(xi, 0, frame_w - 1), _clamp(yi, 0, frame_h - 1)])
-    return pts, mode
+    return pts, "ballistic"
 
 
-def interpolate_track(main_track, fps, frame_w, frame_h, debug=False):
+def interpolate_track(main_track, fps, frame_w, frame_h, debug=False,
+                      table_geo=None, g_frame=None, smooth=True):
     if not main_track:
         return {}
+    if g_frame is None:
+        g_frame, _ = estimate_gravity_px_per_frame2(
+            table_geo, main_track, fps, frame_w, frame_h, debug=False)
+    diag = math.hypot(frame_w, frame_h)
     keys = sorted(main_track.keys())
     # 补帧视野: 只补 ≤0.3s 的缺口; 更长的缺口物理上无法可靠恢复, 直接留空
-    # (注意: 关联阶段的 max_gap_frames 仍是 0.5s, 在 build_main_ball_track 内, 不受此处影响)
     max_gap = max(1, int(fps * 0.3))
     segments = []
     cur = [keys[0]]
@@ -1460,29 +2176,48 @@ def interpolate_track(main_track, fps, frame_w, frame_h, debug=False):
             segments.append(cur)
             cur = [k]
     segments.append(cur)
-    filled = {k: (main_track[k][0], main_track[k][1], False) for k in keys}
-    n_ballistic = n_chord = 0
+
+    filled = {}
+    n_ballistic = n_bounce = n_skipped = 0
     for seg in segments:
-        if len(seg) < 2:
+        if len(seg) == 1:
+            k = seg[0]
+            filled[k] = (float(main_track[k][0]), float(main_track[k][1]), False)
             continue
         seg_f = np.array(seg, dtype=np.float64)
         seg_x = np.array([main_track[k][0] for k in seg], dtype=np.float64)
         seg_y = np.array([main_track[k][1] for k in seg], dtype=np.float64)
+        seg_c = np.array([main_track[k][2] if len(main_track[k]) > 2 else 0.8 for k in seg],
+                         dtype=np.float64)
+
+        bps = _detect_arc_breakpoints(seg_f, seg_x, seg_y, g_frame, diag)
+        if smooth:
+            seg_x, seg_y = _smooth_segment_parabolic(
+                seg_f, seg_x, seg_y, seg_c, bps, g_frame, fps, frame_w, frame_h)
+
+        for idx_k, k in enumerate(seg):
+            filled[k] = (float(seg_x[idx_k]), float(seg_y[idx_k]), False)
+
         for i in range(len(seg) - 1):
             gs, ge = seg[i], seg[i + 1]
             if ge - gs <= 1:
                 continue
-            pts, mode = _ballistic_fill_gap(seg_f, seg_x, seg_y, i, frame_w, frame_h)
+            pts, mode = _ballistic_fill_gap(
+                seg_f, seg_x, seg_y, i, frame_w, frame_h,
+                g_frame=g_frame, table_geo=table_geo, bps=bps)
             if mode == "ballistic":
                 n_ballistic += 1
+            elif mode == "bounce_2arc":
+                n_bounce += 1
             else:
-                n_chord += 1
+                n_skipped += 1
+                continue
             for k, (xi, yi) in zip(range(gs + 1, ge), pts):
                 filled[k] = (xi, yi, True)
     if debug:
         n_interp = sum(1 for v in filled.values() if v[2])
-        log(f"  补帧(端点钉死弹道): 原始 {len(main_track)} 帧 -> 填充后 {len(filled)} 帧 "
-            f"(插值 {n_interp}; 缺口 {n_ballistic} 个走弹道, {n_chord} 个退化为弦)")
+        log(f"  补帧+分段抛物线平滑(smooth={smooth}): 原始 {len(main_track)} 帧 -> 填充后 {len(filled)} 帧 "
+            f"(插值 {n_interp}; 弹道缺口 {n_ballistic}, 弹跳双弧缺口 {n_bounce}, 跨反向留白 {n_skipped})")
     return filled
 
 
@@ -1535,7 +2270,10 @@ def compute_ball_speed_table(filled_track, table_geo, fps, frame_w, frame_h):
                     d_mm = math.hypot(t1[0] - t0[0], t1[1] - t0[1])
                     dt = df / fps
                     if dt > 0:
-                        kmh = (d_mm / 1000.0) / dt * 3.6
+                        raw_kmh = (d_mm / 1000.0) / dt * 3.6
+                        # 抑制高抛球经台面单应性透视放大产生的极端虚高球速
+                        if 0.0 < raw_kmh <= 165.0:
+                            kmh = raw_kmh
         table[f] = {"px_s": px_s, "kmh": kmh, "norm": norm}
     return table, (p50, p95)
 
@@ -1560,23 +2298,53 @@ def _finalize_rally(rally_periods, current_rally, end_reason, rally_min_duration
     return True
 
 
-def _get_net_center_x(raw_log_path):
-    table_x = None
-    with open(raw_log_path, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                det = json.loads(line)
-            except Exception:
-                continue
+def _get_net_center_x(frames_or_path):
+    """稳健获取球网(兜底球台)水平中心坐标: 支持直接传入已加载的 frames 列表或日志路径(.jsonl/.gz)。"""
+    net_xs = []
+    table_xs = []
+    if isinstance(frames_or_path, list):
+        sample = frames_or_path[::max(1, len(frames_or_path) // 200)]
+        for det in sample:
             for d in det.get("detections", []):
-                if d.get("class") == "net" and len(d.get("bbox", [])) == 4:
-                    return (d["bbox"][0] + d["bbox"][2]) / 2.0
-                if table_x is None and d.get("class") == "table" and len(d.get("bbox", [])) == 4:
-                    table_x = (d["bbox"][0] + d["bbox"][2]) / 2.0
-    return table_x
+                if d.get("confidence", 0.0) < 0.45:
+                    continue
+                b = d.get("bbox")
+                if not b or len(b) != 4:
+                    continue
+                cls = d.get("class")
+                if cls == "net":
+                    net_xs.append((b[0] + b[2]) * 0.5)
+                elif cls == "table":
+                    table_xs.append((b[0] + b[2]) * 0.5)
+    elif frames_or_path and os.path.exists(str(frames_or_path)):
+        with _open_text_maybe_gz(frames_or_path) as f:
+            for li, line in enumerate(f):
+                if li % 10 != 0:
+                    continue
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    det = json.loads(line)
+                except Exception:
+                    continue
+                for d in det.get("detections", []):
+                    if d.get("confidence", 0.0) < 0.45:
+                        continue
+                    b = d.get("bbox")
+                    if not b or len(b) != 4:
+                        continue
+                    if d.get("class") == "net":
+                        net_xs.append((b[0] + b[2]) * 0.5)
+                    elif d.get("class") == "table":
+                        table_xs.append((b[0] + b[2]) * 0.5)
+                if len(net_xs) >= 50:
+                    break
+    if net_xs:
+        return float(np.median(net_xs))
+    if table_xs:
+        return float(np.median(table_xs))
+    return None
 
 
 def _estimate_slow_speed_threshold(ball_lookup, fps):
@@ -1641,6 +2409,7 @@ def detect_bounce_events(filled_track, table_geo, fps, table_edge_tol=30.0):
         return events, {}
     has_geo = table_geo is not None
     quad = table_geo.get("quad") if has_geo else None
+    corridor = table_geo.get("corridor") if has_geo else None
     _TX_MAX = TABLE_WID_M * 1000
     _TY_MAX = TABLE_LEN_M * 1000
     _SURFACE_TOL = 80
@@ -1655,6 +2424,12 @@ def detect_bounce_events(filled_track, table_geo, fps, table_edge_tol=30.0):
         # 测距模式: 点在四边形外但距边界 ≤ _TABLE_EDGE_TOL 像素也算通过
         return cv2.pointPolygonTest(quad.reshape(-1, 1, 2),
                                     (float(x), float(y)), True) >= -_TABLE_EDGE_TOL
+
+    def _in_hit_zone(x, y):
+        # 选手常在端线外/台面斜上方挥拍击球, 击球判定应使用走廊区域而非仅限桌面四边形 quad
+        if corridor is not None:
+            return _point_in_corridor((x, y), corridor)
+        return _in_table(x, y)
 
     def _on_table_surface(txy):
         tx, ty = txy
@@ -1678,17 +2453,23 @@ def detect_bounce_events(filled_track, table_geo, fps, table_edge_tol=30.0):
         dt = (k1 - k0) / fps
         if dt <= 0:
             return None
-        return (d_mm / 1000.0) / dt * 3.6
+        v_kmh = (d_mm / 1000.0) / dt * 3.6
+        return v_kmh if 0.0 < v_kmh <= 165.0 else None
 
     bounce_halves = {}
     last_bounce_frame = -10 ** 9
-    bounce_cooldown_frames = max(1, int(round(fps * 0.01)))
+    # 物理上乒乓球不可能在 <0.12s 内于台面弹跳两次; 避免弹跳峰值轻微平顶在 2 帧内重复计点误触 three_same_half
+    bounce_cooldown_frames = max(3, int(round(fps * 0.12)))
+    max_adj_gap = max(2, int(round(fps * 0.08)))
     last_ok_frame = None    # 最近一次已采纳落点帧号 (严格或宽松)
     last_ok_half = None     # 其半台
     for i in range(1, n - 1):
         f, x, y, is_interp = pts[i]
         f_p, x_p, y_p, _ = pts[i - 1]
         f_n, x_n, y_n, _ = pts[i + 1]
+        # 禁止跨未补帧长缺口(如两回合间隔数秒)做局部极值与变号差分, 防止回合首尾产生伪落点/伪击球
+        if (f - f_p) > max_adj_gap or (f_n - f) > max_adj_gap:
+            continue
         ev_type = None
         is_local_y_max = (y >= pts[i - 1][2] and y >= pts[i + 1][2])
         vy_prev, vy_next = y - y_p, y_n - y
@@ -1729,7 +2510,7 @@ def detect_bounce_events(filled_track, table_geo, fps, table_edge_tol=30.0):
         if ev_type is None:
             vx_prev, vx_next = x - x_p, x_n - x
             if vx_prev * vx_next < 0 and abs(vx_prev) > 2.0 and abs(vx_next) > 2.0:
-                if _in_table(x, y):
+                if _in_hit_zone(x, y):
                     ev_type = "hit"
                     spd = speed_kmh(f_p, f_n, pts[i - 1], pts[i + 1])
                     txy = img_to_table(table_geo, (x, y)) if has_geo else None
@@ -1743,13 +2524,14 @@ def detect_rallies(filled_track, fps, total_frames, raw_log_path, table_geo=None
                    rally_lost_timeout=1.0, rally_min_duration=0.6, pre_roll_sec=1.0,
                    slow_speed_window_sec=1.0, slow_speed_min_in_play_sec=0.8,
                    out_of_table_timeout=1.0, no_bounce_timeout=2.0,
-                   bounce_halves=None, debug=False):
+                   bounce_halves=None, net_center_x_hint=None, debug=False):
     if not filled_track or fps <= 0:
         return []
     ball_lookup = {f: ((x, y), not interp) for f, (x, y, interp) in filled_track.items()}
     sorted_frames = sorted(ball_lookup.keys())
     net_line = table_geo.get("net_line") if table_geo else None
-    net_center_x = _get_net_center_x(raw_log_path) if net_line is None else None
+    net_center_x = (net_center_x_hint if net_center_x_hint is not None
+                    else (_get_net_center_x(raw_log_path) if net_line is None else None))
     if net_line is None and net_center_x is None and not bounce_halves:
         log("  ⚠️ 无球网且无落点信息, 回退到连续性切分")
         keys = sorted_frames
@@ -1760,9 +2542,19 @@ def detect_rallies(filled_track, fps, total_frames, raw_log_path, table_geo=None
             if k - cur[-1] <= max_gap:
                 cur.append(k)
             else:
-                rallies.append({"start_frame": cur[0], "end_frame": cur[-1]})
+                rallies.append({
+                    "start_frame": cur[0],
+                    "end_frame": cur[-1],
+                    "duration": round((cur[-1] - cur[0]) / fps, 2),
+                    "ended_reason": "gap_split",
+                })
                 cur = [k]
-        rallies.append({"start_frame": cur[0], "end_frame": cur[-1]})
+        rallies.append({
+            "start_frame": cur[0],
+            "end_frame": cur[-1],
+            "duration": round((cur[-1] - cur[0]) / fps, 2),
+            "ended_reason": "gap_split",
+        })
         return rallies
     slow_thresh = _estimate_slow_speed_threshold(ball_lookup, fps)
     corridor = table_geo.get("corridor") if table_geo else None
@@ -2489,7 +3281,8 @@ class PlayerFX:
         self.fps = fps
         self.diag = math.hypot(frame_w, frame_h)
         self.intensity = intensity
-        self.fast_thresh = self.diag * 0.012
+        # 按帧率归一化单帧位移阈值, 保证 30fps / 60fps / 120fps 光环响应一致
+        self.fast_thresh = self.diag * 0.012 * (30.0 / max(float(fps), 1.0))
         self.aura_phase = 0.0
 
     def draw(self, frame, boxes_prev, boxes_cur):
@@ -2540,14 +3333,25 @@ class PlayerFX:
             cv2.addWeighted(ov, blend, roi, 1 - blend, 0, roi)
 
 
+_TRAIL_POLISH_KERNEL = np.array([0.15, 0.70, 0.15], dtype=np.float64)
+
+
 def smooth_trail(points):
     if len(points) < 3:
         return points
     pts = np.array(points, dtype=np.float64)
-    xs = np.convolve(pts[:, 0], _SMOOTH_KERNEL, mode="same")
-    ys = np.convolve(pts[:, 1], _SMOOTH_KERNEL, mode="same")
+    xs = np.convolve(pts[:, 0], _TRAIL_POLISH_KERNEL, mode="same")
+    ys = np.convolve(pts[:, 1], _TRAIL_POLISH_KERNEL, mode="same")
     xs[0], ys[0] = pts[0]
     xs[-1], ys[-1] = pts[-1]
+    # 保护真实台面弹跳峰值与球拍击球折返顶点不被二次圆角削平而悬空
+    for i in range(1, len(pts) - 1):
+        dx1 = pts[i, 0] - pts[i - 1, 0]
+        dx2 = pts[i + 1, 0] - pts[i, 0]
+        dy1 = pts[i, 1] - pts[i - 1, 1]
+        dy2 = pts[i + 1, 1] - pts[i, 1]
+        if (dx1 * dx2 < 0 and (abs(dx1) > 1.5 or abs(dx2) > 1.5)) or (dy1 > 1.0 and dy2 < -1.0):
+            xs[i], ys[i] = pts[i, 0], pts[i, 1]
     return list(zip(xs, ys))
 
 
@@ -2616,7 +3420,7 @@ def render(args, segments, rally_starts_by_seg, filled_track, events, table_geo,
                     "-thread_queue_size", "512",
                     "-f", "rawvideo", "-pix_fmt", "bgr24",
                     "-s", f"{out_w}x{out_h}", "-r", str(fps), "-i", "-",
-                ] + _enc_args(enc) + ["-pix_fmt", "yuv420p", silent_path]
+                ] + _enc_args(enc) + [silent_path]
                 pipe_proc = subprocess.Popen(
                     ffmpeg_cmd, stdin=subprocess.PIPE, creationflags=_SUBPROC_FLAGS)
                 use_pipe = True
@@ -2633,14 +3437,13 @@ def render(args, segments, rally_starts_by_seg, filled_track, events, table_geo,
             raise RuntimeError(f"无法打开视频: {args.video}")
         mini = MiniTable(out_w, out_h)
         particles = ParticleSystem(intensity=fx_intensity)
-        shockwaves = ShockwaveSystem(intensity=fx_intensity)
         labels = FloatingLabel()
         flash = SpeedFlash()
-        bmarker = BounceMarker()
         trail_renderer = SpeedTrailRenderer(intensity=fx_intensity)
         player_fx = PlayerFX(fps, out_w, out_h, intensity=fx_intensity) if enable_player_fx else None
         # 残影 (球拖尾) 时长 ≈ 0.2s; 下限 4 帧保证可平滑/绘制
         TRAIL_LEN = max(4, int(fps * 0.2))
+        max_trail_step = getattr(args, "max_jump_ratio", 0.10) * math.hypot(out_w, out_h) * 1.15
 
         prepend_frame_count = sum(e - ps + 1 for ps, e in (prepend_segments or []))
         black_frame_count = int(round(fps * black_gap_sec)) if prepend_segments else 0
@@ -2655,7 +3458,7 @@ def render(args, segments, rally_starts_by_seg, filled_track, events, table_geo,
 
         def _apply_fade(frame, fidx):
             """对帧应用淡入淡出 (in-place), fidx 为 0-based 全局帧序号。"""
-            if total_render <= fade_frames * 2:
+            if total_render <= fade_frames * 2 or fade_frames <= 0:
                 return
             alpha = 1.0
             if fidx < fade_frames:
@@ -2672,6 +3475,7 @@ def render(args, segments, rally_starts_by_seg, filled_track, events, table_geo,
                 alpha = (total_render - fidx) / fade_frames
             if alpha < 1.0:
                 cv2.addWeighted(frame, alpha, black_img, 1.0 - alpha, 0, dst=frame)
+
         pipe_method = "ffmpeg pipe 直编" if use_pipe else "cv2.VideoWriter"
         log(f"🎬 渲染: {len(segments)} 个片段, 约 {total_render} 帧 @ {out_w}x{out_h} "
             f"{fps:.2f}fps [{pipe_method} → {enc}]  fx={fx_level}"
@@ -2679,150 +3483,73 @@ def render(args, segments, rally_starts_by_seg, filled_track, events, table_geo,
         written = 0
         t_start = time.time()
         last_progress_time = t_start
-
         do_resize = (scale != 1.0)
 
-        # — 前置精彩回合 (球速最快) —
-        if prepend_segments:
-            # 为前置片段构建落点索引 (同时保留 rally_id 以正确重置回合内落点)
-            prepend_landing_by_seg, prepend_landing_rally_id = build_landing_rally_index(
-                prepend_segments, prepend_rally_starts_by_seg or {},
-                landing_all, debug=False)
-            log(f"🎬 渲染前置精彩回合: {len(prepend_segments)} 段")
-            for psi, (ps, pe) in enumerate(prepend_segments):
-                cap.set(cv2.CAP_PROP_POS_FRAMES, ps)
+        def _write_frame_and_progress(frm):
+            nonlocal use_pipe, writer, written, last_progress_time
+            if use_pipe:
+                try:
+                    pipe_proc.stdin.write(frm.tobytes())
+                except (BrokenPipeError, OSError):
+                    log("⚠️ ffmpeg pipe 断开, 回退到 cv2.VideoWriter")
+                    try:
+                        pipe_proc.stdin.close()
+                    except Exception:
+                        pass
+                    try:
+                        pipe_proc.wait(timeout=5)
+                    except Exception:
+                        pass
+                    use_pipe = False
+                    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+                    writer = cv2.VideoWriter(silent_path, fourcc, fps, (out_w, out_h))
+                    if not writer.isOpened():
+                        raise RuntimeError("无法创建回退视频写入器")
+                    writer.write(frm)
+            else:
+                writer.write(frm)
+            written += 1
+            now = time.time()
+            if written % 100 == 0 or written == total_render or (now - last_progress_time) >= 0.5:
+                elapsed = now - t_start
+                fps_render = written / elapsed if elapsed > 0 else 0
+                pct = written / total_render * 100 if total_render > 0 else 100
+                eta = (total_render - written) / fps_render if fps_render > 0 else 0
+                sys.stdout.write(
+                    f"\r  渲染进度: {written}/{total_render} ({pct:5.1f}%)"
+                    f" | {fps_render:6.1f} fps | ETA {eta:5.0f}s   ")
+                sys.stdout.flush()
+                last_progress_time = now
+
+        def _render_segment_batch(seg_list, seg_landings_map, seg_rally_id_map):
+            for idx_seg, (s_f, e_f) in enumerate(seg_list):
+                cap.set(cv2.CAP_PROP_POS_FRAMES, s_f)
                 trail = deque(maxlen=TRAIL_LEN)
-                cur_landings = sorted(prepend_landing_by_seg.get(psi, []),
-                                      key=lambda lp: lp["frame"])
+                last_trail_f = None
+                # 切换剪辑片段时清空上一段残留的粒子/文字/闪屏, 防止跨镜头特效串场
+                particles.particles.clear()
+                labels.labels.clear()
+                flash._t = 0
+                flash._max = 0
+                cur_landings_sorted = sorted(seg_landings_map.get(idx_seg, []),
+                                             key=lambda lp: lp["frame"])
                 lp_idx = 0
                 cur_lp_so_far = []
                 cur_rally_id = None
                 prev_player_boxes = None
-                for f in range(ps, pe + 1):
+                for f in range(s_f, e_f + 1):
                     ret, frame = cap.read()
                     if not ret:
                         break
                     if do_resize:
-                        frame = cv2.resize(frame, (out_w, out_h),
-                                           interpolation=cv2.INTER_LINEAR)
+                        frame = cv2.resize(frame, (out_w, out_h), interpolation=cv2.INTER_LINEAR)
+
                     for sev in scaled_ev_by_frame.get(f, []):
                         snorm = sev["snorm"]
                         is_bounce = (sev["type"] == "bounce")
-                        particles.emit(sev["x"], sev["y"],
-                                       n=22 if is_bounce else 16,
+                        particles.emit(sev["x"], sev["y"], n=22 if is_bounce else 16,
                                        kind=sev["type"], speed_norm=snorm)
-                        if enable_extra_fx:
-                            shockwaves.emit(sev["x"], sev["y"],
-                                            kind=sev["type"], speed_norm=snorm)
-                            if is_bounce:
-                                bmarker.emit(sev["x"], sev["y"])
-                            if not is_bounce and snorm >= 0.6:
-                                if snorm >= 0.85:
-                                    txt, col = "SMASH!", (60, 80, 255)
-                                    flash.trigger(int(7 * fx_intensity))
-                                else:
-                                    txt, col = "FAST!", (60, 200, 255)
-                                labels.emit(sev["x"], sev["y"] - 20, txt,
-                                            color=col, scale=1.0 + snorm * 0.5)
-                    if player_fx is not None:
-                        cur_boxes = player_boxes.get(f, [])
-                        cur_boxes_scaled = [
-                            (b[0] * scale, b[1] * scale, b[2] * scale, b[3] * scale)
-                            for b in cur_boxes]
-                        player_fx.draw(frame, prev_player_boxes, cur_boxes_scaled)
-                        prev_player_boxes = cur_boxes_scaled
-                    if f in scaled_track:
-                        trail.append(scaled_track[f])
-                    elif trail and len(trail) > 1:
-                        trail.popleft()
-                    if len(trail) >= 2:
-                        st = ball_speed_table.get(f)
-                        snorm = st["norm"] if st else 0.3
-                        trail_renderer.draw(frame, smooth_trail(list(trail)),
-                                            speed_norm=snorm)
-                    particles.update_and_draw(frame)
-                    labels.update_and_draw(frame)
-                    flash.update_and_draw(frame)
-                    while lp_idx < len(cur_landings) and cur_landings[lp_idx]["frame"] <= f:
-                        lp = cur_landings[lp_idx]
-                        rid = prepend_landing_rally_id.get((psi, lp["frame"]))
-                        if cur_rally_id is not None and rid != cur_rally_id:
-                            cur_lp_so_far = []
-                        cur_rally_id = rid
-                        cur_lp_so_far.append(lp)
-                        lp_idx += 1
-                    mini.draw(frame, cur_lp_so_far)
-                    _apply_fade(frame, written)
-                    if use_pipe:
-                        try:
-                            pipe_proc.stdin.write(frame.tobytes())
-                        except (BrokenPipeError, OSError):
-                            log("⚠️ ffmpeg pipe 断开, 回退到 cv2.VideoWriter")
-                            try:
-                                pipe_proc.wait()
-                            except Exception:
-                                pass
-                            use_pipe = False
-                            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-                            writer = cv2.VideoWriter(silent_path, fourcc, fps,
-                                                     (out_w, out_h))
-                            if not writer.isOpened():
-                                raise RuntimeError("无法创建回退视频写入器")
-                            writer.write(frame)
-                    else:
-                        writer.write(frame)
-                    written += 1
-            # 黑幕间隔
-            black_frames = int(round(fps * black_gap_sec))
-            black = np.zeros((out_h, out_w, 3), dtype=np.uint8)
-            for _ in range(black_frames):
-                if use_pipe:
-                    try:
-                        pipe_proc.stdin.write(black.tobytes())
-                    except (BrokenPipeError, OSError):
-                        log("⚠️ ffmpeg pipe 断开(黑幕), 回退 cv2.VideoWriter")
-                        try:
-                            pipe_proc.wait()
-                        except Exception:
-                            pass
-                        use_pipe = False
-                        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-                        writer = cv2.VideoWriter(silent_path, fourcc, fps,
-                                                 (out_w, out_h))
-                        if not writer.isOpened():
-                            raise RuntimeError("无法创建回退视频写入器")
-                        writer.write(black)
-                else:
-                    writer.write(black)
-                written += 1
-            log(f"⏯️  前置 {len(prepend_segments)} 段 + 黑幕 {black_gap_sec}s 完成, "
-                f"进入全顺序视频")
-
-        for si, (s, e) in enumerate(segments):
-            cap.set(cv2.CAP_PROP_POS_FRAMES, s)
-            trail = deque(maxlen=TRAIL_LEN)
-            cur_landings_sorted = sorted(landing_by_seg.get(si, []), key=lambda lp: lp["frame"])
-            lp_idx = 0
-            cur_lp_so_far = []
-            cur_rally_id = None
-            prev_player_boxes = None
-            for f in range(s, e + 1):
-                ret, frame = cap.read()
-                if not ret:
-                    break
-                if do_resize:
-                    frame = cv2.resize(frame, (out_w, out_h), interpolation=cv2.INTER_LINEAR)
-
-                for sev in scaled_ev_by_frame.get(f, []):
-                    snorm = sev["snorm"]
-                    is_bounce = (sev["type"] == "bounce")
-                    particles.emit(sev["x"], sev["y"], n=22 if is_bounce else 16,
-                                   kind=sev["type"], speed_norm=snorm)
-                    if enable_extra_fx:
-                        shockwaves.emit(sev["x"], sev["y"], kind=sev["type"], speed_norm=snorm)
-                        if is_bounce:
-                            bmarker.emit(sev["x"], sev["y"])
-                        if not is_bounce and snorm >= 0.6:
+                        if enable_extra_fx and not is_bounce and snorm >= 0.6:
                             if snorm >= 0.85:
                                 txt, col = "SMASH!", (60, 80, 255)
                                 flash.trigger(int(7 * fx_intensity))
@@ -2831,68 +3558,68 @@ def render(args, segments, rally_starts_by_seg, filled_track, events, table_geo,
                             labels.emit(sev["x"], sev["y"] - 20, txt,
                                         color=col, scale=1.0 + snorm * 0.5)
 
-                if player_fx is not None:
-                    cur_boxes = player_boxes.get(f, [])
-                    cur_boxes_scaled = [(b[0] * scale, b[1] * scale, b[2] * scale, b[3] * scale)
-                                        for b in cur_boxes]
-                    player_fx.draw(frame, prev_player_boxes, cur_boxes_scaled)
-                    prev_player_boxes = cur_boxes_scaled
+                    if player_fx is not None:
+                        cur_boxes = player_boxes.get(f, [])
+                        cur_boxes_scaled = [(b[0] * scale, b[1] * scale, b[2] * scale, b[3] * scale)
+                                            for b in cur_boxes]
+                        player_fx.draw(frame, prev_player_boxes, cur_boxes_scaled)
+                        prev_player_boxes = cur_boxes_scaled
 
-                if f in scaled_track:
-                    trail.append(scaled_track[f])
-                elif trail and len(trail) > 1:
-                    trail.popleft()
-                if len(trail) >= 2:
-                    st = ball_speed_table.get(f)
-                    snorm = st["norm"] if st else 0.3
-                    trail_renderer.draw(frame, smooth_trail(list(trail)), speed_norm=snorm)
+                    if f in scaled_track:
+                        pt = scaled_track[f]
+                        # 跨越未补帧缺口或极端跳变时立即清空旧残影, 防止旧尾点与新位置跨屏连成折线/直线
+                        if last_trail_f is not None and (
+                            (f - last_trail_f) > 1
+                            or (trail and math.hypot(pt[0] - trail[-1][0],
+                                                     pt[1] - trail[-1][1]) > max_trail_step)
+                        ):
+                            trail.clear()
+                        trail.append(pt)
+                        last_trail_f = f
+                    elif trail:
+                        # 彻底排空到 0 (修复旧版 len>1 留 1 个幽灵点导致跨缺口拉直线的问题)
+                        trail.popleft()
+                        if not trail:
+                            last_trail_f = None
 
-                #shockwaves.update_and_draw(frame)
-                particles.update_and_draw(frame)
-                #bmarker.update_and_draw(frame)
-                labels.update_and_draw(frame)
-                flash.update_and_draw(frame)
+                    if len(trail) >= 2:
+                        st = ball_speed_table.get(f)
+                        snorm = st["norm"] if st else 0.3
+                        trail_renderer.draw(frame, smooth_trail(list(trail)), speed_norm=snorm)
 
-                while lp_idx < len(cur_landings_sorted) and cur_landings_sorted[lp_idx]["frame"] <= f:
-                    lp = cur_landings_sorted[lp_idx]
-                    rid = landing_rally_id.get((si, lp["frame"]))
-                    if cur_rally_id is not None and rid != cur_rally_id:
-                        cur_lp_so_far = []
-                    cur_rally_id = rid
-                    cur_lp_so_far.append(lp)
-                    lp_idx += 1
-                mini.draw(frame, cur_lp_so_far)
-                _apply_fade(frame, written)
+                    particles.update_and_draw(frame)
+                    labels.update_and_draw(frame)
+                    flash.update_and_draw(frame)
 
-                if use_pipe:
-                    try:
-                        pipe_proc.stdin.write(frame.tobytes())
-                    except (BrokenPipeError, OSError):
-                        log("⚠️ ffmpeg pipe 断开, 回退到 cv2.VideoWriter")
-                        try:
-                            pipe_proc.wait()
-                        except Exception:
-                            pass
-                        use_pipe = False
-                        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-                        writer = cv2.VideoWriter(silent_path, fourcc, fps, (out_w, out_h))
-                        if not writer.isOpened():
-                            raise RuntimeError("无法创建回退视频写入器")
-                        writer.write(frame)
-                else:
-                    writer.write(frame)
-                written += 1
-                now = time.time()
-                if written % 100 == 0 or written == total_render or (now - last_progress_time) >= 0.5:
-                    elapsed = now - t_start
-                    fps_render = written / elapsed if elapsed > 0 else 0
-                    pct = written / total_render * 100 if total_render > 0 else 100
-                    eta = (total_render - written) / fps_render if fps_render > 0 else 0
-                    sys.stdout.write(
-                        f"\r  渲染进度: {written}/{total_render} ({pct:5.1f}%)"
-                        f" | {fps_render:6.1f} fps | ETA {eta:5.0f}s   ")
-                    sys.stdout.flush()
-                    last_progress_time = now
+                    while lp_idx < len(cur_landings_sorted) and cur_landings_sorted[lp_idx]["frame"] <= f:
+                        lp = cur_landings_sorted[lp_idx]
+                        rid = seg_rally_id_map.get((idx_seg, lp["frame"]))
+                        if cur_rally_id is not None and rid != cur_rally_id:
+                            cur_lp_so_far = []
+                        cur_rally_id = rid
+                        cur_lp_so_far.append(lp)
+                        lp_idx += 1
+                    mini.draw(frame, cur_lp_so_far)
+                    _apply_fade(frame, written)
+                    _write_frame_and_progress(frame)
+
+        # — 前置精彩回合 (球速最快) —
+        if prepend_segments:
+            prepend_landing_by_seg, prepend_landing_rally_id = build_landing_rally_index(
+                prepend_segments, prepend_rally_starts_by_seg or {},
+                landing_all, debug=False)
+            log(f"🎬 渲染前置精彩回合: {len(prepend_segments)} 段")
+            _render_segment_batch(prepend_segments, prepend_landing_by_seg,
+                                  prepend_landing_rally_id)
+            # 黑幕间隔
+            for _ in range(black_frame_count):
+                _write_frame_and_progress(black_img)
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+            log(f"⏯️  前置 {len(prepend_segments)} 段 + 黑幕 {black_gap_sec}s 完成, "
+                f"进入全顺序视频")
+
+        _render_segment_batch(segments, landing_by_seg, landing_rally_id)
         sys.stdout.write("\n")
         sys.stdout.flush()
         elapsed_total = time.time() - t_start
@@ -2925,8 +3652,13 @@ def render(args, segments, rally_starts_by_seg, filled_track, events, table_geo,
 def finalize_output(args, silent_path, segments, fps, written, tmp_dir,
                     already_encoded=False, enc="libx264",
                     prepend_segments=None, black_gap_sec=0.0):
+    has_ffmpeg = bool(shutil.which("ffmpeg"))
+    if not has_ffmpeg:
+        log("🎞️ 未检测到 ffmpeg, 直接输出渲染视频 (mp4v, 无音频)")
+        shutil.copy2(silent_path, args.output)
+        return
     has_audio = (not args.no_audio) and ffprobe_has_audio(args.video)
-    if not has_audio or not shutil.which("ffmpeg"):
+    if not has_audio:
         if already_encoded:
             log(f"🎞️ 无音频, 直接复制已编码视频 ({enc})")
             shutil.copy2(silent_path, args.output)
@@ -2951,11 +3683,15 @@ def finalize_output(args, silent_path, segments, fps, written, tmp_dir,
                 f"asetpts=PTS-STARTPTS[a{aidx}]")
             parts.append(f"[a{aidx}]")
             aidx += 1
-    # 黑幕静音
+    # 黑幕静音 (与实际渲染黑幕帧数严格对齐, 消除浮点取整累计的音画微偏)
     if black_gap_sec > 0:
-        filt.append(f"anullsrc=r=48000:cl=stereo,atrim=0:{black_gap_sec},asetpts=PTS-STARTPTS[a{aidx}]")
-        parts.append(f"[a{aidx}]")
-        aidx += 1
+        exact_black_sec = int(round(fps * black_gap_sec)) / fps
+        if exact_black_sec > 0:
+            filt.append(
+                f"anullsrc=r=48000:cl=stereo,atrim=0:{exact_black_sec:.4f},"
+                f"asetpts=PTS-STARTPTS[a{aidx}]")
+            parts.append(f"[a{aidx}]")
+            aidx += 1
     # 主片段
     for i, (s, e) in enumerate(segments):
         t0 = s / fps
@@ -2967,11 +3703,19 @@ def finalize_output(args, silent_path, segments, fps, written, tmp_dir,
         aidx += 1
     concat = "".join(parts) + f"concat=n={aidx}:v=0:a=1[aout]"
     filter_complex = ";".join(filt + [concat])
+    # Windows CreateProcess 命令行上限 32767 字符: 多片段长视频改走脚本文件传递滤镜图
+    if len(filter_complex) > 8000:
+        fc_script = os.path.join(tmp_dir, "audio_filter.txt")
+        with open(fc_script, "w", encoding="utf-8") as f_fc:
+            f_fc.write(filter_complex)
+        fc_args = ["-filter_complex_script", fc_script]
+    else:
+        fc_args = ["-filter_complex", filter_complex]
+
     if already_encoded:
         log(f"🔊 重建音频 ({len(segments)} 段) 并 mux (视频 copy, 音频 aac)")
         cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "warning",
-               "-i", silent_path, "-i", args.video,
-               "-filter_complex", filter_complex,
+               "-i", silent_path, "-i", args.video] + fc_args + [
                "-map", "0:v:0", "-map", "[aout]",
                "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
                "-shortest", "-movflags", "+faststart", args.output]
@@ -2980,8 +3724,7 @@ def finalize_output(args, silent_path, segments, fps, written, tmp_dir,
             enc = detect_amf_encoder(args.encoder)
         log(f"🔊 重建音频 ({len(segments)} 段) 并 mux ({enc})")
         cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "warning",
-               "-i", silent_path, "-i", args.video,
-               "-filter_complex", filter_complex,
+               "-i", silent_path, "-i", args.video] + fc_args + [
                "-map", "0:v:0", "-map", "[aout]"] + _enc_args(enc) + [
                "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
                "-shortest", "-movflags", "+faststart", args.output]
@@ -3011,10 +3754,18 @@ def main():
         log(f"❌ 视频不存在: {args.video}")
         sys.exit(1)
     if not os.path.exists(args.raw_detections):
-        log(f"❌ 检测日志不存在: {args.raw_detections}")
-        sys.exit(1)
+        gz_alt = str(args.raw_detections) + ".gz"
+        if os.path.exists(gz_alt):
+            log(f"ℹ️ 未找到 {args.raw_detections}, 自动读取压缩日志: {gz_alt}")
+            args.raw_detections = gz_alt
+        else:
+            log(f"❌ 检测日志不存在: {args.raw_detections}")
+            sys.exit(1)
+    out_parent = os.path.dirname(os.path.abspath(args.output))
+    if out_parent:
+        os.makedirs(out_parent, exist_ok=True)
     log("=" * 60)
-    log("🏓 PingPong Highlight Generator (v4.7 精简+提速)")
+    log("🏓 PingPong Highlight Generator (v4.16 物理抛物线净化+平滑)")
     log("=" * 60)
     cap = cv2.VideoCapture(args.video)
     if not cap.isOpened():
@@ -3037,14 +3788,19 @@ def main():
         corridor_margin=args.corridor_margin, corridor_extend=args.corridor_extend,
         center_dist_ratio=args.center_dist_ratio)
     geo_rebuilt = bool(table_geo.get("rebuilt")) if table_geo else False
+    net_center_x_hint = (_get_net_center_x(frames)
+                         if (table_geo is None or table_geo.get("net_line") is None) else None)
 
     if not args.no_player_fx:
         player_boxes, _pc = gather_player_boxes(frames, debug=args.debug)
     else:
         player_boxes = {}
 
-    log("⚪ 提取主球轨迹 (走廊软过滤 + 多球过滤) ...")
+    log("⚪ 提取主球轨迹 (走廊软过滤 + 多球过滤 + 重力抛物线净化) ...")
     ball_cands = gather_ball_candidates(frames, fps, conf_min=args.ball_conf)
+    # 及时释放全量帧检测字典, 降低长视频渲染阶段常驻内存占用
+    del frames
+
     ball_cands = filter_static_ball_candidates(
         ball_cands, fps, in_w, in_h,
         min_static_count=args.min_static_ball_count, debug=args.debug)
@@ -3058,10 +3814,17 @@ def main():
     main_track = build_main_ball_track(
         ball_cands, fps, in_w, in_h, table_geo=table_geo, debug=args.debug,
         max_jump_ratio=args.max_jump_ratio, match_algo=args.match_algo)
-    log(f"   主轨迹原始点数: {len(main_track)}")
+    g_frame, _ = estimate_gravity_px_per_frame2(
+        table_geo, main_track, fps, in_w, in_h, debug=args.debug)
+    main_track = clean_ball_track_parabolic(
+        main_track, fps, in_w, in_h, g_frame,
+        table_geo=table_geo, max_jump_ratio=args.max_jump_ratio, debug=args.debug)
+    log(f"   主轨迹净化后点数: {len(main_track)}")
 
-    log("🧩 物理补帧 ...")
-    filled = interpolate_track(main_track, fps, in_w, in_h, debug=args.debug)
+    log("🧩 分段重力抛物线平滑 + 物理弹道补帧 ...")
+    filled = interpolate_track(
+        main_track, fps, in_w, in_h, debug=args.debug,
+        table_geo=table_geo, g_frame=g_frame, smooth=(not args.no_track_smooth))
 
     log("⚡ 计算逐帧球速表 (速度自适应特效) ...")
     ball_speed_table, (p50, p95) = compute_ball_speed_table(filled, table_geo, fps, in_w, in_h)
@@ -3074,6 +3837,7 @@ def main():
                                                     table_edge_tol=args.table_edge_tol)
     rallies = detect_rallies(filled, fps, total_frames, args.raw_detections,
                              table_geo=table_geo, bounce_halves=hl_bounce_halves,
+                             net_center_x_hint=net_center_x_hint,
                              out_of_table_timeout=args.out_of_table_timeout,
                              rally_lost_timeout=args.rally_lost_timeout,
                              no_bounce_timeout=args.no_bounce_timeout, debug=args.debug)
