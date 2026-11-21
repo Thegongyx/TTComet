@@ -67,6 +67,8 @@
 │   ├── extract_missing_ball.py           #   漏检帧提取（球跳变帧）
 │   ├── extract_rejected_ball_frames.py   #   错误球帧收集（负样本）
 │   ├── random_sample_frames.py           #   通用随机抽帧（支持无日志）
+│   ├── remove_narration.py               #   去解说人声（demucs / 卡拉OK相减 / 静音）
+│   ├── remove_watermark.py               #   去静态水印台标（delogo / OpenCV inpaint）
 │   ├── train_pingpong_v2.py              #   分割模型训练（bbox→polygon 自动转换）
 │   ├── export_onnx.py                    #   .pt → .onnx 导出（支持 FP16 / NMS）
 │   ├── split_all1.py / split_all19.py    #   数据集拆分 / 增量合并
@@ -111,6 +113,7 @@
 | Python 3.10+ | 建议用 conda 或 venv 隔离 |
 | PyTorch + ultralytics | 抽帧推理 / 训练 |
 | `rfdetr` | 可选，只有跑 `src_detr/` 时才需要 |
+| `demucs` | 可选，只有 `remove_narration.py --method demucs` 才需要（`pip install --no-deps demucs` + `julius einops omegaconf pyyaml tqdm lameenc huggingface-hub safetensors sphn`，用 `--no-deps` 避免替换已有 torch） |
 | `label-studio` | 可选，只有做标注时才需要 |
 | ffmpeg | 抽帧 / 推理 / 剪辑必需（桌面安装包已内置） |
 | GPU | AMD（ROCm）或 NVIDIA（CUDA），框架自动检测；也可纯 CPU 跑 |
@@ -127,6 +130,8 @@
 | `extract_missing_ball.py` | 漏检帧提取（球跳变帧） |
 | `extract_rejected_ball_frames.py` | 错误球帧收集（A/B 两类负样本） |
 | `random_sample_frames.py` | 通用随机抽帧（`--ball-only` / `--no-player` / `--no-log`） |
+| `remove_narration.py` | 去解说人声，保留击球声/环境声（`--method demucs` / `center` / `mute`） |
+| `remove_watermark.py` | 去静态水印台标（`--method delogo` / `inpaint`，内置 `logo`/`overlay`/`all` 预设） |
 | `train_pingpong_v2.py` | 分割模型训练（best_class AP / mAP50 双追踪） |
 | `export_onnx.py` | `.pt` → `.onnx`（`--half` / `--dynamic` / `--simplify` / `--nms`） |
 | `split_all1.py` | 数据集拆分 train/val |

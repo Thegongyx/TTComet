@@ -1,0 +1,346 @@
+#!/usr/bin/env python3
+"""
+去除视频中的解说人声（保留击球声 / 环境声 / 观众声）。
+
+三种后端:
+    demucs  AI 人声分离（htdemucs），把音轨拆成 vocals + no_vocals，只保留伴奏轨
+    center  卡拉OK 中心声道相减，零依赖、秒出结果，但会削掉立体声、只对人声居中有效
+    mute    直接删除音轨（纯静音，最彻底）
+
+用法:
+    # 默认: demucs 分离, 视频流直接复制(不重编码), 输出 <原名>_novoice.mp4
+    python src/remove_narration.py --video Videos/fb1080.mp4
+
+    # 只处理前 60 秒做效果验证
+    python src/remove_narration.py --video Videos/fb1080.mp4 --duration 60 --output tmp/test_novoice.mp4
+
+    # 卡拉OK 相减（秒出，适合快速试听）
+    python src/remove_narration.py --video Videos/fb1080.mp4 --method center
+
+    # CPU 跑推理 + 更激进地减掉分离残留的人声
+    python src/remove_narration.py --video Videos/fb1080.mp4 --device cpu --residual 0.15
+
+参数说明:
+    --video       源视频路径
+    --output      输出视频路径（默认: 源视频同目录 <原名>_novoice.mp4）
+    --method      去人声方式: demucs / center / mute（默认 demucs）
+    --model       demucs 模型: htdemucs / htdemucs_ft / mdx_extra（默认 htdemucs）
+    --device      auto / cuda / cpu（默认 auto, 有 ROCm/CUDA 就走 GPU）
+    --shifts      demucs 位移平均次数, 越大越干净越慢（默认 1）
+    --residual    再减去 vocals 轨的比例, 用于压掉分离残留人声（0 表示不减, 默认 0）
+    --audio-bitrate  输出音频码率（默认 192k）
+    --start       起始时间（秒, 默认 0）
+    --duration    处理时长（秒, 默认整段）
+    --reencode    强制重编码视频流（默认只在 --start > 0 时重编码, 否则直接复制）
+    --keep-temp   保留下载/分离出的中间 wav（默认处理完删除）
+"""
+
+import json
+import subprocess
+import sys
+import shutil
+from argparse import ArgumentParser
+from pathlib import Path
+
+# 中间文件统一放项目根目录 tmp/
+_TMP_ROOT = Path(__file__).resolve().parent.parent / "tmp" / "narration"
+
+
+# ────────────────────────────────────────────────────────────────────────────
+#  基础工具
+# ────────────────────────────────────────────────────────────────────────────
+
+def run(cmd, quiet=False):
+    """执行外部命令, 失败时打印完整命令并退出"""
+    if not quiet:
+        print("> " + " ".join(str(c) for c in cmd))
+    proc = subprocess.run([str(c) for c in cmd])
+    if proc.returncode != 0:
+        print(f"! 命令失败 (exit={proc.returncode})")
+        sys.exit(proc.returncode)
+    return proc
+
+
+def check_ffmpeg():
+    if shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None:
+        print("! 未找到 ffmpeg / ffprobe, 请先安装并加入 PATH")
+        sys.exit(1)
+
+
+def probe_media(path):
+    """读取视频/音频流信息"""
+    out = subprocess.run(
+        ["ffprobe", "-v", "error", "-print_format", "json",
+         "-show_streams", "-show_format", str(path)],
+        capture_output=True, text=True,
+    )
+    if out.returncode != 0:
+        print(f"! 无法读取媒体信息: {path}")
+        print(out.stderr.strip())
+        sys.exit(1)
+    info = json.loads(out.stdout)
+    streams = info.get("streams", [])
+    video = next((s for s in streams if s.get("codec_type") == "video"), None)
+    audio = next((s for s in streams if s.get("codec_type") == "audio"), None)
+    return {
+        "duration": float(info.get("format", {}).get("duration") or 0.0),
+        "video": video,
+        "audio": audio,
+    }
+
+
+def resolve_device(requested):
+    """auto -> 有可用 torch 加速就 cuda, 否则 cpu"""
+    if requested != "auto":
+        return requested
+    try:
+        import torch
+        if torch.cuda.is_available():
+            return "cuda"
+    except Exception:
+        pass
+    return "cpu"
+
+
+def build_output_path(video, output, suffix):
+    if output:
+        return Path(output)
+    src = Path(video)
+    return src.with_name(f"{src.stem}{suffix}{src.suffix}")
+
+
+# ────────────────────────────────────────────────────────────────────────────
+#  音频处理
+# ────────────────────────────────────────────────────────────────────────────
+
+def extract_audio(video, wav_path, start, duration, sample_rate=None):
+    """把视频音轨抽成 wav（demucs 只吃音频文件）"""
+    wav_path.parent.mkdir(parents=True, exist_ok=True)
+    cmd = ["ffmpeg", "-v", "error", "-y"]
+    if start and start > 0:
+        cmd += ["-ss", f"{start:.3f}"]
+    cmd += ["-i", str(video)]
+    if duration and duration > 0:
+        cmd += ["-t", f"{duration:.3f}"]
+    cmd += ["-vn", "-c:a", "pcm_f32le"]
+    if sample_rate:
+        cmd += ["-ar", str(sample_rate)]
+    cmd += [str(wav_path)]
+    run(cmd, quiet=True)
+    return wav_path
+
+
+def separate_demucs(wav_path, model, device, shifts, out_dir):
+    """调用 demucs 分离人声, 返回 (no_vocals, vocals) 路径"""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        sys.executable, "-m", "demucs",
+        "--two-stems", "vocals",
+        "-n", model,
+        "-d", device,
+        "--shifts", str(shifts),
+        "-o", str(out_dir),
+        str(wav_path),
+    ]
+    print(f"\n[demucs] 模型={model} 设备={device} shifts={shifts}")
+    run(cmd)
+
+    stem_dir = out_dir / model / wav_path.stem
+    no_vocals = stem_dir / "no_vocals.wav"
+    vocals = stem_dir / "vocals.wav"
+    if not no_vocals.exists():
+        print(f"! demucs 未生成伴奏轨: {no_vocals}")
+        sys.exit(1)
+    return no_vocals, vocals
+
+
+def subtract_residual(no_vocals, vocals, out_wav, ratio):
+    """从伴奏轨里再减掉 ratio 倍人声, 压制分离残留"""
+    if ratio <= 0:
+        return no_vocals
+    print(f"[residual] 伴奏 - {ratio:.2f} × 人声")
+    cmd = [
+        "ffmpeg", "-v", "error", "-y",
+        "-i", str(no_vocals), "-i", str(vocals),
+        "-filter_complex",
+        f"[1:a]volume={ratio:.4f}[v];"
+        f"[0:a][v]amix=inputs=2:duration=first:weights=1 -1:normalize=0[a]",
+        "-map", "[a]", "-c:a", "pcm_f32le", str(out_wav),
+    ]
+    run(cmd, quiet=True)
+    return out_wav
+
+
+def mux_audio(video, audio_path, output, start, duration, bitrate,
+              reencode, encoder="libx264", crf=18):
+    """把处理后的音轨合回视频, 视频流默认直接复制"""
+    output.parent.mkdir(parents=True, exist_ok=True)
+    need_reencode = reencode or (start and start > 0)
+    cmd = ["ffmpeg", "-v", "warning", "-stats", "-y"]
+    if start and start > 0:
+        cmd += ["-ss", f"{start:.3f}"]
+    cmd += ["-i", str(video), "-i", str(audio_path)]
+    cmd += ["-map", "0:v:0", "-map", "1:a:0"]
+    # 时长必须作为输出选项, 否则只作用于紧邻的输入(音频), 视频会整段复制
+    if duration and duration > 0:
+        cmd += ["-t", f"{duration:.3f}"]
+    if need_reencode:
+        cmd += ["-c:v", encoder]
+        if encoder == "libx264":
+            cmd += ["-crf", str(crf), "-preset", "fast"]
+        else:
+            cmd += ["-b:v", "8M"]
+    else:
+        cmd += ["-c:v", "copy"]
+    cmd += ["-c:a", "aac", "-b:a", bitrate, "-movflags", "+faststart"]
+    cmd += [str(output)]
+    run(cmd)
+
+
+# ────────────────────────────────────────────────────────────────────────────
+#  三种后端
+# ────────────────────────────────────────────────────────────────────────────
+
+def do_demucs(args, video, output, info):
+    """AI 人声分离"""
+    stem = Path(video).stem
+    work = _TMP_ROOT / stem
+    work.mkdir(parents=True, exist_ok=True)
+
+    wav = work / "source.wav"
+    print("[1/3] 提取音轨 ...")
+    extract_audio(video, wav, args.start, args.duration)
+
+    print("[2/3] demucs 人声分离 ...")
+    device = resolve_device(args.device)
+    no_vocals, vocals = separate_demucs(wav, args.model, device, args.shifts, work / "separated")
+
+    audio = no_vocals
+    if args.residual and args.residual > 0:
+        audio = subtract_residual(no_vocals, vocals, work / "residual.wav", args.residual)
+
+    print("[3/3] 合成输出视频 ...")
+    mux_audio(video, audio, output, args.start, args.duration,
+              args.audio_bitrate, args.reencode, args.encoder, args.crf)
+
+    if not args.keep_temp:
+        shutil.rmtree(work, ignore_errors=True)
+    return output
+
+
+def do_center(args, video, output, info):
+    """卡拉OK 中心声道相减: 人声通常在正中, 左右声道同相 -> 相减后消失"""
+    audio = info.get("audio") or {}
+    channels = int(audio.get("channels") or 0)
+    if channels < 2:
+        print("! center 方法需要立体声音轨, 当前视频是单声道")
+        print("  可改用 --method mute 或 --method demucs")
+        sys.exit(1)
+
+    af = "pan=stereo|c0=0.5*c0-0.5*c1|c1=0.5*c1-0.5*c0"
+    print(f"[center] 立体声反相相减: {af}")
+    output.parent.mkdir(parents=True, exist_ok=True)
+
+    cmd = ["ffmpeg", "-v", "warning", "-stats", "-y"]
+    if args.start and args.start > 0:
+        cmd += ["-ss", f"{args.start:.3f}"]
+    cmd += ["-i", str(video)]
+    if args.duration and args.duration > 0:
+        cmd += ["-t", f"{args.duration:.3f}"]
+    cmd += ["-map", "0:v:0", "-map", "0:a:0", "-af", af]
+    if args.reencode or (args.start and args.start > 0):
+        cmd += ["-c:v", args.encoder, "-crf", str(args.crf), "-preset", "fast"]
+    else:
+        cmd += ["-c:v", "copy"]
+    cmd += ["-c:a", "aac", "-b:a", args.audio_bitrate, "-movflags", "+faststart"]
+    cmd += [str(output)]
+    run(cmd)
+    return output
+
+
+def do_mute(args, video, output, info):
+    """直接删除音轨"""
+    output.parent.mkdir(parents=True, exist_ok=True)
+    cmd = ["ffmpeg", "-v", "warning", "-stats", "-y"]
+    if args.start and args.start > 0:
+        cmd += ["-ss", f"{args.start:.3f}"]
+    cmd += ["-i", str(video)]
+    if args.duration and args.duration > 0:
+        cmd += ["-t", f"{args.duration:.3f}"]
+    cmd += ["-map", "0:v:0", "-an"]
+    if args.reencode or (args.start and args.start > 0):
+        cmd += ["-c:v", args.encoder, "-crf", str(args.crf), "-preset", "fast"]
+    else:
+        cmd += ["-c:v", "copy"]
+    cmd += ["-movflags", "+faststart", str(output)]
+    run(cmd)
+    return output
+
+
+# ────────────────────────────────────────────────────────────────────────────
+#  入口
+# ────────────────────────────────────────────────────────────────────────────
+
+def build_parser():
+    p = ArgumentParser(
+        description="去除视频解说人声, 保留击球声/环境声",
+        formatter_class=__import__("argparse").RawDescriptionHelpFormatter,
+        epilog=__doc__,
+    )
+    p.add_argument("--video", help="源视频路径")
+    p.add_argument("--output", help="输出视频路径")
+    p.add_argument("--method", choices=["demucs", "center", "mute"], default="demucs")
+    p.add_argument("--model", default="htdemucs", help="demucs 模型名")
+    p.add_argument("--device", default="auto", choices=["auto", "cuda", "cpu"])
+    p.add_argument("--shifts", type=int, default=1)
+    p.add_argument("--residual", type=float, default=0.0, help="额外减掉的 vocals 比例")
+    p.add_argument("--audio-bitrate", default="192k")
+    p.add_argument("--start", type=float, default=0.0)
+    p.add_argument("--duration", type=float, default=0.0)
+    p.add_argument("--reencode", action="store_true", help="强制重编码视频流")
+    p.add_argument("--encoder", default="libx264", help="重编码时的视频编码器")
+    p.add_argument("--crf", type=int, default=18)
+    p.add_argument("--keep-temp", action="store_true")
+    return p
+
+
+def main():
+    args = build_parser().parse_args()
+    check_ffmpeg()
+
+    if not args.video:
+        args.video = input("源视频路径: ").strip().strip('"')
+    video = Path(args.video)
+    if not video.is_file():
+        print(f"! 视频不存在: {video}")
+        sys.exit(1)
+
+    info = probe_media(video)
+    if not info["video"]:
+        print("! 输入文件里没有视频流")
+        sys.exit(1)
+    if not info["audio"]:
+        print("! 输入文件里没有音轨, 无需去除人声")
+        sys.exit(1)
+
+    audio = info["audio"]
+    print(f"输入: {video}")
+    print(f"  视频: {info['video'].get('width')}x{info['video'].get('height')} "
+          f"{info['video'].get('codec_name')}  时长 {info['duration']:.1f}s")
+    print(f"  音频: {audio.get('codec_name')} {audio.get('sample_rate')}Hz "
+          f"{audio.get('channels')}ch  方法 {args.method}")
+
+    output = build_output_path(video, args.output, "_novoice")
+    if output.resolve() == video.resolve():
+        print("! 输出路径不能与输入相同")
+        sys.exit(1)
+
+    handlers = {"demucs": do_demucs, "center": do_center, "mute": do_mute}
+    result = handlers[args.method](args, video, output, info)
+
+    size_mb = result.stat().st_size / 1024 / 1024
+    print(f"\n完成: {result}  ({size_mb:.1f} MB)")
+
+
+if __name__ == "__main__":
+    main()
