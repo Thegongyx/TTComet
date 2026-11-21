@@ -74,12 +74,6 @@
 │   ├── split_all1.py / split_all19.py    #   数据集拆分 / 增量合并
 │   └── convert_yolo_to_labelstudio.py    #   YOLO 标注 → Label Studio
 │
-├── src_detr/                             # RF-DETR 队列（另一套检测实现）
-│   ├── train_detr.py                     #   微调（detect / seg）
-│   ├── inference_video_detr.py           #   推理（输出与 YOLO 版同 schema）
-│   ├── run_pipeline_detr.py              #   推理 + 高光
-│   └── download_weights.py               #   官方权重多连接下载（MD5 校验）
-│
 ├── src_yls/                              # Label Studio ML 后端（自动预标注）
 │
 ├── webui/                                # 乒乓彗星 TTComet 桌面版
@@ -92,8 +86,8 @@
 │
 ├── models/                               # 自定义训练权重（.pt 不入库）
 ├── train_data/                           # 标注数据集（内容不入库，见下方说明）
-├── yolo26*-seg.pt / rf-detr-seg-*.pt     # 预训练权重（不入库）
-├── runs/  runs_detr/                     # 训练输出
+├── yolo26*-seg.pt                        # 预训练权重（不入库）
+├── runs/                                 # 训练输出
 ├── Videos/  transition_videos/           # 素材视频（不入库）
 └── tmp/                                  # 脚本临时文件
 ```
@@ -112,7 +106,6 @@
 |---|---|
 | Python 3.10+ | 建议用 conda 或 venv 隔离 |
 | PyTorch + ultralytics | 抽帧推理 / 训练 |
-| `rfdetr` | 可选，只有跑 `src_detr/` 时才需要 |
 | `demucs` | 可选，只有 `remove_narration.py --method demucs` 才需要（`pip install --no-deps demucs` + `julius einops omegaconf pyyaml tqdm lameenc huggingface-hub safetensors sphn`，用 `--no-deps` 避免替换已有 torch） |
 | `label-studio` | 可选，只有做标注时才需要 |
 | ffmpeg | 抽帧 / 推理 / 剪辑必需（桌面安装包已内置） |
@@ -137,9 +130,6 @@
 | `split_all1.py` | 数据集拆分 train/val |
 | `split_all19.py` | 数据集增量合并拆分（专用） |
 | `convert_yolo_to_labelstudio.py` | YOLO 标注 → Label Studio 格式 |
-| `src_detr/train_detr.py` | RF-DETR 微调（detect / seg） |
-| `src_detr/inference_video_detr.py` | RF-DETR 推理（输出同 schema） |
-| `src_detr/run_pipeline_detr.py` | RF-DETR 推理 + 高光 |
 
 ---
 
@@ -188,6 +178,117 @@ python src/random_sample_frames.py `
 
 ---
 
+## ✂️ 音视频清理（去水印 / 去解说）
+
+两个独立的后期处理脚本，和上面的高光流程互不干扰，可以任意组合。
+都只需要 **ffmpeg**；`remove_narration.py` 的 AI 分离额外需要 `demucs`（见「环境要求」）。
+
+### 去静态水印 `remove_watermark.py`
+
+针对转播画面里**时间上位置固定**的叠加层（平台台标、赛事条、角标）。
+
+内置预设（坐标基于 1920×1080 的 WTT 转播画面，其他分辨率会**自动等比缩放**）：
+
+| 预设 | 处理内容 | 适用场景 |
+|---|---|---|
+| `logo` | 右上角「咪咕 独播」台标 | 只想去平台水印 |
+| `overlay`（默认） | 台标 + 底部「ISTANBUL \| 百岁山 \| WTT」赛事条 | 保留比赛信息 |
+| `all` | 再加左下角比分牌 | 比分也不需要时 |
+| `none` | 不用预设，只处理 `--region` 指定的区域 | 其他来源的水印 |
+
+```powershell
+# 默认：去台标 + 底部赛事条，保留比分牌
+python src/remove_watermark.py --video Videos/match.mp4
+
+# 只去台标 / 连比分牌一起去
+python src/remove_watermark.py --video Videos/match.mp4 --preset logo
+python src/remove_watermark.py --video Videos/match.mp4 --preset all
+
+# 手动指定区域（可重复），x,y,w,h 按实际画面像素
+python src/remove_watermark.py --video in.mp4 --preset none --region 100,100,200,50
+```
+
+**自动检测未知水印位置。** 换平台、换赛事的台标位置不一样时，不用手量像素：
+
+```powershell
+# 只输出候选框和可疑度，不动视频
+python src/remove_watermark.py --video in.mp4 --detect
+
+# 确认候选无误后直接处理
+python src/remove_watermark.py --video in.mp4 --detect --detect-apply
+```
+
+检测原理是对多帧做逐像素时序统计：水印叠加使得该区域**最小亮度偏高**、**时间标准差极低**，
+再结合填充率和宽高比打分。默认只报告不处理，`--detect-apply` 时也只处理
+`score ≥ 50% × 最高分` 的候选，避免把白球衣、广告板这类静止亮色物体一起抹掉。
+
+**两种算法：**
+
+| 方法 | 速度 | 效果 |
+|---|---|---|
+| `delogo`（默认） | 快 | 区域被周边像素插值成模糊块，复杂背景上有拖影 |
+| `inpaint` | 慢 | OpenCV TELEA 逐帧修复，纯色背景（地板）更好，复杂背景拖影更明显 |
+
+**先看效果再动手**（导出前后对比静帧，不编码视频）：
+
+```powershell
+python src/remove_watermark.py --video in.mp4 --preview 3,900,2100 --dry-run
+```
+
+实测：1920×1080 / 46 分钟影片，**约 4.8 分钟**（9.75x 实时）。
+
+> **边界**：只处理矩形区域、只对时间上静止的水印有效。滚动/闪烁/位置漂移的水印、
+> 与背景亮度接近的水印、以及异形 logo（会被多抹一点背景）都不适用。
+
+### 去解说人声 `remove_narration.py`
+
+把解说员的声音去掉，保留击球声、观众声和场馆环境音。
+
+| 方法 | 说明 | 速度 | 效果 |
+|---|---|---|---|
+| `demucs`（默认） | AI 人声分离（htdemucs），只保留 `no_vocals` 轨 | 慢，需 GPU 更佳 | 最彻底 |
+| `center` | 立体声反相相减（人声通常居中） | 秒出 | 人声有残留 |
+| `mute` | 直接删除音轨 | 秒出 | 完全静音 |
+
+```powershell
+# 默认：demucs 分离 + 音量提升 1 倍
+python src/remove_narration.py --video Videos/match.mp4
+
+# 卡拉OK 相减（零依赖，快速试听）
+python src/remove_narration.py --video in.mp4 --method center
+
+# 音量不变 / 提到 2.5 倍 / 再压一点分离残留
+python src/remove_narration.py --video in.mp4 --volume-gain 1.0
+python src/remove_narration.py --video in.mp4 --volume-gain 2.5
+python src/remove_narration.py --video in.mp4 --residual 0.15
+```
+
+**音量处理**：分离后人声没了，整体响度会明显下降，所以默认 `--volume-gain 2.0`
+（+6dB）把音轨提回来，并在增益后接 `alimiter` 限幅 —— 只在峰值超过 0dBFS 时压一下，
+正常段落不受影响，不会整体变闷。
+
+**视频流默认直接复制**（`-c:v copy`），只重编码音频，所以几乎不影响画质、速度也快。
+
+实测：46 分钟影片的音频分离约 **2 分 15 秒**（22x 实时），合成 45 秒。
+
+> 首次运行会从 HuggingFace 下载 htdemucs 权重（约 80 MB）。国内网络慢可以设
+> `$env:HF_ENDPOINT = "https://hf-mirror.com"`。
+>
+> **注意**：demucs 会把解说连同部分环境声一起划进 vocals，所以去人声后击球声会变弱。
+> 觉得太闷就用 `--method center` 对比，或调小 `--volume-gain`。
+
+### 组合使用
+
+先去水印（视频重编码），再去人声（视频流复制，很快）：
+
+```powershell
+python src/remove_watermark.py --video Videos/match.mp4
+python src/remove_narration.py `
+    --video Videos/match_nowatermark.mp4 --output Videos/match_clean.mp4
+```
+
+---
+
 ## 🧠 模型
 
 ### 分割模型（6 类）
@@ -212,13 +313,6 @@ python src/export_onnx.py `
 ```
 
 > 注意不要加 `--nms`：内嵌 NMS 会把 0.25 阈值烧进模型，导致 `--conf-ball 0.10` 的低分球召回失效。
-
-### RF-DETR（可选替代）
-
-```powershell
-python src_detr/train_detr.py `
-    --data train_data/all22_split/data.yaml --size medium --task seg --name detr_v1
-```
 
 ---
 
@@ -307,12 +401,11 @@ print(df[['epoch', 'metrics/mAP50-95(B)', 'metrics/mAP50(B)']].tail(20))
 ## ⚠️ 注意事项
 
 1. **先激活装好依赖的环境**，再执行 `python src/<script>.py`（conda 用 `conda activate <环境名>`）
-2. **`src_detr/` 额外需要 `rfdetr` 包**，与 YOLO 那套互不影响，可装在同一环境
-3. **训练启动后不要持续监控进程**：确认启动正常即可，持续查看会拖慢训练
-4. **标注格式**：YOLO txt（`class_id x_center y_center width height`，归一化）；也接受 polygon（9+ 值），训练脚本会自动转换
-5. **`data.yaml` 的 `path` 必须指向 `images/` `labels/` 的父目录**，且训练前必须拆分 train/val，否则会静默失败
-6. **临时文件统一放 `tmp/`**
-7. **`train_data/` 内容不入库**：只保留目录结构，数据集请在本地准备
+2. **训练启动后不要持续监控进程**：确认启动正常即可，持续查看会拖慢训练
+3. **标注格式**：YOLO txt（`class_id x_center y_center width height`，归一化）；也接受 polygon（9+ 值），训练脚本会自动转换
+4. **`data.yaml` 的 `path` 必须指向 `images/` `labels/` 的父目录**，且训练前必须拆分 train/val，否则会静默失败
+5. **临时文件统一放 `tmp/`**
+6. **`train_data/` 内容不入库**：只保留目录结构，数据集请在本地准备
 
 ---
 
@@ -320,7 +413,7 @@ print(df[['epoch', 'metrics/mAP50-95(B)', 'metrics/mAP50(B)']].tail(20))
 
 本仓库目前**未声明开源许可证**（默认保留所有权利）。如需引用或二次分发，请先联系仓库所有者。
 
-第三方组件遵循各自许可：Ultralytics（AGPL-3.0）、RF-DETR（Apache-2.0）、ONNX Runtime（MIT）、three.js（MIT）。
+第三方组件遵循各自许可：Ultralytics（AGPL-3.0）、ONNX Runtime（MIT）、three.js（MIT）。
 
 ## 📚 更多
 
