@@ -8,11 +8,16 @@
     mute    直接删除音轨（纯静音，最彻底）
 
 用法:
-    # 默认: demucs 分离, 视频流直接复制(不重编码), 输出 <原名>_novoice.mp4
+    # 默认: demucs 分离 + 音量提升 1 倍(+6dB), 视频流直接复制(不重编码)
+    # 输出 <原名>_novoice.mp4
     python src/remove_narration.py --video Videos/fb1080.mp4
 
     # 只处理前 60 秒做效果验证
     python src/remove_narration.py --video Videos/fb1080.mp4 --duration 60 --output tmp/test_novoice.mp4
+
+    # 音量保持不变 / 提升到 2.5 倍
+    python src/remove_narration.py --video in.mp4 --volume-gain 1.0
+    python src/remove_narration.py --video in.mp4 --volume-gain 2.5
 
     # 卡拉OK 相减（秒出，适合快速试听）
     python src/remove_narration.py --video Videos/fb1080.mp4 --method center
@@ -28,6 +33,8 @@
     --device      auto / cuda / cpu（默认 auto, 有 ROCm/CUDA 就走 GPU）
     --shifts      demucs 位移平均次数, 越大越干净越慢（默认 1）
     --residual    再减去 vocals 轨的比例, 用于压掉分离残留人声（0 表示不减, 默认 0）
+    --volume-gain 去人声后的音量倍数（默认 2.0, 即提升 1 倍 / +6dB; 1.0 表示不变）
+    --no-limiter  不加防削波限幅器（默认在增益后自动接 alimiter, 峰值超 0dBFS 才动作）
     --audio-bitrate  输出音频码率（默认 192k）
     --start       起始时间（秒, 默认 0）
     --duration    处理时长（秒, 默认整段）
@@ -171,8 +178,19 @@ def subtract_residual(no_vocals, vocals, out_wav, ratio):
     return out_wav
 
 
+def build_audio_filter(gain, limiter=True):
+    """构造音量和防削波滤镜链; gain=1.0 时返回空串"""
+    parts = []
+    if gain and abs(gain - 1.0) > 1e-6:
+        parts.append(f"volume={gain:.4f}")
+    # 增益后若某段峰值超过 0dBFS 会削波, alimiter 只在超限时动作
+    if limiter and gain and gain > 1.0:
+        parts.append("alimiter=limit=0.98:level=false")
+    return ",".join(parts)
+
+
 def mux_audio(video, audio_path, output, start, duration, bitrate,
-              reencode, encoder="libx264", crf=18):
+              reencode, encoder="libx264", crf=18, audio_filter=""):
     """把处理后的音轨合回视频, 视频流默认直接复制"""
     output.parent.mkdir(parents=True, exist_ok=True)
     need_reencode = reencode or (start and start > 0)
@@ -184,6 +202,8 @@ def mux_audio(video, audio_path, output, start, duration, bitrate,
     # 时长必须作为输出选项, 否则只作用于紧邻的输入(音频), 视频会整段复制
     if duration and duration > 0:
         cmd += ["-t", f"{duration:.3f}"]
+    if audio_filter:
+        cmd += ["-af", audio_filter]
     if need_reencode:
         cmd += ["-c:v", encoder]
         if encoder == "libx264":
@@ -220,8 +240,12 @@ def do_demucs(args, video, output, info):
         audio = subtract_residual(no_vocals, vocals, work / "residual.wav", args.residual)
 
     print("[3/3] 合成输出视频 ...")
+    af = build_audio_filter(args.volume_gain, not args.no_limiter)
+    if af:
+        print(f"      音频滤镜: {af}")
     mux_audio(video, audio, output, args.start, args.duration,
-              args.audio_bitrate, args.reencode, args.encoder, args.crf)
+              args.audio_bitrate, args.reencode, args.encoder, args.crf,
+              audio_filter=af)
 
     if not args.keep_temp:
         shutil.rmtree(work, ignore_errors=True)
@@ -238,6 +262,9 @@ def do_center(args, video, output, info):
         sys.exit(1)
 
     af = "pan=stereo|c0=0.5*c0-0.5*c1|c1=0.5*c1-0.5*c0"
+    gain_f = build_audio_filter(args.volume_gain, not args.no_limiter)
+    if gain_f:
+        af = f"{af},{gain_f}"
     print(f"[center] 立体声反相相减: {af}")
     output.parent.mkdir(parents=True, exist_ok=True)
 
@@ -294,6 +321,10 @@ def build_parser():
     p.add_argument("--device", default="auto", choices=["auto", "cuda", "cpu"])
     p.add_argument("--shifts", type=int, default=1)
     p.add_argument("--residual", type=float, default=0.0, help="额外减掉的 vocals 比例")
+    p.add_argument("--volume-gain", type=float, default=2.0,
+                   help="去人声后的音量倍数, 默认 2.0 (提升 1 倍 / +6dB)")
+    p.add_argument("--no-limiter", action="store_true",
+                   help="增益后不加防削波限幅器 (默认 auto 加 alimiter)")
     p.add_argument("--audio-bitrate", default="192k")
     p.add_argument("--start", type=float, default=0.0)
     p.add_argument("--duration", type=float, default=0.0)
