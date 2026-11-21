@@ -1,8 +1,18 @@
 #!/usr/bin/env python3
 """
-pingpong_highlight.py  (优化版 v4.17 - 残影时长参数化)
+pingpong_highlight.py  (优化版 v4.18 - 多机位导播切视角分段几何自适应 | 单机位零影响)
 =====================================================================
 乒乓球比赛 → 自动特效精华集锦
+
+v4.18 在 v4.17 基础上的改动:
+  ★ 新增第一阶段「导播切视角 / 多机位球台几何自适应」(--camera-mode auto/single/multi, 默认 auto):
+    - 零解码切镜检测与同机位聚类 (detect_camera_timeline): 直接从 jsonl 识别不同球台机位与无球台特写镜头,
+      内置半遮挡钉边子框保护、球网静止保护及同帧共存邻台剔除;
+    - 单机位零影响保证: auto 模式下仅当确认存在 ≥2 个互斥稳定球台机位时才启用多视角管线,
+      固定单机位视频(含多球台球馆、球员走过半遮挡/短暂遮挡) 100% 走原生单机位代码路径, 表现分毫不差;
+    - 按镜头(Shot)严格隔离: 每个机位独立拟合 table_geo, 按镜头隔离执行走廊过滤、轨迹关联、重力标定、
+      抛物线净化、平滑补帧与落点投影, 屏蔽无球台球员特写镜头误检, 并按像素比例尺归一化跨机位球速;
+    - 跨镜头回合衔接与渲染重置: 回合中途切机位不断裂、切入球员特写干脆收尾, 渲染遇切镜帧立即清空残影/光环/粒子缓存。
 
 v4.17 在 v4.16 基础上的改动:
   ★ 球残影 (拖尾/彗尾) 停留时长参数化:
@@ -234,6 +244,10 @@ def parse_args():
                    help="关闭前置精彩回合功能 (只输出全顺序视频)")
     p.add_argument("--no-track-smooth", action="store_true",
                    help="关闭分段重力抛物线平滑 (仅保留离群误检剔除与弹道补帧, 排查对比用)")
+    p.add_argument("--camera-mode", default="auto", choices=["auto", "single", "multi"],
+                   help="机位模式: auto(默认)=自动检测导播切视角(单机位视频100%%走原生管线不改变任何效果, "
+                        "检测到>=2个球台视角时自动启用按镜头分段几何与切镜重置); "
+                        "single=强制全局单球台; multi=强制开启切镜分段与无球台特写屏蔽")
     p.add_argument("--debug", action="store_true", help="输出调试信息")
     return p.parse_args()
 
@@ -1160,6 +1174,507 @@ def img_to_table(H_or_geo, pt):
         return (x_mm, y_mm)
     out = cv2.perspectiveTransform(np.array([[[pt[0], pt[1]]]], dtype=np.float32), H_or_geo)
     return float(out[0, 0, 0]), float(out[0, 0, 1])
+
+
+# =====================================================================
+#  2b) 多机位切镜检测 + 同机位聚类几何 (单机位视频零影响透传)
+# =====================================================================
+def _bbox_iou_xyxy(a, b):
+    ix1, iy1 = max(a[0], b[0]), max(a[1], b[1])
+    ix2, iy2 = min(a[2], b[2]), min(a[3], b[3])
+    if ix2 <= ix1 or iy2 <= iy1:
+        return 0.0
+    inter = (ix2 - ix1) * (iy2 - iy1)
+    area_a = max(1.0, (a[2] - a[0]) * (a[3] - a[1]))
+    area_b = max(1.0, (b[2] - b[0]) * (b[3] - b[1]))
+    return inter / (area_a + area_b - inter)
+
+
+def _same_camera_table_view(ba, na, bb, nb, diag):
+    """判定两个球台观测框是否来自同一固定机位 (含球员半遮挡桌面容错)。
+
+    区分两类情况:
+      - 同机位球员半遮挡: 遮挡框落在完整框内部 (inter/min_area>=0.85) 且未被遮挡的 ≥2 条边位置钉死不变,
+        或球网框中心与长度几乎不动 → 归为同一机位!
+      - 导播切换机位/焦段: 四边整体位移缩放、长宽比/视角翻转、球网同步跳变 → 判为不同机位!
+    """
+    iou = _bbox_iou_xyxy(ba, bb)
+    if iou >= 0.62:
+        return True
+    cxa, cya = 0.5 * (ba[0] + ba[2]), 0.5 * (ba[1] + ba[3])
+    cxb, cyb = 0.5 * (bb[0] + bb[2]), 0.5 * (bb[1] + bb[3])
+    wa, ha = max(1.0, ba[2] - ba[0]), max(1.0, ba[3] - ba[1])
+    wb, hb = max(1.0, bb[2] - bb[0]), max(1.0, bb[3] - bb[1])
+    area_a, area_b = wa * ha, wb * hb
+    c_dist = math.hypot(cxa - cxb, cya - cyb)
+
+    # 轻微检测框呼吸
+    if c_dist <= 0.045 * diag and 0.58 <= (area_a / area_b) <= 1.72:
+        if 0.68 <= (wa / wb) <= 1.47 and 0.68 <= (ha / hb) <= 1.47:
+            return True
+
+    # 半遮挡子框保护: 小框 ≥85% 被大框包含, 且至少 2 条边钉死在原位 (变焦推拉时四边会同时收缩/扩张, 不会钉死两边)
+    ix1, iy1 = max(ba[0], bb[0]), max(ba[1], bb[1])
+    ix2, iy2 = min(ba[2], bb[2]), min(ba[3], bb[3])
+    if ix2 > ix1 and iy2 > iy1:
+        inter = (ix2 - ix1) * (iy2 - iy1)
+        contain = inter / max(1.0, min(area_a, area_b))
+        edge_tol = max(14.0, 0.015 * diag)
+        pinned_edges = sum(1 for k in range(4) if abs(ba[k] - bb[k]) <= edge_tol)
+        if contain >= 0.85 and pinned_edges >= 2:
+            return True
+
+    # 球网静止保护: 两帧均检出可靠球网且位置/尺度几乎完全重合, 同时球台中心未大幅跳变
+    if na is not None and nb is not None and c_dist <= 0.12 * diag:
+        ncx_a, ncy_a = 0.5 * (na[0] + na[2]), 0.5 * (na[1] + na[3])
+        ncx_b, ncy_b = 0.5 * (nb[0] + nb[2]), 0.5 * (nb[1] + nb[3])
+        nlen_a = math.hypot(na[2] - na[0], na[3] - na[1])
+        nlen_b = math.hypot(nb[2] - nb[0], nb[3] - nb[1])
+        if (math.hypot(ncx_a - ncx_b, ncy_a - ncy_b) <= 0.015 * diag
+                and 0.80 <= (nlen_a / max(1.0, nlen_b)) <= 1.25):
+            return True
+
+    return False
+
+
+def detect_camera_timeline(frames, total_frames, img_hw, fps, args):
+    """基于检测日志识别导播视角切换与机位聚类。
+
+    核心安全保证:
+      - auto 模式下, 只有检测到 ≥2 个「不同帧互斥、各自持续稳定 ≥1.0s」的球台机位时才返回 is_multi=True;
+      - 同帧共存的多球台球馆邻台、球员走过半遮挡/短暂全遮挡均不会触发多机位, 确保单机位视频 100% 走原生管线!
+    """
+    mode = getattr(args, "camera_mode", "auto") or "auto"
+    if mode == "single":
+        return {"is_multi": False}
+
+    h, w = img_hw
+    diag = math.hypot(w, h)
+    n_total = max(int(total_frames), (frames[-1]["frame"] + 1) if frames else 0)
+    min_shot_frames = max(25, int(round(fps * 1.0)))
+    if n_total < min_shot_frames * 2 or len(frames) < 30:
+        return {"is_multi": False}
+
+    # 副机位球台可能略偏离画面正中心, 聚类发现阶段适度放宽中心距离上限
+    disc_ratio = max(float(args.center_dist_ratio or 0.0), 0.36) if args.center_dist_ratio else None
+    disc_dist_max = disc_ratio * max(w, h) if disc_ratio else None
+    cx_img, cy_img = w * 0.5, h * 0.5
+
+    # 1) 收集每帧所有候选球台框与最近中心球网框
+    frame_tables = {}   # fidx -> [(dist_center, (x1,y1,x2,y2)), ...]
+    frame_net = {}      # fidx -> (x1,y1,x2,y2)
+    for fr in frames:
+        fidx = int(fr["frame"])
+        t_list = []
+        best_net, best_nd = None, 1e18
+        for det in fr.get("detections", []):
+            conf = det.get("confidence", 0.0)
+            if conf < 0.48:
+                continue
+            b = det.get("bbox")
+            if not b or len(b) != 4:
+                continue
+            bx1, by1, bx2, by2 = float(b[0]), float(b[1]), float(b[2]), float(b[3])
+            if (bx2 - bx1) < w * 0.05 or (by2 - by1) < h * 0.02:
+                continue
+            dc = math.hypot(0.5 * (bx1 + bx2) - cx_img, 0.5 * (by1 + by2) - cy_img)
+            cls = det.get("class")
+            if cls == "table":
+                if disc_dist_max is not None and dc > disc_dist_max:
+                    continue
+                t_list.append((dc, (bx1, by1, bx2, by2)))
+            elif cls == "net" and dc < best_nd:
+                best_nd = dc
+                best_net = (bx1, by1, bx2, by2)
+        if t_list:
+            t_list.sort(key=lambda x: x[0])
+            frame_tables[fidx] = t_list
+        if best_net is not None:
+            frame_net[fidx] = best_net
+
+    if not frame_tables:
+        return {"is_multi": False}
+
+    # 2) 对采样帧的主候选球台框做机位聚类
+    sorted_t_frames = sorted(frame_tables.keys())
+    sample_stride = max(1, len(sorted_t_frames) // 600)
+    clusters = []  # [{"boxes": [...], "nets": [...], "med_box": tuple, "med_net": tuple|None, "frames": set}]
+    for fidx in sorted_t_frames[::sample_stride]:
+        primary_box = frame_tables[fidx][0][1]
+        net_box = frame_net.get(fidx)
+        matched_ci = -1
+        for ci, cl in enumerate(clusters):
+            if _same_camera_table_view(primary_box, net_box, cl["med_box"], cl["med_net"], diag):
+                matched_ci = ci
+                break
+        if matched_ci < 0:
+            clusters.append({
+                "boxes": [primary_box],
+                "nets": [net_box] if net_box is not None else [],
+                "med_box": primary_box,
+                "med_net": net_box,
+                "frames": {fidx},
+            })
+        else:
+            cl = clusters[matched_ci]
+            cl["boxes"].append(primary_box)
+            if net_box is not None:
+                cl["nets"].append(net_box)
+            cl["frames"].add(fidx)
+            if len(cl["boxes"]) <= 30 or len(cl["boxes"]) % 15 == 0:
+                cl["med_box"] = tuple(np.median(np.array(cl["boxes"], dtype=np.float64), axis=0).tolist())
+                if cl["nets"]:
+                    cl["med_net"] = tuple(np.median(np.array(cl["nets"], dtype=np.float64), axis=0).tolist())
+
+    # 合并聚类收敛后彼此靠近的簇
+    clusters.sort(key=lambda c: len(c["boxes"]), reverse=True)
+    merged_clusters = []
+    for cl in clusters:
+        merged = False
+        for mcl in merged_clusters:
+            if _same_camera_table_view(cl["med_box"], cl["med_net"], mcl["med_box"], mcl["med_net"], diag):
+                mcl["boxes"].extend(cl["boxes"])
+                mcl["nets"].extend(cl["nets"])
+                mcl["frames"] |= cl["frames"]
+                mcl["med_box"] = tuple(np.median(np.array(mcl["boxes"], dtype=np.float64), axis=0).tolist())
+                if mcl["nets"]:
+                    mcl["med_net"] = tuple(np.median(np.array(mcl["nets"], dtype=np.float64), axis=0).tolist())
+                merged = True
+                break
+        if not merged:
+            merged_clusters.append(cl)
+
+    # 3) 同帧共存邻台剔除: 若某次级簇对应的球台在其他帧与更高频主簇「同帧同时出现」,
+    #    证明它是球馆里的隔壁球台(主机位被遮挡时短暂成为离中心最近框), 绝非导播切机位!
+    non_coexist = []
+    for ci, cl in enumerate(merged_clusters):
+        is_neighbor_table = False
+        for prev_cl in non_coexist:
+            co_cnt = 0
+            for f_chk in list(prev_cl["frames"])[:300]:
+                all_b = frame_tables.get(f_chk, [])
+                if len(all_b) < 2:
+                    continue
+                has_prev = any(_bbox_iou_xyxy(b, prev_cl["med_box"]) >= 0.45 for _, b in all_b)
+                has_cur = any(_bbox_iou_xyxy(b, cl["med_box"]) >= 0.45 for _, b in all_b)
+                if has_prev and has_cur:
+                    co_cnt += 1
+                    if co_cnt >= 2:
+                        break
+            if co_cnt >= 2:
+                is_neighbor_table = True
+                break
+        if not is_neighbor_table:
+            non_coexist.append(cl)
+
+    if not non_coexist:
+        return {"is_multi": False}
+
+    # 4) 逐帧归属标记 + 连续稳定平台校验
+    raw_cam = np.full(n_total, -1, dtype=np.int32)
+    for fidx, t_list in frame_tables.items():
+        if fidx >= n_total:
+            continue
+        net_b = frame_net.get(fidx)
+        # 优先匹配与该帧某个检测框同机位的最高频簇
+        best_cid = -1
+        for cid, cl in enumerate(non_coexist):
+            if any(_same_camera_table_view(b, net_b, cl["med_box"], cl["med_net"], diag) for _, b in t_list):
+                best_cid = cid
+                break
+        raw_cam[fidx] = best_cid
+
+    # 短暂漏检桥接: 若短缺口 (<0.75s) 前后属于同一机位, 视为同镜头内遮挡/漏检而非切特写
+    bridge_gap = max(20, int(round(fps * 0.75)))
+    close_up_min = max(25, int(round(fps * 0.85)))
+    filled_cam = raw_cam.copy()
+    idx = 0
+    while idx < n_total:
+        if filled_cam[idx] != -1:
+            idx += 1
+            continue
+        g_start = idx
+        while idx < n_total and filled_cam[idx] == -1:
+            idx += 1
+        g_end = idx - 1
+        left_c = filled_cam[g_start - 1] if g_start > 0 else -1
+        right_c = filled_cam[idx] if idx < n_total else -1
+        if left_c >= 0 and left_c == right_c and (g_end - g_start + 1) <= bridge_gap:
+            filled_cam[g_start:idx] = left_c
+        elif (g_end - g_start + 1) < close_up_min:
+            # 极短过渡归并到紧邻有效机位, 保证切镜边界干净利落
+            fill_c = left_c if left_c >= 0 else right_c
+            if fill_c >= 0:
+                filled_cam[g_start:idx] = fill_c
+
+    # 吸收切换边缘 <0.25s 的毛刺帧
+    min_flicker = max(6, int(round(fps * 0.25)))
+    runs = []
+    r_s = 0
+    for k in range(1, n_total + 1):
+        if k == n_total or filled_cam[k] != filled_cam[r_s]:
+            runs.append([r_s, k - 1, int(filled_cam[r_s])])
+            r_s = k
+    for ri in range(len(runs)):
+        s_i, e_i, c_i = runs[ri]
+        if (e_i - s_i + 1) < min_flicker and len(runs) > 1:
+            if ri > 0:
+                runs[ri][2] = runs[ri - 1][2]
+            else:
+                runs[ri][2] = runs[ri + 1][2]
+
+    # 合并同 cam_id 相邻段
+    merged_runs = [runs[0][:]]
+    for s_i, e_i, c_i in runs[1:]:
+        if c_i == merged_runs[-1][2]:
+            merged_runs[-1][1] = e_i
+        else:
+            merged_runs.append([s_i, e_i, c_i])
+
+    # 统计真正满足最小稳定持续时长的有效球台机位集合
+    valid_cids = set()
+    cam_total_frames = defaultdict(int)
+    cam_max_run = defaultdict(int)
+    for s_i, e_i, c_i in merged_runs:
+        if c_i >= 0:
+            dur_f = e_i - s_i + 1
+            cam_total_frames[c_i] += dur_f
+            if dur_f > cam_max_run[c_i]:
+                cam_max_run[c_i] = dur_f
+    for c_i, tot_f in cam_total_frames.items():
+        if cam_max_run[c_i] >= min_shot_frames and tot_f >= max(30, int(round(fps * 1.2))):
+            valid_cids.add(c_i)
+
+    # auto 模式黄金准则: 只有实锤存在 ≥2 个不同球台机位时才进入多机位模式;
+    # 单机位视频直接返回 is_multi=False, 100% 保持原单机位逻辑与表现不变!
+    has_closeup_cuts = any(c_i == -1 and (e_i - s_i + 1) >= close_up_min for s_i, e_i, c_i in merged_runs)
+    if mode == "auto" and len(valid_cids) < 2:
+        if args.debug:
+            log(f"  📹 机位自检(auto): 仅检出 {len(valid_cids)} 个稳定球台机位 → 保持原生单机位模式")
+        return {"is_multi": False}
+    if mode == "multi" and len(valid_cids) == 0:
+        return {"is_multi": False}
+    if mode == "multi" and len(valid_cids) == 1 and not has_closeup_cuts:
+        return {"is_multi": False}
+
+    # 清理未达标的极小杂散机位并重新编号 0, 1, ...
+    ordered_cids = sorted(valid_cids, key=lambda c: -cam_total_frames[c])
+    cid_remap = {old_c: new_c for new_c, old_c in enumerate(ordered_cids)}
+    clean_runs = []
+    for s_i, e_i, c_i in merged_runs:
+        mapped = cid_remap.get(c_i, None)
+        if clean_runs and clean_runs[-1][2] == mapped:
+            clean_runs[-1][1] = e_i
+        else:
+            clean_runs.append([s_i, e_i, mapped])
+
+    # 5) 为每个有效球台机位聚合其名下所有帧, 独立提取高精度 table_geo
+    shot_of_frame = np.full(n_total, -1, dtype=np.int32)
+    cam_of_frame = np.full(n_total, -1, dtype=np.int32)
+    shots = []
+    for si, (s_i, e_i, mapped_cid) in enumerate(clean_runs):
+        shots.append({
+            "shot_id": si,
+            "start_frame": int(s_i),
+            "end_frame": int(e_i),
+            "cam_id": mapped_cid,
+        })
+        shot_of_frame[s_i:e_i + 1] = si
+        if mapped_cid is not None:
+            cam_of_frame[s_i:e_i + 1] = int(mapped_cid)
+
+    frames_by_cam = defaultdict(list)
+    for fr in frames:
+        fidx = int(fr["frame"])
+        if 0 <= fidx < n_total:
+            cid = int(cam_of_frame[fidx])
+            if cid >= 0:
+                frames_by_cam[cid].append(fr)
+
+    cam_geos = {}
+    cam_scales = {}
+    for cid in range(len(ordered_cids)):
+        c_frames = frames_by_cam.get(cid, [])
+        if len(c_frames) < 3:
+            continue
+        if args.debug:
+            log(f"  📐 提取机位 Cam#{cid} 几何 (覆盖 {len(c_frames)} 帧) ...")
+        geo = extract_table_geometry(
+            c_frames, img_hw, debug=args.debug,
+            corridor_margin=args.corridor_margin, corridor_extend=args.corridor_extend,
+            center_dist_ratio=args.center_dist_ratio)
+        if geo is None and args.center_dist_ratio:
+            # 副机位球台可能偏离中心超过默认 0.2, 自动放宽重试一次
+            geo = extract_table_geometry(
+                c_frames, img_hw, debug=args.debug,
+                corridor_margin=args.corridor_margin, corridor_extend=args.corridor_extend,
+                center_dist_ratio=max(float(args.center_dist_ratio), 0.40))
+        if geo is not None:
+            _, s_px_m = estimate_gravity_px_per_frame2(geo, None, fps, w, h, debug=False)
+            geo["s_px_m"] = s_px_m
+            cam_geos[cid] = geo
+            cam_scales[cid] = s_px_m
+
+    # 若有效拟合出的几何不足 2 套且非显式 multi 特写屏蔽场景, 安全回退单机位原生管线
+    if mode == "auto" and len(cam_geos) < 2:
+        if args.debug:
+            log(f"  📹 机位自检(auto): 成功拟合几何机位数={len(cam_geos)}<2 → 安全回退单机位模式")
+        return {"is_multi": False}
+
+    cut_frames = {sh["start_frame"] for sh in shots[1:]}
+    n_closeup = sum(1 for sh in shots if sh["cam_id"] is None)
+    log(f"📹 检测到多视角切镜: 共 {len(shots)} 个镜头 "
+        f"({len(cam_geos)} 个球台机位, {n_closeup} 段无球台特写, {len(cut_frames)} 处切镜点)")
+    if args.debug:
+        for sh in shots:
+            tag = f"Cam#{sh['cam_id']}" if sh["cam_id"] is not None else "NO_TABLE(特写)"
+            log(f"    镜头{sh['shot_id']}: [{sh['start_frame']}-{sh['end_frame']}] "
+                f"({(sh['end_frame'] - sh['start_frame'] + 1) / fps:.1f}s) → {tag}")
+
+    ref_cid = 0 if 0 in cam_scales else (min(cam_scales.keys()) if cam_scales else None)
+    ref_scale = cam_scales.get(ref_cid, diag * 0.16)
+    return {
+        "is_multi": True,
+        "shots": shots,
+        "cut_frames": cut_frames,
+        "shot_of_frame": shot_of_frame,
+        "cam_of_frame": cam_of_frame,
+        "cam_geos": cam_geos,
+        "cam_scales": cam_scales,
+        "ref_scale": ref_scale,
+        "primary_geo": cam_geos.get(ref_cid) if ref_cid is not None else None,
+    }
+
+
+def run_multi_camera_track_and_events(cam_timeline, ball_cands, fps, in_w, in_h, args):
+    """多机位模式下按机位去静止球、按镜头隔离追踪/抛物线净化/平滑补帧/落点检测与跨焦段球速归一化。"""
+    shots = cam_timeline["shots"]
+    cam_geos = cam_timeline["cam_geos"]
+    cam_scales = cam_timeline["cam_scales"]
+    ref_scale = max(1.0, float(cam_timeline["ref_scale"]))
+    cam_of_frame = cam_timeline["cam_of_frame"]
+    n_total = len(cam_of_frame)
+
+    # 1) 按机位分组执行静止球过滤 (排除 NO_TABLE 特写镜头, 且避免机位 A 静止点误杀机位 B 正常球)
+    cands_by_cam = defaultdict(list)
+    for fidx, cands in ball_cands:
+        if 0 <= fidx < n_total:
+            cid = int(cam_of_frame[fidx])
+            if cid >= 0 and cid in cam_geos:
+                cands_by_cam[cid].append((fidx, cands))
+
+    filtered_by_frame = {}
+    for cid, ccands in cands_by_cam.items():
+        cclean = filter_static_ball_candidates(
+            ccands, fps, in_w, in_h,
+            min_static_count=args.min_static_ball_count, debug=args.debug)
+        for fidx, rem in cclean:
+            filtered_by_frame[fidx] = rem
+
+    # 2) 按每个镜头(Shot)严格隔离执行走廊过滤 → 轨迹关联 → 重力抛物线净化 → 补帧 → 落点/击球事件
+    main_track_all = {}
+    filled_all = {}
+    events_all = []
+    bounce_halves_all = {}
+    raw_px_norm = {}   # 归一化到主机位比例尺后的等效 px/s
+    kmh_by_frame = {}
+
+    for sh in shots:
+        cid = sh["cam_id"]
+        if cid is None or cid not in cam_geos:
+            continue
+        s_f, e_f = sh["start_frame"], sh["end_frame"]
+        geo = cam_geos[cid]
+        geo_rebuilt = bool(geo.get("rebuilt"))
+        sh_cands = [(f, filtered_by_frame[f])
+                    for f in range(s_f, e_f + 1) if f in filtered_by_frame]
+        if not sh_cands:
+            continue
+
+        corridor = geo.get("corridor")
+        if corridor is not None:
+            sh_cands = filter_ball_by_corridor(
+                sh_cands, corridor, max_drop_ratio=args.corridor_max_drop,
+                geo_rebuilt=geo_rebuilt, debug=False)
+        if args.court_cluster:
+            sh_cands = cluster_ball_by_court(sh_cands, in_w, in_h, debug=False)
+
+        sh_main = build_main_ball_track(
+            sh_cands, fps, in_w, in_h, table_geo=geo, debug=False,
+            max_jump_ratio=args.max_jump_ratio, match_algo=args.match_algo)
+        if not sh_main:
+            continue
+
+        sh_g, sh_scale = estimate_gravity_px_per_frame2(
+            geo, sh_main, fps, in_w, in_h, debug=False)
+        scale_factor = ref_scale / max(1.0, float(cam_scales.get(cid, sh_scale)))
+        sh_main = clean_ball_track_parabolic(
+            sh_main, fps, in_w, in_h, sh_g,
+            table_geo=geo, max_jump_ratio=args.max_jump_ratio, debug=False)
+        if not sh_main:
+            continue
+
+        main_track_all.update(sh_main)
+        sh_filled = interpolate_track(
+            sh_main, fps, in_w, in_h, debug=False,
+            table_geo=geo, g_frame=sh_g, smooth=(not args.no_track_smooth))
+        filled_all.update(sh_filled)
+
+        sh_evs, sh_bh = detect_bounce_events(
+            sh_filled, geo, fps, table_edge_tol=args.table_edge_tol)
+        events_all.extend(sh_evs)
+        bounce_halves_all.update(sh_bh)
+
+        # 镜头内部计算逐帧球速 (杜绝跨镜头坐标差分, 并按机位比例尺归一化等效像素速度)
+        sh_keys = sorted(sh_filled.keys())
+        for i in range(1, len(sh_keys)):
+            f0, f1 = sh_keys[i - 1], sh_keys[i]
+            df = f1 - f0
+            if df <= 0 or df > int(fps * 0.4) + 2:
+                continue
+            x0, y0, _ = sh_filled[f0]
+            x1, y1, _ = sh_filled[f1]
+            raw_px_norm[f1] = (math.hypot(x1 - x0, y1 - y0) / (df / fps)) * scale_factor
+            if geo.get("homography") is not None:
+                t0 = img_to_table(geo, (x0, y0))
+                t1 = img_to_table(geo, (x1, y1))
+                if t0 and t1:
+                    d_mm = math.hypot(t1[0] - t0[0], t1[1] - t0[1])
+                    raw_kmh = (d_mm / 1000.0) / (df / fps) * 3.6
+                    if 0.0 < raw_kmh <= 165.0:
+                        kmh_by_frame[f1] = raw_kmh
+
+    events_all.sort(key=lambda e: e["frame"])
+
+    # 3) 汇总全片归一化速度表
+    if not raw_px_norm:
+        speed_table, sp_stats = {}, (1.0, 1.0)
+    else:
+        vals = sorted(raw_px_norm.values())
+        p50 = vals[len(vals) // 2]
+        p95 = max(vals[min(len(vals) - 1, int(len(vals) * 0.95))], p50 * 1.5, 1.0)
+        all_keys = sorted(filled_all.keys())
+        win = max(1, int(fps * 0.08))
+        shot_arr = cam_timeline["shot_of_frame"]
+        smoothed = {}
+        for i, f in enumerate(all_keys):
+            sh_i = shot_arr[f] if 0 <= f < len(shot_arr) else -1
+            acc = [raw_px_norm[all_keys[j]]
+                   for j in range(max(0, i - win), min(len(all_keys), i + win + 1))
+                   if all_keys[j] in raw_px_norm
+                   and (0 <= all_keys[j] < len(shot_arr) and shot_arr[all_keys[j]] == sh_i)]
+            if acc:
+                smoothed[f] = sum(acc) / len(acc)
+        speed_table = {}
+        for f in all_keys:
+            px_s = smoothed.get(f, raw_px_norm.get(f))
+            if px_s is None:
+                continue
+            norm = _clamp((px_s - p50 * 0.4) / (p95 - p50 * 0.4 + 1e-6), 0.0, 1.0)
+            speed_table[f] = {"px_s": px_s, "kmh": kmh_by_frame.get(f), "norm": norm}
+        sp_stats = (p50, p95)
+
+    return main_track_all, filled_all, speed_table, sp_stats, events_all, bounce_halves_all
 
 
 # =====================================================================
@@ -2828,15 +3343,25 @@ def detect_rallies(filled_track, fps, total_frames, raw_log_path, table_geo=None
                    rally_lost_timeout=1.0, rally_min_duration=0.6, pre_roll_sec=1.0,
                    slow_speed_window_sec=1.0, slow_speed_min_in_play_sec=0.8,
                    out_of_table_timeout=1.0, no_bounce_timeout=2.0,
-                   bounce_halves=None, net_center_x_hint=None, debug=False):
+                   bounce_halves=None, net_center_x_hint=None,
+                   cam_timeline=None, debug=False):
     if not filled_track or fps <= 0:
         return []
+    is_multi = bool(cam_timeline and cam_timeline.get("is_multi"))
+    cut_frames = cam_timeline["cut_frames"] if is_multi else None
+    cam_of_frame = cam_timeline["cam_of_frame"] if is_multi else None
+    shot_of_frame = cam_timeline["shot_of_frame"] if is_multi else None
+    shots_list = cam_timeline["shots"] if is_multi else None
+    cam_geos = cam_timeline["cam_geos"] if is_multi else None
+
     ball_lookup = {f: ((x, y), not interp) for f, (x, y, interp) in filled_track.items()}
     sorted_frames = sorted(ball_lookup.keys())
     net_line = table_geo.get("net_line") if table_geo else None
+    has_any_net = (net_line is not None) or (
+        is_multi and any(g.get("net_line") is not None for g in cam_geos.values()))
     net_center_x = (net_center_x_hint if net_center_x_hint is not None
-                    else (_get_net_center_x(raw_log_path) if net_line is None else None))
-    if net_line is None and net_center_x is None and not bounce_halves:
+                    else (_get_net_center_x(raw_log_path) if not has_any_net else None))
+    if not has_any_net and net_center_x is None and not bounce_halves:
         log("  ⚠️ 无球网且无落点信息, 回退到连续性切分")
         keys = sorted_frames
         max_gap = int(fps * 0.45)
@@ -2889,9 +3414,20 @@ def detect_rallies(filled_track, fps, total_frames, raw_log_path, table_geo=None
     traj_buffer = deque(maxlen=max(PRE_ROLL_FRAMES * 3, int(fps * 6)))
     idle_bounces = deque()
 
-    def _ball_side(x, y):
-        if net_line is not None:
-            (nx1, ny1), (nx2, ny2) = net_line
+    def _geo_for_frame(f_i):
+        if not is_multi:
+            return table_geo
+        if 0 <= f_i < len(cam_of_frame):
+            cid = int(cam_of_frame[f_i])
+            if cid >= 0:
+                return cam_geos.get(cid)
+        return None
+
+    def _ball_side(x, y, f_i=None):
+        g_cur = _geo_for_frame(f_i) if is_multi else table_geo
+        nl_cur = g_cur.get("net_line") if g_cur else net_line
+        if nl_cur is not None:
+            (nx1, ny1), (nx2, ny2) = nl_cur
             return 'A' if (nx2 - nx1) * (y - ny1) - (ny2 - ny1) * (x - nx1) > 0 else 'B'
         if net_center_x is not None:
             return 'L' if x < net_center_x else 'R'
@@ -2912,11 +3448,23 @@ def detect_rallies(filled_track, fps, total_frames, raw_log_path, table_geo=None
             spds.append(math.hypot(x1 - x0, y1 - y0) / (df / fps))
         return sum(spds) / len(spds) if spds else None
 
+    CLOSEUP_END_WAIT = max(4, int(round(fps * 0.35)))
+
     for frame_idx in range(first_frame, last_frame + 1):
+        # 多机位切镜边界自适应重置: 保持进行中回合不断裂, 但清空依赖旧相机坐标系的方位/走廊/速度差分缓存
+        if is_multi and frame_idx in cut_frames:
+            prev_side = None
+            out_of_table_run = 0
+            same_half_count, last_bounce_half = 0, None
+            traj_buffer.clear()
+            if idle_bounces:
+                # 若切镜前刚完成发球第一跳, 将其半台标记转为跨镜通配符 'PRE_CUT', 使切回全景后的接发球第二跳仍能正常触发回合开始
+                idle_bounces = deque((bf, "PRE_CUT") for bf, _ in idle_bounces)
+
         entry = ball_lookup.get(frame_idx)
         if entry is not None:
             (bx, by), is_real = entry
-            side = _ball_side(bx, by)
+            side = _ball_side(bx, by, frame_idx)
             traj_buffer.append((frame_idx, frame_idx / fps, float(bx), float(by), bool(is_real), side))
             missing_ball_frames = 0
         else:
@@ -2971,9 +3519,11 @@ def detect_rallies(filled_track, fps, total_frames, raw_log_path, table_geo=None
                 if slow_run_frames >= SLOW_WIN_FRAMES:
                     end_by_slow = True
             end_by_out = False
-            if corridor is not None:
+            corridor_cur = ((_geo_for_frame(frame_idx) or {}).get("corridor")
+                            if is_multi else corridor)
+            if corridor_cur is not None:
                 if entry is not None:
-                    if _point_in_corridor((bx, by), corridor):
+                    if _point_in_corridor((bx, by), corridor_cur):
                         out_of_table_run = 0
                     else:
                         out_of_table_run += 1
@@ -2982,6 +3532,12 @@ def detect_rallies(filled_track, fps, total_frames, raw_log_path, table_geo=None
                     out_of_table_run += 1
                 if out_of_table_run >= OUT_OF_TABLE_FRAMES:
                     end_by_out = True
+            end_by_closeup = False
+            if is_multi and 0 <= frame_idx < len(shot_of_frame):
+                sh_idx = int(shot_of_frame[frame_idx])
+                if sh_idx >= 0 and shots_list[sh_idx]["cam_id"] is None:
+                    if missing_ball_frames >= CLOSEUP_END_WAIT:
+                        end_by_closeup = True
             # 落点状态机: ① 同半台连续落点 3 次 → 结束; ② 球台连续无新落点超时 → 结束
             end_by_same_half = False
             end_by_no_bounce = False
@@ -2999,9 +3555,12 @@ def detect_rallies(filled_track, fps, total_frames, raw_log_path, table_geo=None
             if (bounce_halves and no_bounce_last_frame is not None and
                     frame_idx - no_bounce_last_frame >= NO_BOUNCE_FRAMES):
                 end_by_no_bounce = True
-            if end_by_lost or end_by_slow or end_by_out or end_by_same_half or end_by_no_bounce:
+            if (end_by_lost or end_by_slow or end_by_out or end_by_same_half
+                    or end_by_no_bounce or end_by_closeup):
                 if end_by_same_half:
                     end_reason = "three_same_half"
+                elif end_by_closeup:
+                    end_reason = "camera_cut_closeup"
                 elif end_by_no_bounce:
                     end_reason = "no_bounce"
                 elif end_by_out:
@@ -3012,13 +3571,21 @@ def detect_rallies(filled_track, fps, total_frames, raw_log_path, table_geo=None
                     end_reason = "ball_too_slow"
                 if end_by_same_half:
                     end_f = frame_idx
+                elif end_by_closeup:
+                    end_f = current_rally["start_frame"]
+                    for f in range(frame_idx, current_rally["start_frame"] - 1, -1):
+                        if ball_lookup.get(f) is not None:
+                            end_f = f
+                            break
                 elif end_by_no_bounce:
                     end_f = no_bounce_last_frame  # 回退到最后一次落点帧, 裁掉无落点空窗
                 elif end_by_out:
                     end_f = frame_idx
                     for f in range(frame_idx, current_rally["start_frame"] - 1, -1):
                         e = ball_lookup.get(f)
-                        if e is not None and _point_in_corridor((e[0][0], e[0][1]), corridor):
+                        c_f = ((_geo_for_frame(f) or {}).get("corridor")
+                               if is_multi else corridor)
+                        if e is not None and _point_in_corridor((e[0][0], e[0][1]), c_f):
                             end_f = f
                             break
                 elif end_by_lost and missing_ball_frames > 0:
@@ -3064,24 +3631,34 @@ def _landing_half(landing):
     return 'FAR' if txy[1] < TABLE_LEN_M * 1000 / 2.0 else 'NEAR'
 
 
-def filter_alternating_landings(landings, debug=False):
+def filter_alternating_landings(landings, debug=False, cut_splits=None):
     if not landings:
         return []
     ordered = sorted(landings, key=lambda lp: lp["frame"])
-    kept, last_half, n_drop = [], None, 0
+    kept, last_half, last_f, n_drop = [], None, None, 0
     for lp in ordered:
+        f_cur = lp["frame"]
+        # 若两落点之间跨越了导播切镜边界, 重置半台交替状态(兼容正反机位 NEAR/FAR 对调)
+        if cut_splits and last_f is not None:
+            ci = bisect.bisect_right(cut_splits, last_f)
+            if ci < len(cut_splits) and cut_splits[ci] <= f_cur:
+                last_half = None
         half = lp.get("half") or _landing_half(lp)
         if half is None or half == last_half:
             n_drop += 1
             continue
         kept.append(lp)
         last_half = half
+        last_f = f_cur
     if debug and n_drop > 0:
         log(f"    落点交替过滤: {len(ordered)} → {len(kept)} 个落点 (剔除 {n_drop})")
     return kept
 
 
-def build_landing_rally_index(segments, rally_starts_by_seg, landing_all, debug=False):
+def build_landing_rally_index(segments, rally_starts_by_seg, landing_all,
+                              debug=False, cut_frames=None):
+    cut_splits = sorted(cut_frames) if cut_frames else None
+
     def seg_of_frame(f):
         for i, (s, e) in enumerate(segments):
             if s <= f <= e:
@@ -3110,7 +3687,7 @@ def build_landing_rally_index(segments, rally_starts_by_seg, landing_all, debug=
             group = [lp for lp in seg_landings if lo <= lp["frame"] < hi]
             if not group:
                 continue
-            kept = filter_alternating_landings(group, debug=debug)
+            kept = filter_alternating_landings(group, debug=debug, cut_splits=cut_splits)
             for lp in kept:
                 landing_rally_id[(si, lp["frame"])] = bi
             landing_by_seg[si].extend(kept)
@@ -3662,7 +4239,7 @@ def smooth_trail(points):
 def render(args, segments, rally_starts_by_seg, filled_track, events, table_geo,
            in_w, in_h, fps, total_frames, ball_speed_table, player_boxes,
            prepend_segments=None, prepend_rally_starts_by_seg=None,
-           black_gap_sec=1.0):
+           black_gap_sec=1.0, cut_frames=None):
     out_h = args.output_height or in_h
     out_w = int(round(in_w * out_h / in_h))
     if out_w % 2:
@@ -3705,7 +4282,8 @@ def render(args, segments, rally_starts_by_seg, filled_track, events, table_geo,
                 "snorm": event_speed_norm(ev), "kmh": ev.get("speed_kmh")})
 
     landing_by_seg, landing_rally_id = build_landing_rally_index(
-        segments, rally_starts_by_seg, landing_all, debug=args.debug)
+        segments, rally_starts_by_seg, landing_all,
+        debug=args.debug, cut_frames=cut_frames)
 
     scaled_track = {f: (x * scale, y * scale) for f, (x, y, _) in filled_track.items()}
 
@@ -3849,6 +4427,14 @@ def render(args, segments, rally_starts_by_seg, filled_track, events, table_geo,
                     if do_resize:
                         frame = cv2.resize(frame, (out_w, out_h), interpolation=cv2.INTER_LINEAR)
 
+                    # 片段内部跨越导播切镜点时, 立即清空上一视角残留的拖尾/选手框/粒子/飘字
+                    if cut_frames and f in cut_frames and f > s_f:
+                        trail.clear()
+                        last_trail_f = None
+                        prev_player_boxes = None
+                        particles.particles.clear()
+                        labels.labels.clear()
+
                     for sev in scaled_ev_by_frame.get(f, []):
                         snorm = sev["snorm"]
                         is_bounce = (sev["type"] == "bounce")
@@ -3912,7 +4498,7 @@ def render(args, segments, rally_starts_by_seg, filled_track, events, table_geo,
         if prepend_segments:
             prepend_landing_by_seg, prepend_landing_rally_id = build_landing_rally_index(
                 prepend_segments, prepend_rally_starts_by_seg or {},
-                landing_all, debug=False)
+                landing_all, debug=False, cut_frames=cut_frames)
             log(f"🎬 渲染前置精彩回合: {len(prepend_segments)} 段")
             _render_segment_batch(prepend_segments, prepend_landing_by_seg,
                                   prepend_landing_rally_id)
@@ -4070,7 +4656,7 @@ def main():
     if out_parent:
         os.makedirs(out_parent, exist_ok=True)
     log("=" * 60)
-    log("🏓 PingPong Highlight Generator (v4.17 物理抛物线净化+平滑 | 残影时长可调)")
+    log("🏓 PingPong Highlight Generator (v4.18 物理抛物线净化 | 多机位切镜自适应)")
     log("=" * 60)
     cap = cv2.VideoCapture(args.video)
     if not cap.isOpened():
@@ -4087,65 +4673,98 @@ def main():
     frames = load_detections(args.raw_detections)
     log(f"   {len(frames)} 条帧记录")
 
-    log("📐 提取球台/球网几何 + 校验自愈 + 长边走廊 ...")
-    table_geo = extract_table_geometry(
-        frames, (in_h, in_w), debug=args.debug,
-        corridor_margin=args.corridor_margin, corridor_extend=args.corridor_extend,
-        center_dist_ratio=args.center_dist_ratio)
-    geo_rebuilt = bool(table_geo.get("rebuilt")) if table_geo else False
-    net_center_x_hint = (_get_net_center_x(frames)
-                         if (table_geo is None or table_geo.get("net_line") is None) else None)
+    cam_timeline = detect_camera_timeline(frames, total_frames, (in_h, in_w), fps, args)
+    is_multi_cam = bool(cam_timeline.get("is_multi"))
 
-    if not args.no_player_fx:
-        player_boxes, _pc = gather_player_boxes(frames, debug=args.debug)
+    if not is_multi_cam:
+        # ==================== 原生单机位管线 (与既有版本 100% 一致) ====================
+        log("📐 提取球台/球网几何 + 校验自愈 + 长边走廊 ...")
+        table_geo = extract_table_geometry(
+            frames, (in_h, in_w), debug=args.debug,
+            corridor_margin=args.corridor_margin, corridor_extend=args.corridor_extend,
+            center_dist_ratio=args.center_dist_ratio)
+        geo_rebuilt = bool(table_geo.get("rebuilt")) if table_geo else False
+        net_center_x_hint = (_get_net_center_x(frames)
+                             if (table_geo is None or table_geo.get("net_line") is None) else None)
+
+        if not args.no_player_fx:
+            player_boxes, _pc = gather_player_boxes(frames, debug=args.debug)
+        else:
+            player_boxes = {}
+
+        log("⚪ 提取主球轨迹 (走廊软过滤 + 多球过滤 + 重力抛物线净化) ...")
+        ball_cands = gather_ball_candidates(frames, fps, conf_min=args.ball_conf)
+        # 及时释放全量帧检测字典, 降低长视频渲染阶段常驻内存占用
+        del frames
+
+        ball_cands = filter_static_ball_candidates(
+            ball_cands, fps, in_w, in_h,
+            min_static_count=args.min_static_ball_count, debug=args.debug)
+        corridor = table_geo.get("corridor") if table_geo else None
+        if corridor is not None:
+            ball_cands = filter_ball_by_corridor(
+                ball_cands, corridor, max_drop_ratio=args.corridor_max_drop,
+                geo_rebuilt=geo_rebuilt, debug=args.debug)
+        if args.court_cluster:
+            ball_cands = cluster_ball_by_court(ball_cands, in_w, in_h, debug=args.debug)
+        main_track = build_main_ball_track(
+            ball_cands, fps, in_w, in_h, table_geo=table_geo, debug=args.debug,
+            max_jump_ratio=args.max_jump_ratio, match_algo=args.match_algo)
+        g_frame, _ = estimate_gravity_px_per_frame2(
+            table_geo, main_track, fps, in_w, in_h, debug=args.debug)
+        main_track = clean_ball_track_parabolic(
+            main_track, fps, in_w, in_h, g_frame,
+            table_geo=table_geo, max_jump_ratio=args.max_jump_ratio, debug=args.debug)
+        log(f"   主轨迹净化后点数: {len(main_track)}")
+
+        log("🧩 分段重力抛物线平滑 + 物理弹道补帧 ...")
+        filled = interpolate_track(
+            main_track, fps, in_w, in_h, debug=args.debug,
+            table_geo=table_geo, g_frame=g_frame, smooth=(not args.no_track_smooth))
+
+        log("⚡ 计算逐帧球速表 (速度自适应特效) ...")
+        ball_speed_table, (p50, p95) = compute_ball_speed_table(filled, table_geo, fps, in_w, in_h)
+        if args.debug:
+            log(f"   球速基准: p50={p50:.0f}px/s  p95={p95:.0f}px/s  (共 {len(ball_speed_table)} 帧速度)")
+
+        log("🎾 检测回合与落点/击球事件 ...")
+        events, hl_bounce_halves = detect_bounce_events(filled, table_geo, fps,
+                                                        table_edge_tol=args.table_edge_tol)
+        rallies = detect_rallies(filled, fps, total_frames, args.raw_detections,
+                                 table_geo=table_geo, bounce_halves=hl_bounce_halves,
+                                 net_center_x_hint=net_center_x_hint,
+                                 out_of_table_timeout=args.out_of_table_timeout,
+                                 rally_lost_timeout=args.rally_lost_timeout,
+                                 no_bounce_timeout=args.no_bounce_timeout, debug=args.debug)
+        cut_frames_for_render = None
     else:
-        player_boxes = {}
+        # ==================== 多机位分段几何管线 (导播切视角视频) ====================
+        table_geo = cam_timeline.get("primary_geo")
+        net_center_x_hint = _get_net_center_x(frames)
+        if not args.no_player_fx:
+            player_boxes, _pc = gather_player_boxes(frames, debug=args.debug)
+        else:
+            player_boxes = {}
 
-    log("⚪ 提取主球轨迹 (走廊软过滤 + 多球过滤 + 重力抛物线净化) ...")
-    ball_cands = gather_ball_candidates(frames, fps, conf_min=args.ball_conf)
-    # 及时释放全量帧检测字典, 降低长视频渲染阶段常驻内存占用
-    del frames
+        log("⚪ 按镜头(Shot)提取多视角主球轨迹 + 重力抛物线净化 + 弹道补帧 ...")
+        ball_cands = gather_ball_candidates(frames, fps, conf_min=args.ball_conf)
+        del frames
 
-    ball_cands = filter_static_ball_candidates(
-        ball_cands, fps, in_w, in_h,
-        min_static_count=args.min_static_ball_count, debug=args.debug)
-    corridor = table_geo.get("corridor") if table_geo else None
-    if corridor is not None:
-        ball_cands = filter_ball_by_corridor(
-            ball_cands, corridor, max_drop_ratio=args.corridor_max_drop,
-            geo_rebuilt=geo_rebuilt, debug=args.debug)
-    if args.court_cluster:
-        ball_cands = cluster_ball_by_court(ball_cands, in_w, in_h, debug=args.debug)
-    main_track = build_main_ball_track(
-        ball_cands, fps, in_w, in_h, table_geo=table_geo, debug=args.debug,
-        max_jump_ratio=args.max_jump_ratio, match_algo=args.match_algo)
-    g_frame, _ = estimate_gravity_px_per_frame2(
-        table_geo, main_track, fps, in_w, in_h, debug=args.debug)
-    main_track = clean_ball_track_parabolic(
-        main_track, fps, in_w, in_h, g_frame,
-        table_geo=table_geo, max_jump_ratio=args.max_jump_ratio, debug=args.debug)
-    log(f"   主轨迹净化后点数: {len(main_track)}")
+        main_track, filled, ball_speed_table, (p50, p95), events, hl_bounce_halves = (
+            run_multi_camera_track_and_events(cam_timeline, ball_cands, fps, in_w, in_h, args))
+        log(f"   多机位主轨迹净化后点数: {len(main_track)}, 补帧后点数: {len(filled)}")
+        if args.debug:
+            log(f"   归一化球速基准: p50={p50:.0f}px/s  p95={p95:.0f}px/s  (共 {len(ball_speed_table)} 帧速度)")
 
-    log("🧩 分段重力抛物线平滑 + 物理弹道补帧 ...")
-    filled = interpolate_track(
-        main_track, fps, in_w, in_h, debug=args.debug,
-        table_geo=table_geo, g_frame=g_frame, smooth=(not args.no_track_smooth))
-
-    log("⚡ 计算逐帧球速表 (速度自适应特效) ...")
-    ball_speed_table, (p50, p95) = compute_ball_speed_table(filled, table_geo, fps, in_w, in_h)
-    if args.debug:
-        log(f"   球速基准: p50={p50:.0f}px/s  p95={p95:.0f}px/s  (共 {len(ball_speed_table)} 帧速度)")
-
-    log("🎾 检测回合与落点/击球事件 ...")
-    # 统一落点/击球检测: 一次遍历产出渲染事件流 + 回合用落点半台分布
-    events, hl_bounce_halves = detect_bounce_events(filled, table_geo, fps,
-                                                    table_edge_tol=args.table_edge_tol)
-    rallies = detect_rallies(filled, fps, total_frames, args.raw_detections,
-                             table_geo=table_geo, bounce_halves=hl_bounce_halves,
-                             net_center_x_hint=net_center_x_hint,
-                             out_of_table_timeout=args.out_of_table_timeout,
-                             rally_lost_timeout=args.rally_lost_timeout,
-                             no_bounce_timeout=args.no_bounce_timeout, debug=args.debug)
+        log("🎾 跨视角检测回合与落点/击球事件 ...")
+        rallies = detect_rallies(filled, fps, total_frames, args.raw_detections,
+                                 table_geo=table_geo, bounce_halves=hl_bounce_halves,
+                                 net_center_x_hint=net_center_x_hint,
+                                 out_of_table_timeout=args.out_of_table_timeout,
+                                 rally_lost_timeout=args.rally_lost_timeout,
+                                 no_bounce_timeout=args.no_bounce_timeout,
+                                 cam_timeline=cam_timeline, debug=args.debug)
+        cut_frames_for_render = cam_timeline["cut_frames"]
     log(f"   回合: {len(rallies)}, 事件: {len(events)}")
 
     if args.cut:
@@ -4194,7 +4813,8 @@ def main():
            in_w, in_h, fps, total_frames, ball_speed_table, player_boxes,
            prepend_segments=top_segs or None,
            prepend_rally_starts_by_seg=top_rally_starts,
-           black_gap_sec=args.highlight_black_gap)
+           black_gap_sec=args.highlight_black_gap,
+           cut_frames=cut_frames_for_render)
     log(f"🎉 完成! 输出: {args.output}")
 
 

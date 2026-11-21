@@ -50,6 +50,7 @@ _PARAM_FLAGS = {
     "center_dist_ratio": "--center-dist-ratio",
     "court_cluster": "--court-cluster",
     "match_algo": "--match-algo",
+    "camera_mode": "--camera-mode",
     # 片段与缓冲
     "pre_buffer": "--pre-buffer",
     "post_buffer": "--post-buffer",
