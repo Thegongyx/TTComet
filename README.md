@@ -131,7 +131,7 @@
 | `extract_rejected_ball_frames.py` | 错误球帧收集（A/B 两类负样本） |
 | `random_sample_frames.py` | 通用随机抽帧（`--ball-only` / `--no-player` / `--no-log`） |
 | `remove_narration.py` | 去解说人声，保留击球声/环境声（`--method demucs` / `center` / `mute`），默认再提音量 1 倍 |
-| `remove_watermark.py` | 去静态水印台标（`--method delogo` / `inpaint`，内置 `logo`/`overlay`/`all` 预设） |
+| `remove_watermark.py` | 去静态水印台标（`--method delogo` / `inpaint`，内置 `logo`/`overlay`/`all` 预设，默认 `overlay` 保留比分牌） |
 | `train_pingpong_v2.py` | 分割模型训练（best_class AP / mAP50 双追踪） |
 | `export_onnx.py` | `.pt` → `.onnx`（`--half` / `--dynamic` / `--simplify` / `--nms`） |
 | `split_all1.py` | 数据集拆分 train/val |

@@ -8,16 +8,19 @@
 
 内置预设区域（实测于 1920x1080 的 WTT 转播画面, 可直接改 _PRESETS）:
     logo      右上角「咪咕 独播」台标
-    overlay   logo + 底部「ISTANBUL | 百岁山 | WTT CONTENDER」赛事条
-    all       overlay + 左下角比分板
+    overlay   logo + 底部「ISTANBUL | 百岁山 | WTT CONTENDER」赛事条（默认）
+    all       overlay + 左下角比分牌（比分是比赛信息, 非必要别动）
     none      不用预设, 只保留 --region 手动指定的区域
 
 用法:
-    # 默认: 去全部静态叠加 (preset=all), delogo 算法, 视频重编码
+    # 默认: preset=overlay(右上台标 + 底部赛事条), delogo 算法, 保留比分牌
     python src/remove_watermark.py --video Videos/fb1080.mp4
 
     # 只去右上角咪咕台标
     python src/remove_watermark.py --video Videos/fb1080.mp4 --preset logo
+
+    # 连比分牌一起去掉(比赛信息会消失)
+    python src/remove_watermark.py --video Videos/fb1080.mp4 --preset all
 
     # 自定义区域(可重复), 不用预设
     python src/remove_watermark.py --video in.mp4 --preset none --region 100,100,200,50 --region 800,900,300,80
@@ -32,7 +35,7 @@
     --video       源视频路径
     --output      输出视频路径（默认: 源视频同目录 <原名>_nowatermark.mp4）
     --method      delogo / inpaint（默认 delogo）
-    --preset      logo / overlay / all / none（默认 all）
+    --preset      logo / overlay / all / none（默认 overlay, 保留比分牌）
     --region      额外区域 "x,y,w,h", 可重复
     --expand      区域外扩像素, 盖住水印抗锯齿边（默认 3）
     --crf         libx264 质量, 越小越清晰（默认 18）
@@ -57,20 +60,21 @@ import numpy as np
 
 _TMP_ROOT = Path(__file__).resolve().parent.parent / "tmp"
 
-# 预设区域 (x, y, w, h), 基于 1920x1080。
+# 预设区域 (x, y, w, h, 说明), 基于 1920x1080。
 # 若换成别的分辨率, 用 --region 手动指定, 或按比例换算。
+# 注意: 比分牌属于比赛信息, 默认不处理; 需要抹掉时显式用 --preset all
 _PRESETS = {
     "logo": [
-        (1588, 38, 292, 74),      # 右上角「咪咕 独播」
+        (1588, 38, 292, 74, "右上角「咪咕 独播」台标"),
     ],
     "overlay": [
-        (1588, 38, 292, 74),      # 右上角「咪咕 独播」
-        (1170, 950, 650, 78),     # 底部 ISTANBUL | 百岁山 | WTT CONTENDER
+        (1588, 38, 292, 74, "右上角「咪咕 独播」台标"),
+        (1170, 950, 650, 78, "底部 ISTANBUL | 百岁山 | WTT 赛事条"),
     ],
     "all": [
-        (1588, 38, 292, 74),      # 右上角「咪咕 独播」
-        (1170, 950, 650, 78),     # 底部赛事条
-        (84, 884, 462, 150),      # 左下角比分板
+        (1588, 38, 292, 74, "右上角「咪咕 独播」台标"),
+        (1170, 950, 650, 78, "底部 ISTANBUL | 百岁山 | WTT 赛事条"),
+        (84, 884, 462, 150, "左下角比分牌（比赛信息, 谨慎去除）"),
     ],
     "none": [],
 }
@@ -154,32 +158,32 @@ def normalize_region(x, y, w, h, width, height):
 
 
 def collect_regions(args, width, height):
-    """预设 + 手动 --region, 统一外扩并裁边界"""
+    """预设 + 手动 --region, 统一外扩并裁边界, 返回 (x, y, w, h, 说明)"""
     regions = list(_PRESETS.get(args.preset, []))
     for raw in args.region or []:
         parts = [p.strip() for p in str(raw).replace(" ", ",").split(",") if p.strip()]
         if len(parts) != 4:
             print(f"! --region 需要 4 个数字 x,y,w,h, 收到: {raw}")
             sys.exit(1)
-        regions.append(tuple(float(p) for p in parts))
+        regions.append(tuple(float(p) for p in parts) + (f"自定义区域 {raw}",))
 
     if not regions:
         print("! 没有任何待处理区域, 用 --preset 或 --region 指定")
         sys.exit(1)
 
     out = []
-    for (x, y, w, h) in regions:
+    for (x, y, w, h, name) in regions:
         x -= args.expand
         y -= args.expand
         w += args.expand * 2
         h += args.expand * 2
-        out.append(normalize_region(x, y, w, h, width, height))
+        out.append(normalize_region(x, y, w, h, width, height) + (name,))
     return out
 
 
 def build_delogo_filter(regions):
     return ",".join(
-        f"delogo=x={x}:y={y}:w={w}:h={h}" for (x, y, w, h) in regions
+        f"delogo=x={x}:y={y}:w={w}:h={h}" for (x, y, w, h, _) in regions
     )
 
 
@@ -229,7 +233,7 @@ def do_delogo(args, video, output, info, regions):
 
 def build_mask(width, height, regions):
     mask = np.zeros((height, width), np.uint8)
-    for (x, y, w, h) in regions:
+    for (x, y, w, h, _) in regions:
         mask[y:y + h, x:x + w] = 255
     return mask
 
@@ -276,7 +280,8 @@ def do_inpaint(args, video, output, info, regions):
     enc += ["-movflags", "+faststart", str(output)]
     write_proc = subprocess.Popen([str(c) for c in enc], stdin=subprocess.PIPE)
 
-    total = int((args.duration if args.duration and args.duration > 0 else info["duration"]) * fps)
+    total = int((args.duration if args.duration and args.duration > 0
+                 else max(info["duration"] - args.start, 0.0)) * fps)
     done = 0
     try:
         while True:
@@ -346,7 +351,7 @@ def export_preview(args, video, info, regions, times):
         sheet = np.vstack([orig, proc])
         # 下: 每个区域的处理前后放大并排
         crops = []
-        for (x, y, w, h) in regions:
+        for (x, y, w, h, _name) in regions:
             pad = 12
             x0, y0 = max(0, x - pad), max(0, y - pad)
             x1 = min(info["width"], x + w + pad)
@@ -400,7 +405,7 @@ def build_parser():
     p.add_argument("--video", help="源视频路径")
     p.add_argument("--output", help="输出视频路径")
     p.add_argument("--method", choices=["delogo", "inpaint"], default="delogo")
-    p.add_argument("--preset", choices=list(_PRESETS.keys()), default="all")
+    p.add_argument("--preset", choices=list(_PRESETS.keys()), default="overlay")
     p.add_argument("--region", action="append", metavar="x,y,w,h")
     p.add_argument("--expand", type=int, default=3, help="区域外扩像素")
     p.add_argument("--crf", type=int, default=18)
@@ -422,7 +427,11 @@ def main():
 
     if args.list_presets:
         for name, regs in _PRESETS.items():
-            print(f"{name:8s} {regs}")
+            print(f"[{name}]")
+            if not regs:
+                print("  (无)")
+            for (x, y, w, h, desc) in regs:
+                print(f"  x={x:4d} y={y:4d} w={w:4d} h={h:4d}  {desc}")
         return
 
     check_ffmpeg()
@@ -441,8 +450,8 @@ def main():
     print(f"  画面: {info['width']}x{info['height']} @ {info['fps']:.3f}fps  "
           f"时长 {info['duration']:.1f}s  音轨 {info['has_audio']}")
     print(f"  方法: {args.method}  预设: {args.preset}")
-    for (x, y, w, h) in regions:
-        print(f"  区域: x={x} y={y} w={w} h={h}")
+    for (x, y, w, h, name) in regions:
+        print(f"  区域: x={x} y={y} w={w} h={h}  {name}")
 
     times = []
     if args.preview:
