@@ -111,7 +111,7 @@ def _resolve_models() -> tuple[dict[str, str], list[dict], str]:
 
 MODELS, MODEL_META, DEFAULT_MODEL = _resolve_models()
 
-APP_VERSION = "0.2.1"
+APP_VERSION = "0.2.2"
 PROJECT_URL = "https://github.com/Thegongyx/TTComet"
 SUPPORT_URL = "https://ifdian.net/a/TTComet"
 
@@ -231,7 +231,7 @@ _dl_state: dict = {
 
 
 def _ver_tuple(v: str) -> tuple[int, ...]:
-    """把 "v0.2.1" / "0.2.1-beta" 解析成可比较的整数三元组。"""
+    """把 "v0.2.2" / "0.2.2-beta" 解析成可比较的整数三元组。"""
     out: list[int] = []
     for part in (v or "").strip().lstrip("vV").split("."):
         num = ""

@@ -15,7 +15,7 @@
 
   产物：
     webui\dist\TTComet\                                  （onedir 目录）
-    webui\dist\installer\TTComet-0.2.1-setup.exe         （-Installer 时）
+    webui\dist\installer\TTComet-0.2.2-setup.exe         （-Installer 时）
     webui\dist\SHA256SUMS.txt                            （始终生成，用于校验下载完整性）
 #>
 param(
