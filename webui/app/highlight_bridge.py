@@ -35,6 +35,7 @@ _PARAM_FLAGS = {
     "cut": "--cut",
     # 回合判定
     "min_rally_frames": "--min-rally-frames",
+    "rally_start": "--rally-start",
     "min_rally_bounce_count": "--min-rally-bounce-count",
     "min_rally_speed_top_n": "--min-rally-speed-top-n",
     "min_static_ball_count": "--min-static-ball-count",

@@ -1,8 +1,17 @@
 #!/usr/bin/env python3
 """
-pingpong_highlight.py  (优化版 v4.18 - 多机位导播切视角分段几何自适应 | 单机位零影响)
+pingpong_highlight.py  (优化版 v4.19 - 回合起点过网兜底 | 多机位分段几何自适应)
 =====================================================================
 乒乓球比赛 → 自动特效精华集锦
+
+v4.19 在 v4.18 基础上的改动:
+  ★ 回合起点判定新增「过网 + 活跃球」兜底 (--rally-start auto, 默认 auto; 旧行为用 --rally-start bounce):
+    - 近台落点漏检导致两半台落点凑不齐时, 若最近 0.32s 真实球检测充分、球速高于慢速阈值、
+      球在走廊内, 且明确越过球网, 则从过网前 PRE_ROLL 处开回合;
+    - 起点自动 clamp 到上一回合结束 +1.5s、当前镜头起点/最近切镜帧之后;
+    - 要求最近 2s 内有过落点、且开回合后至少出现一次落点确认, 避免捡球/滚球误入;
+    - 球网附近 4% 网长死区避免贴网抖动; 切镜后 0.2s 内不触发;
+    - 每个回合新增 start_reason (bounce_pair / net) 便于调试。
 
 v4.18 在 v4.17 基础上的改动:
   ★ 新增第一阶段「导播切视角 / 多机位球台几何自适应」(--camera-mode auto/single/multi, 默认 auto):
@@ -206,6 +215,9 @@ def parse_args():
                    help="球连续丢失该秒数则回合以 ball_lost 结束 (默认 1.5, 高球漏检多可调大)")
     p.add_argument("--no-bounce-timeout", type=float, default=3.0,
                    help="回合内球台连续该秒数无新落点则回合结束 (默认 3.0)")
+    p.add_argument("--rally-start", default="auto", choices=["bounce", "auto"],
+                   help="回合起点判定: auto=落点不足时用「过网+活跃球」兜底开回合(默认); "
+                        "bounce=仅依赖两半台落点(旧行为)")
     p.add_argument("--corridor-max-drop", type=float, default=0.55, help="走廊过滤单次剔除比例上限")
     p.add_argument("--court-cluster", action="store_true",
                    help="启用球台空间聚类过滤 (DBSCAN 只保留最大簇)。"
@@ -3109,10 +3121,15 @@ def _finalize_rally(rally_periods, current_rally, end_reason, rally_min_duration
     rally_duration = current_rally["end"] - current_rally["start"]
     if not (current_rally.get("crossed_net", False) and rally_duration >= float(rally_min_duration)):
         return False
+    # 过网开回合必须有一次实际落点确认, 否则大概率是捡球/滚球, 直接丢弃
+    if (current_rally.get("start_reason") == "net"
+            and not current_rally.get("bounce_seen", False)):
+        return False
     rally_periods.append({
         "start_frame": current_rally["start_frame"],
         "end_frame": current_rally["end_frame"],
         "duration": round(rally_duration, 2),
+        "start_reason": current_rally.get("start_reason", "unknown"),
         "ended_reason": end_reason})
     return True
 
@@ -3344,7 +3361,7 @@ def detect_rallies(filled_track, fps, total_frames, raw_log_path, table_geo=None
                    slow_speed_window_sec=1.0, slow_speed_min_in_play_sec=0.8,
                    out_of_table_timeout=1.0, no_bounce_timeout=2.0,
                    bounce_halves=None, net_center_x_hint=None,
-                   cam_timeline=None, debug=False):
+                   cam_timeline=None, rally_start_mode="auto", debug=False):
     if not filled_track or fps <= 0:
         return []
     is_multi = bool(cam_timeline and cam_timeline.get("is_multi"))
@@ -3387,6 +3404,15 @@ def detect_rallies(filled_track, fps, total_frames, raw_log_path, table_geo=None
         return rallies
     slow_thresh = _estimate_slow_speed_threshold(ball_lookup, fps)
     corridor = table_geo.get("corridor") if table_geo else None
+    # L2「过网 + 活跃球」开回合 (--rally-start auto)
+    NET_START_ENABLED = (rally_start_mode or "bounce") == "auto"
+    START_ACTIVE_WIN_FRAMES = max(3, int(round(fps * 0.32)))
+    START_MIN_REAL_RATIO = 0.5
+    START_SPEED_FACTOR = 1.5
+    START_MIN_GAP_FRAMES = max(1, int(round(fps * 1.5)))
+    START_CUT_GUARD_FRAMES = max(1, int(round(fps * 0.2)))
+    NET_SIDE_DEADBAND_RATIO = 0.04      # 死区 = 网长 × 4%, 约 15~20px
+    NET_CENTER_DEADBAND_PX = 15.0       # 无网线时按画面 x 中心死区
     OUT_OF_TABLE_FRAMES = max(1, int(round(fps * out_of_table_timeout)))
     NO_BOUNCE_FRAMES = max(1, int(round(fps * no_bounce_timeout)))
     BOUNCE_START_WINDOW_FRAMES = max(1, int(round(fps * 2.0)))
@@ -3405,6 +3431,12 @@ def detect_rallies(filled_track, fps, total_frames, raw_log_path, table_geo=None
     current_rally = None
     missing_ball_frames = 0
     prev_side = None
+    prev_side_l2 = None
+    last_cut_frame = -10 ** 9
+    if is_multi and cut_frames:
+        prior_cuts = [f for f in cut_frames if f <= first_frame]
+        if prior_cuts:
+            last_cut_frame = max(prior_cuts)
     slow_run_frames = 0
     out_of_table_run = 0
     same_half_count = 0
@@ -3423,13 +3455,20 @@ def detect_rallies(filled_track, fps, total_frames, raw_log_path, table_geo=None
                 return cam_geos.get(cid)
         return None
 
-    def _ball_side(x, y, f_i=None):
+    def _ball_side(x, y, f_i=None, deadband=0.0):
         g_cur = _geo_for_frame(f_i) if is_multi else table_geo
         nl_cur = g_cur.get("net_line") if g_cur else net_line
         if nl_cur is not None:
             (nx1, ny1), (nx2, ny2) = nl_cur
-            return 'A' if (nx2 - nx1) * (y - ny1) - (ny2 - ny1) * (x - nx1) > 0 else 'B'
+            cross = (nx2 - nx1) * (y - ny1) - (ny2 - ny1) * (x - nx1)
+            if deadband > 0.0:
+                nl_len = math.hypot(nx2 - nx1, ny2 - ny1)
+                if nl_len > 1e-6 and abs(cross) < deadband * nl_len:
+                    return None
+            return 'A' if cross > 0 else 'B'
         if net_center_x is not None:
+            if deadband > 0.0 and abs(x - net_center_x) < NET_CENTER_DEADBAND_PX:
+                return None
             return 'L' if x < net_center_x else 'R'
         return None
 
@@ -3448,12 +3487,21 @@ def detect_rallies(filled_track, fps, total_frames, raw_log_path, table_geo=None
             spds.append(math.hypot(x1 - x0, y1 - y0) / (df / fps))
         return sum(spds) / len(spds) if spds else None
 
+    def _recent_real_ratio(buf, frame_idx, win_frames):
+        pts = [p for p in buf if p[0] >= frame_idx - win_frames]
+        if not pts:
+            return 0.0, 0
+        n_real = sum(1 for p in pts if p[4])
+        return n_real / len(pts), n_real
+
     CLOSEUP_END_WAIT = max(4, int(round(fps * 0.35)))
 
     for frame_idx in range(first_frame, last_frame + 1):
         # 多机位切镜边界自适应重置: 保持进行中回合不断裂, 但清空依赖旧相机坐标系的方位/走廊/速度差分缓存
         if is_multi and frame_idx in cut_frames:
             prev_side = None
+            prev_side_l2 = None
+            last_cut_frame = frame_idx
             out_of_table_run = 0
             same_half_count, last_bounce_half = 0, None
             traj_buffer.clear()
@@ -3470,8 +3518,12 @@ def detect_rallies(filled_track, fps, total_frames, raw_log_path, table_geo=None
         else:
             is_real, side = False, None
             missing_ball_frames += 1
+        side_l2 = None
+        if NET_START_ENABLED and entry is not None:
+            side_l2 = _ball_side(bx, by, frame_idx, deadband=NET_SIDE_DEADBAND_RATIO)
         if rally_state == RallyState.IDLE:
             rally_start = None
+            start_reason = None
             if entry is not None:
                 if bounce_halves:
                     # 落点驱动: 2 秒窗口内两半台(FAR/NEAR)都有落点 → 以倒数第二个落点开始回合
@@ -3484,12 +3536,50 @@ def detect_rallies(filled_track, fps, total_frames, raw_log_path, table_geo=None
                         halves = {h for _, h in idle_bounces}
                         if len(idle_bounces) >= 2 and len(halves) == 2:
                             rally_start = idle_bounces[-2][0]
-                elif prev_side is not None and side is not None and side != prev_side:
-                    # 无落点信息时跨网兜底
+                            start_reason = "bounce_pair"
+                recent_bounce_ok = (not bounce_halves) or (
+                    bool(idle_bounces)
+                    and frame_idx - idle_bounces[-1][0] <= BOUNCE_START_WINDOW_FRAMES)
+                # L2: 过网 + 活跃球兜底 (即使已有稀疏落点也生效, 解决近台漏检导致回合起点推迟)
+                if (rally_start is None and NET_START_ENABLED
+                        and prev_side_l2 is not None and side_l2 is not None
+                        and side_l2 != prev_side_l2
+                        and recent_bounce_ok
+                        and frame_idx - last_cut_frame >= START_CUT_GUARD_FRAMES):
+                    geo_cur = _geo_for_frame(frame_idx) if is_multi else table_geo
+                    if (not is_multi) or geo_cur is not None:
+                        corridor_cur = (geo_cur or {}).get("corridor") if geo_cur else corridor
+                        real_ratio, n_real = _recent_real_ratio(
+                            traj_buffer, frame_idx, START_ACTIVE_WIN_FRAMES)
+                        avg_sp = _recent_avg_speed(traj_buffer, frame_idx, START_ACTIVE_WIN_FRAMES)
+                        in_corr = (corridor_cur is None
+                                   or _point_in_corridor((bx, by), corridor_cur))
+                        prev_end = rallies[-1]["end_frame"] if rallies else -10 ** 9
+                        lower = max(0, prev_end + START_MIN_GAP_FRAMES,
+                                    (last_cut_frame + 1) if last_cut_frame > -10 ** 8 else 0)
+                        min_real = max(2, int(round(START_ACTIVE_WIN_FRAMES * START_MIN_REAL_RATIO)))
+                        if (n_real >= min_real and real_ratio >= START_MIN_REAL_RATIO
+                                and avg_sp is not None and avg_sp >= slow_thresh * START_SPEED_FACTOR
+                                and in_corr and lower <= frame_idx):
+                            cand = frame_idx - PRE_ROLL_FRAMES
+                            rally_start = max(lower, min(cand, frame_idx))
+                            start_reason = "net"
+                            if debug:
+                                win_n = len([p for p in traj_buffer
+                                             if p[0] >= frame_idx - START_ACTIVE_WIN_FRAMES])
+                                log(f"  开回合[net] @{rally_start} (过网帧 {frame_idx}, "
+                                    f"side {prev_side_l2}->{side_l2}, real {n_real}/{win_n}, "
+                                    f"v={avg_sp:.0f}px/s)")
+                elif (rally_start is None and not NET_START_ENABLED and not bounce_halves
+                        and prev_side is not None and side is not None and side != prev_side):
+                    # 无落点信息时跨网兜底 (旧行为, 仅 bounce 模式)
                     rally_start = max(0, frame_idx - PRE_ROLL_FRAMES)
+                    start_reason = "net_legacy"
             if rally_start is not None:
                 rally_num += 1
-                current_rally = {"start_frame": rally_start, "end_frame": frame_idx, "crossed_net": True}
+                current_rally = {"start_frame": rally_start, "end_frame": frame_idx,
+                                 "crossed_net": True, "start_reason": start_reason or "unknown",
+                                 "bounce_seen": (start_reason == "bounce_pair") or (not bounce_halves)}
                 rally_state = RallyState.IN_PLAY
                 slow_run_frames = out_of_table_run = 0
                 same_half_count, last_bounce_half = 0, None
@@ -3497,8 +3587,13 @@ def detect_rallies(filled_track, fps, total_frames, raw_log_path, table_geo=None
                 idle_bounces.clear()
                 while traj_buffer and traj_buffer[0][0] < rally_start:
                     traj_buffer.popleft()
+                if debug:
+                    log(f"  回合开始[{current_rally['start_reason']}] @ {rally_start} "
+                        f"(触发帧 {frame_idx})")
             if entry is not None:
                 prev_side = side
+                if NET_START_ENABLED and side_l2 is not None:
+                    prev_side_l2 = side_l2
         elif rally_state == RallyState.IN_PLAY:
             if current_rally is None:
                 continue
@@ -3544,6 +3639,7 @@ def detect_rallies(filled_track, fps, total_frames, raw_log_path, table_geo=None
             if entry is not None:
                 bh = bounce_halves.get(frame_idx)
                 if bh is not None:
+                    current_rally["bounce_seen"] = True
                     no_bounce_last_frame = frame_idx
                     if bh == last_bounce_half:
                         same_half_count += 1
@@ -3606,6 +3702,8 @@ def detect_rallies(filled_track, fps, total_frames, raw_log_path, table_geo=None
                 same_half_count, last_bounce_half = 0, None
                 no_bounce_last_frame = None
                 prev_side = side
+                if NET_START_ENABLED:
+                    prev_side_l2 = side_l2
     if rally_state == RallyState.IN_PLAY and current_rally is not None:
         current_rally["start"] = current_rally["start_frame"] / fps
         current_rally["end"] = current_rally["end_frame"] / fps
@@ -3614,7 +3712,8 @@ def detect_rallies(filled_track, fps, total_frames, raw_log_path, table_geo=None
         log(f"  回合检测 (跨网+球速+出台): {len(rallies)} 个回合")
         for ri, r in enumerate(rallies):
             log(f"    回合{ri}: [{r['start_frame']}-{r['end_frame']}] "
-                f"{r['duration']}s 结束原因={r['ended_reason']}")
+                f"{r['duration']}s 起点={r.get('start_reason', '?')} "
+                f"结束原因={r['ended_reason']}")
     return rallies
 
 
@@ -4735,7 +4834,9 @@ def main():
                                  net_center_x_hint=net_center_x_hint,
                                  out_of_table_timeout=args.out_of_table_timeout,
                                  rally_lost_timeout=args.rally_lost_timeout,
-                                 no_bounce_timeout=args.no_bounce_timeout, debug=args.debug)
+                                 no_bounce_timeout=args.no_bounce_timeout,
+                                 rally_start_mode=args.rally_start,
+                                 debug=args.debug)
         cut_frames_for_render = None
     else:
         # ==================== 多机位分段几何管线 (导播切视角视频) ====================
@@ -4763,7 +4864,9 @@ def main():
                                  out_of_table_timeout=args.out_of_table_timeout,
                                  rally_lost_timeout=args.rally_lost_timeout,
                                  no_bounce_timeout=args.no_bounce_timeout,
-                                 cam_timeline=cam_timeline, debug=args.debug)
+                                 cam_timeline=cam_timeline,
+                                 rally_start_mode=args.rally_start,
+                                 debug=args.debug)
         cut_frames_for_render = cam_timeline["cut_frames"]
     log(f"   回合: {len(rallies)}, 事件: {len(events)}")
 

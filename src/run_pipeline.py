@@ -329,6 +329,8 @@ def _process_one_video(args, python_cmd, has_ffmpeg, video_index=None, video_tot
         hl_cmd += ["--debug"]
     if args.min_rally_frames is not None:
         hl_cmd += ["--min-rally-frames", str(args.min_rally_frames)]
+    if args.rally_start is not None:
+        hl_cmd += ["--rally-start", args.rally_start]
     if args.min_static_ball_count is not None:
         hl_cmd += ["--min-static-ball-count", str(args.min_static_ball_count)]
     if args.ball_conf is not None:
@@ -487,6 +489,9 @@ def main():
                         help="输出调试信息 (球台几何/落点坐标等)")
     parser.add_argument("--min-rally-frames", type=int, default=None,
                         help="有效回合最小帧数 (默认按 fps 自动)")
+    parser.add_argument("--rally-start", choices=["bounce", "auto"], default=None,
+                        help="回合起点判定: auto=落点不足时用「过网+活跃球」兜底开回合(默认); "
+                             "bounce=仅两半台落点(旧行为)")
     parser.add_argument("--min-static-ball-count", type=int, default=None,
                         help="静止球过滤最少检测数 (默认 10)")
     parser.add_argument("--ball-conf", type=float, default=None,

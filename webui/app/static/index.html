@@ -584,6 +584,8 @@ const PARAM_GROUPS = [
       { key: "rally_lost_timeout", type: "number", def: 1.5, min: 0.2, step: 0.1 },
       { key: "out_of_table_timeout", type: "number", def: 3.0, min: 0.2, step: 0.1 },
       { key: "no_bounce_timeout", type: "number", def: 3.0, min: 0.2, step: 0.1 },
+      { key: "rally_start", type: "select", def: "auto",
+        options: ["bounce", "auto"], optKey: "opt.rally_start." },
   ]},
   { key: "valid", onlyWhenCut: true, items: [
       { key: "min_rally_frames", type: "number", def: 90, min: 10, step: 1 },

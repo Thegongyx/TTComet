@@ -202,6 +202,8 @@
       'opt.algo.auto': 'auto（自动选择）',
       'opt.algo.hungarian': 'hungarian（更准更慢）',
       'opt.algo.greedy': 'greedy（更快）',
+      'opt.rally_start.bounce': '落点驱动（旧行为）',
+      'opt.rally_start.auto': '落点 + 过网兜底（默认）',
 
       // groups
       'g.model.title': '模型精度',
@@ -274,6 +276,8 @@
       'p.no_bounce_timeout.label': '连续无落点多久判结束（秒）',
       'p.no_bounce_timeout.up': '调高：允许更长时间没有落点（比如长回合对拉），回合变长',
       'p.no_bounce_timeout.dn': '调低：久不落点就收尾，回合变少变短',
+      'p.rally_start.label': '回合起点判定',
+      'p.rally_start.note': 'bounce：只按两半台落点开回合（旧行为）；auto（默认）：落点不足时，用「过网 + 活跃球」兜底开回合',
 
       // ---- 回合有效性 ----
       'p.min_rally_frames.label': '有效回合最小帧数',
@@ -521,6 +525,8 @@
       'opt.algo.auto': 'auto (choose automatically)',
       'opt.algo.hungarian': 'hungarian (more accurate, slower)',
       'opt.algo.greedy': 'greedy (faster)',
+      'opt.rally_start.bounce': 'Bounce-driven (legacy)',
+      'opt.rally_start.auto': 'Bounce + net fallback (default)',
 
       'g.model.title': 'Model quality',
       'g.model.desc': 'High accuracy is more precise but slower; Fast is ~2.8× faster. Switching loads the other model automatically.',
@@ -589,6 +595,8 @@
       'p.no_bounce_timeout.label': 'End rally without bounce (s)',
       'p.no_bounce_timeout.up': 'Higher: allows long stretches without a bounce, longer rallies',
       'p.no_bounce_timeout.dn': 'Lower: closes the rally sooner, fewer and shorter rallies',
+      'p.rally_start.label': 'Rally start',
+      'p.rally_start.note': 'bounce: start only from two-half bounces (legacy); auto (default): fall back to net crossing + active ball when bounces are missing',
 
       'p.min_rally_frames.label': 'Minimum rally length (frames)',
       'p.min_rally_frames.up': 'Higher: only long rallies are kept, shorter but cleaner output',
