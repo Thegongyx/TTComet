@@ -345,6 +345,21 @@ def _process_one_video(args, python_cmd, has_ffmpeg, video_index=None, video_tot
         hl_cmd += ["--corridor-extend", str(args.corridor_extend)]
     if args.max_jump_ratio is not None:
         hl_cmd += ["--max-jump-ratio", str(args.max_jump_ratio)]
+    if args.out_of_table_timeout is not None:
+        hl_cmd += ["--out-of-table-timeout", str(args.out_of_table_timeout)]
+    if args.no_bounce_timeout is not None:
+        hl_cmd += ["--no-bounce-timeout", str(args.no_bounce_timeout)]
+    if args.rally_lost_timeout is not None:
+        hl_cmd += ["--rally-lost-timeout", str(args.rally_lost_timeout)]
+    if args.table_edge_tol is not None:
+        hl_cmd += ["--table-edge-tol", str(args.table_edge_tol)]
+
+    # 其余未识别参数原样透传给高光脚本, 这样 pingpong_highlight.py 新增参数
+    # 不用改本文件也能直接用（拼错参数会由高光脚本报错）
+    extra_hl_args = list(getattr(args, "extra_hl_args", None) or [])
+    if extra_hl_args:
+        print(f"  ℹ️  透传给高光脚本: {' '.join(extra_hl_args)}")
+        hl_cmd += extra_hl_args
 
     if not run_step(hl_cmd, "Step 2/2: 高光特效剪辑 (pingpong_highlight.py)"):
         print(f"\n❌{batch_tag} 流水线终止, 中间文件保留在: {work_dir}")
@@ -489,6 +504,14 @@ def main():
                         help="走廊纵向延伸倍数 (球台长度的倍数, 默认 1.2)")
     parser.add_argument("--max-jump-ratio", type=float, default=None,
                         help="轨迹追踪最大跳变比例 (相对图像对角线, 默认 0.05)")
+    parser.add_argument("--out-of-table-timeout", type=float, default=None,
+                        help="球持续出走廊该秒数则回合结束 (默认 3.0, 放高球可调大)")
+    parser.add_argument("--no-bounce-timeout", type=float, default=None,
+                        help="回合内球台连续该秒数无新落点则回合结束 (默认 3.0)")
+    parser.add_argument("--rally-lost-timeout", type=float, default=None,
+                        help="球连续丢失该秒数则以 ball_lost 结束回合 (默认 1.5)")
+    parser.add_argument("--table-edge-tol", type=float, default=None,
+                        help="球台四边等距带容差 px (默认 30, 排查用)")
 
     # === 流水线控制 ===
     parser.add_argument("--work-dir", default=None,
@@ -502,7 +525,9 @@ def main():
     parser.add_argument("--conda-env", default=None,
                         help="conda 环境名 (默认使用当前 Python 解释器)")
 
-    args = parser.parse_args()
+    args, unknown = parser.parse_known_args()
+    # 未识别的参数留给 pingpong_highlight.py（流水线只关心自己的参数）
+    args.extra_hl_args = unknown
 
     # === 检查必要脚本 (只需一次) ===
     for script, name in [(INFERENCE_SCRIPT, "inference_video.py"),
