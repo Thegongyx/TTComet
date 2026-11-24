@@ -11,14 +11,16 @@ v4.20 在 v4.19 基础上的改动:
     - 读取并利用球拍 (racket) 与对阵双方主球员 (player) 坐标: 基于球台几何与邻台隔离锁定 2 名对阵主球员
       (自动过滤裁判、观众与隔壁台球友), 执行时序关联、EMA 平滑与球拍归属绑定;
     - 精准修正击球事件 (hit): 融合「球拍-乒乓球接触距离」与球速折返联合判定击球帧, 提取挥拍速度与出球合成方向;
-    - 新增 5 项实战视觉特效 (加上保留的 3 项经典特效共 8 项):
+    - 新增 4 项实战视觉特效 (加上保留的 3 项经典特效共 7 项):
         经典老特效: trail(球轨迹残影) / dust(触球与落台灰尘) / mini_table(迷你球台落点连线)
-        升级新特效: racket_arc(挥拍破风弧线) / hit_impact(拍面定向爆尘与重板瞬光) /
+        升级新特效: hit_impact(拍面定向爆尘与重板瞬光) /
                    mini_radar(迷你球台球员站位雷达与击球线路) / foot_dust(急停救球擦地微尘) /
                    rally_counter(回合连击板数与峰值球速面板)
+    - 精彩集锦里的 hit_impact 默认全渲染: 不按 power 筛选, 半径 x1.5, 时长 ceil(fps*0.25) 帧;
     - 前置集锦选片升级: 综合球速、主球员跑动总跨度、挥拍峰值速度与相持板数排序, 兼顾暴冲快球与中远台神仙救球;
     - 支持黑幕前集锦与黑幕后全局正片独立勾选特效: 新增 --prepend-fx (默认 all 全特效) 与
-      --main-fx (默认 legacy 仅经典三件套), WebUI 同步支持逐项勾选。
+      --main-fx (默认 trail,dust,mini_table,mini_radar,rally_counter: 经典三件套 + 迷你球台雷达/连击面板),
+      WebUI 同步支持逐项勾选。
 
 v4.19 在 v4.18 基础上的改动:
   ★ 回合起点判定新增「过网 + 活跃球」兜底 (--rally-start auto, 默认 auto; 旧行为用 --rally-start bounce):
@@ -188,10 +190,13 @@ _PLAYER_CLASS_NAMES = ("person", "player", "players", "people", "human", "athlet
 _RACKET_CLASS_NAMES = ("racket", "paddle", "paddel", "pingpang paddel", "bat", "球拍")
 _BALL_CLASS_ALIASES = ("pingpangball", "pingpongball", "ppball", "乒乓球")
 
-# 特效键定义: 经典三件套 (legacy) + 升级五件套 (new)
+# 特效键定义: 经典三件套 (legacy) + 升级四件套 (new)
 LEGACY_FX_KEYS = ("trail", "dust", "mini_table")
-NEW_FX_KEYS = ("racket_arc", "hit_impact", "mini_radar", "foot_dust", "rally_counter")
+NEW_FX_KEYS = ("hit_impact", "mini_radar", "foot_dust", "rally_counter")
 ALL_FX_KEYS = LEGACY_FX_KEYS + NEW_FX_KEYS
+# 正片默认: 经典三件套 + 迷你球台周围的 HUD (雷达/连击面板)
+MAIN_DEFAULT_FX_KEYS = ("trail", "dust", "mini_table", "mini_radar", "rally_counter")
+MAIN_DEFAULT_FX_CSV = ",".join(MAIN_DEFAULT_FX_KEYS)
 
 
 def parse_fx_set(spec, default_mode="legacy"):
@@ -294,9 +299,11 @@ def parse_args():
     p.add_argument("--prepend-fx", default="all",
                    help="黑幕前「前置精彩集锦」启用的特效: all(默认, 全部特效) / legacy(仅经典老特效) / "
                         "none(无特效) 或逗号分隔列表 (" + ",".join(ALL_FX_KEYS) + ")")
-    p.add_argument("--main-fx", default="legacy",
-                   help="黑幕后「全局剪辑正片」启用的特效: legacy(默认, 仅保留 trail,dust,mini_table) / "
-                        "all(全部特效) / none(无特效) 或逗号分隔列表")
+    p.add_argument("--main-fx", default=MAIN_DEFAULT_FX_CSV,
+                   help="黑幕后「全局剪辑正片」启用的特效: 默认 trail,dust,mini_table,mini_radar,rally_counter "
+                        "(经典三件套 + 迷你球台雷达/连击面板) / legacy(仅经典三件套) / all / none / 逗号分隔列表")
+    p.add_argument("--hit-impact-all", action=argparse.BooleanOptionalAction, default=False,
+                   help="调试: 正片也全渲染 hit_impact (精彩集锦默认已全渲染, 不再按 power 筛选)")
     # 兼容旧版预设/命令行遗留参数, 静默忽略不报错
     p.add_argument("--no-player-fx", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--highlight-top-n", type=int, default=7,
@@ -1842,8 +1849,7 @@ def _point_to_seg_dist(px, py, ax, ay, bx, by):
 def _track_shot_players_and_rackets(s_f, e_f, shot_id, raw_players, raw_rackets,
                                     geo, fps, in_w, in_h, speed_scale=1.0,
                                     out_players=None, out_rackets=None,
-                                    out_racket_trails=None, out_step_px=None,
-                                    out_racket_spd=None):
+                                    out_step_px=None, out_racket_spd=None):
     """单镜头内部锁定对阵双主球员 (屏蔽裁判/观众/隔壁台) + 球拍归属追踪与速度估计。"""
     diag = math.hypot(in_w, in_h)
     s_px_m = _estimate_table_px_per_m(geo, diag)
@@ -2232,8 +2238,6 @@ def _track_shot_players_and_rackets(s_f, e_f, shot_id, raw_players, raw_rackets,
                 rspd = math.hypot(rvx, rvy)
                 rsnorm = _clamp(rspd / (swing_ref + 1e-6), 0.0, 1.0)
                 rc = bridged[k_cur]
-                out_racket_trails[slot][k_cur] = (float(cxs_s[idx_k]), float(cys_s[idx_k]),
-                                                  float(rsnorm), int(shot_id))
                 out_rackets.setdefault(k_cur, []).append({
                     "slot": slot,
                     "cx": float(cxs_s[idx_k]),
@@ -2254,7 +2258,6 @@ def build_player_and_racket_tracks(raw_players, raw_rackets, fps, in_w, in_h,
     """构建全片对阵双主球员与球拍运动轨迹 (兼容单机位与多机位分段几何)。"""
     players_by_frame = {}
     racket_by_frame = {}
-    racket_trails = {0: {}, 1: {}}
     player_step_px = {}
     racket_speed_px = {}
 
@@ -2262,7 +2265,6 @@ def build_player_and_racket_tracks(raw_players, raw_rackets, fps, in_w, in_h,
         return {
             "players_by_frame": players_by_frame,
             "racket_by_frame": racket_by_frame,
-            "racket_trails": racket_trails,
             "player_step_px": player_step_px,
             "racket_speed_px": racket_speed_px,
         }
@@ -2282,25 +2284,21 @@ def build_player_and_racket_tracks(raw_players, raw_rackets, fps, in_w, in_h,
                 raw_players, raw_rackets, cam_geos[cid], fps, in_w, in_h,
                 speed_scale=scale_factor,
                 out_players=players_by_frame, out_rackets=racket_by_frame,
-                out_racket_trails=racket_trails, out_step_px=player_step_px,
-                out_racket_spd=racket_speed_px)
+                out_step_px=player_step_px, out_racket_spd=racket_speed_px)
     else:
         max_f = max(max(raw_players.keys(), default=0), max(raw_rackets.keys(), default=0))
         _track_shot_players_and_rackets(
             0, max_f, 0, raw_players, raw_rackets, table_geo, fps, in_w, in_h,
             speed_scale=1.0,
             out_players=players_by_frame, out_rackets=racket_by_frame,
-            out_racket_trails=racket_trails, out_step_px=player_step_px,
-            out_racket_spd=racket_speed_px)
+            out_step_px=player_step_px, out_racket_spd=racket_speed_px)
 
     if debug:
         log(f"  🏃 主球员/球拍追踪: 对阵球员覆盖 {len(players_by_frame)} 帧, "
-            f"球拍轨迹覆盖 {len(racket_by_frame)} 帧 "
-            f"(远端拍={len(racket_trails[0])}, 近端拍={len(racket_trails[1])})")
+            f"球拍覆盖 {len(racket_by_frame)} 帧")
     return {
         "players_by_frame": players_by_frame,
         "racket_by_frame": racket_by_frame,
-        "racket_trails": racket_trails,
         "player_step_px": player_step_px,
         "racket_speed_px": racket_speed_px,
     }
@@ -5019,34 +5017,48 @@ class ParticleSystem:
             p["life"] -= 1
             if p["life"] <= 0:
                 continue
-            a = p["life"] / p["maxlife"]
-            col = tuple(int(c * a) for c in p["color"])
-            r = max(1, int(p["size"] * a))
-            xi, yi = int(p["x"]), int(p["y"])
-            if 0 <= xi < w and 0 <= yi < h:
-                cv2.circle(frame, (xi, yi), r, col, -1, cv2.LINE_AA)
+            a = (p["life"] / float(p["maxlife"])) ** 0.85
+            alpha = _clamp(0.55 * a * (0.85 + 0.15 * self.intensity), 0.04, 0.62)
+            r = max(1, int(round(p["size"] * (0.55 + 0.45 * a))))
+            xi, yi = int(round(p["x"])), int(round(p["y"]))
+            x0, x1 = max(0, xi - r - 1), min(w, xi + r + 2)
+            y0, y1 = max(0, yi - r - 1), min(h, yi + r + 2)
+            if x0 < x1 and y0 < y1:
+                roi = frame[y0:y1, x0:x1]
+                ov = roi.copy()
+                cv2.circle(ov, (xi - x0, yi - y0), r, p["color"], -1, cv2.LINE_AA)
+                cv2.addWeighted(ov, alpha, roi, 1.0 - alpha, 0, roi)
             alive.append(p)
         self.particles = alive
 
 
 class HitImpactRenderer:
-    """重板暴冲/扣杀拍面触球瞬光: 仅持续 5 帧的局部椭圆冲击波纹 + 微星芒 (零文字遮挡)。"""
-    def __init__(self, frame_w, frame_h, intensity=1.0):
+    """重板暴冲/扣杀拍面触球瞬光: 局部椭圆冲击波纹 + 微星芒 (默认 5 帧; 集锦全渲染模式 ceil(fps*0.25) 帧)。"""
+    def __init__(self, frame_w, frame_h, intensity=1.0, unfiltered=False, fps=25.0):
         self.impacts = []
         self.ui_scale = _clamp(frame_h / 1080.0, 0.60, 2.2)
         self.intensity = intensity
+        self.unfiltered = bool(unfiltered)
+        self.fps = max(float(fps), 1.0)
+        self.life_frames = max(1, int(math.ceil(self.fps * 0.25)))
 
     def emit(self, x, y, speed_norm=0.5, racket_snorm=0.0, dir_vec=(1.0, 0.0)):
         power = max(speed_norm, 0.55 * speed_norm + 0.45 * racket_snorm)
-        if power < 0.58:
+        if not self.unfiltered and power < 0.58:
             return
+        if self.unfiltered:
+            # 全渲染: 所有 hit 都出现, 低 power 抬到可见下限
+            power = max(power, 0.72)
         dx, dy = float(dir_vec[0]), float(dir_vec[1])
         ang_deg = math.degrees(math.atan2(dy, dx))
         max_r = max(10, int(round((14 + 14 * power) * self.ui_scale * (0.85 + 0.15 * self.intensity))))
+        if self.unfiltered:
+            max_r = int(round(max_r * 1.5))
+        life = self.life_frames if self.unfiltered else 5
         self.impacts.append({
             "x": float(x), "y": float(y),
             "ang": ang_deg, "power": power,
-            "max_r": max_r, "life": 5, "maxlife": 5,
+            "max_r": max_r, "life": life, "maxlife": life,
         })
 
     def update_and_draw(self, frame):
@@ -5072,10 +5084,15 @@ class HitImpactRenderer:
             ov = roi.copy()
             lcx, lcy = cx - x0, cy - y0
             ring_col = _lerp_color((255, 255, 255), (120, 230, 255), 0.5 * imp["power"])
+            if self.unfiltered:
+                # 调试: 中心也加一块短促亮斑, 避免只有细环看不见
+                cv2.circle(ov, (lcx, lcy), max(2, int(round(r_cur * 0.38))),
+                           ring_col, -1, cv2.LINE_AA)
             # 垂直于出球方向的拍面冲击椭圆环
+            ring_th = max(1, int(round((3.0 if self.unfiltered else 2.0) * fade)))
             cv2.ellipse(ov, (lcx, lcy), (r_cur, max(2, int(round(r_cur * 0.52)))),
                         imp["ang"] + 90.0, 0.0, 360.0, ring_col,
-                        max(1, int(round(2.0 * fade))), cv2.LINE_AA)
+                        ring_th, cv2.LINE_AA)
             # 前 2 帧触球中心短促十字微星芒
             if age <= 1:
                 rad = math.radians(imp["ang"])
@@ -5083,174 +5100,30 @@ class HitImpactRenderer:
                 px, py = -uy, ux
                 arm1 = max(4, int(round(r_cur * 0.85)))
                 arm2 = max(3, int(round(r_cur * 0.50)))
+                star_th = 2 if self.unfiltered else 1
                 cv2.line(ov, (int(round(lcx - px * arm1)), int(round(lcy - py * arm1))),
                          (int(round(lcx + px * arm1)), int(round(lcy + py * arm1))),
-                         (255, 255, 255), 1, cv2.LINE_AA)
+                         (255, 255, 255), star_th, cv2.LINE_AA)
                 cv2.line(ov, (int(round(lcx - ux * arm2)), int(round(lcy - uy * arm2))),
                          (int(round(lcx + ux * arm2)), int(round(lcy + py * 0 + uy * arm2))),
-                         (230, 250, 255), 1, cv2.LINE_AA)
-            alpha = _clamp(0.46 * fade * self.intensity, 0.05, 0.62)
+                         (230, 250, 255), star_th, cv2.LINE_AA)
+            alpha = _clamp(0.46 * fade * self.intensity * (1.25 if self.unfiltered else 1.0),
+                           0.05, 0.75 if self.unfiltered else 0.62)
             cv2.addWeighted(ov, alpha, roi, 1.0 - alpha, 0, roi)
             if imp["life"] > 0:
                 alive.append(imp)
         self.impacts = alive
 
 
-def _catmull_rom_subdivide(pts, subdiv=4):
-    """对短轨迹点列做 Catmull-Rom 样条细分, 生成圆润连续的挥拍刀光曲线。"""
-    n = len(pts)
-    if n < 3 or subdiv <= 1:
-        return pts
-    out = []
-    for i in range(n - 1):
-        p0 = pts[max(0, i - 1)]
-        p1 = pts[i]
-        p2 = pts[i + 1]
-        p3 = pts[min(n - 1, i + 2)]
-        for s in range(subdiv):
-            t = s / float(subdiv)
-            t2 = t * t
-            t3 = t2 * t
-            x = 0.5 * ((2.0 * p1[0])
-                       + (-p0[0] + p2[0]) * t
-                       + (2.0 * p0[0] - 5.0 * p1[0] + 4.0 * p2[0] - p3[0]) * t2
-                       + (-p0[0] + 3.0 * p1[0] - 3.0 * p2[0] + p3[0]) * t3)
-            y = 0.5 * ((2.0 * p1[1])
-                       + (-p0[1] + p2[1]) * t
-                       + (2.0 * p0[1] - 5.0 * p1[1] + 4.0 * p2[1] - p3[1]) * t2
-                       + (-p0[1] + 3.0 * p1[1] - 3.0 * p2[1] + p3[1]) * t3)
-            out.append((x, y))
-    out.append(pts[-1])
-    return out
-
-
-class RacketArcRenderer:
-    """挥拍破风弧线 (刀光残影): 仅在击球窗口或高速挥拍瞬间沿球拍轨迹绘制渐变流光弧。"""
-    def __init__(self, fps, frame_w, frame_h, events, racket_trails, scale=1.0, intensity=1.0):
-        self.fps = max(float(fps), 1.0)
-        self.arc_frames = max(4, int(round(self.fps * 0.15)))
-        self.ui_scale = _clamp(frame_h / 1080.0, 0.60, 2.2)
-        self.scale = scale
-        self.intensity = intensity
-        self.racket_trails = racket_trails or {0: {}, 1: {}}
-        self._cache = {}
-
-        # 预构建击球前后挥拍激活帧集合 (平时慢速引拍/执拍等待完全不画, 保持画面干净)
-        pre_w = max(3, int(round(self.fps * 0.11)))
-        post_w = max(3, int(round(self.fps * 0.09)))
-        self.active_frames = {0: {}, 1: {}}
-        for ev in (events or []):
-            if ev.get("type") != "hit":
-                continue
-            hf = int(ev["frame"])
-            target_slots = [ev["slot"]] if ev.get("slot") in (0, 1) else [0, 1]
-            for sl in target_slots:
-                amap = self.active_frames[sl]
-                for fk in range(hf - pre_w, hf + post_w + 1):
-                    dist_f = max(0, fk - (hf + post_w - 2))
-                    fade_w = 1.0 if dist_f == 0 else max(0.25, 1.0 - 0.28 * dist_f)
-                    if fade_w > amap.get(fk, 0.0):
-                        amap[fk] = fade_w
-
-    def draw(self, frame, f):
-        h, w = frame.shape[:2]
-        key = (h, w)
-        if key not in self._cache:
-            self._cache[key] = (np.empty((h, w, 3), dtype=np.uint8),
-                                np.zeros((h, w), dtype=np.float32))
-        overlay, alpha_mask = self._cache[key]
-
-        for slot in (0, 1):
-            tmap = self.racket_trails.get(slot)
-            if not tmap:
-                continue
-            cur_rec = tmap.get(f)
-            win_w = self.active_frames[slot].get(f, 0.0)
-            if cur_rec is None and win_w <= 0.0:
-                continue
-            # 若不在已标记 hit 窗口内, 仅当球拍达到极高挥动速度时自发显现破风弧
-            if win_w <= 0.0:
-                if cur_rec[2] < 0.56:
-                    continue
-                win_w = 0.75
-
-            pts_raw = []
-            snorms = []
-            ref_shot = cur_rec[3] if cur_rec is not None else None
-            last_k = None
-            for fk in range(f - self.arc_frames + 1, f + 1):
-                rec = tmap.get(fk)
-                if rec is None:
-                    continue
-                if ref_shot is None:
-                    ref_shot = rec[3]
-                elif rec[3] != ref_shot:
-                    pts_raw.clear()
-                    snorms.clear()
-                    ref_shot = rec[3]
-                if last_k is not None and (fk - last_k) > 2:
-                    pts_raw.clear()
-                    snorms.clear()
-                pts_raw.append((rec[0] * self.scale, rec[1] * self.scale))
-                snorms.append(rec[2])
-                last_k = fk
-
-            if len(pts_raw) < 3:
-                continue
-            peak_sn = max(snorms)
-            if peak_sn < 0.24:
-                continue
-            span_px = math.hypot(pts_raw[-1][0] - pts_raw[0][0], pts_raw[-1][1] - pts_raw[0][1])
-            if span_px < 10.0 * self.ui_scale:
-                continue
-
-            curve = _catmull_rom_subdivide(pts_raw, subdiv=4)
-            nc = len(curve)
-            if nc < 3:
-                continue
-
-            xs = [p[0] for p in curve]
-            ys = [p[1] for p in curve]
-            pad = max(12, int(round(16 * self.ui_scale)))
-            x0 = max(0, int(min(xs)) - pad)
-            x1 = min(w, int(max(xs)) + pad + 1)
-            y0 = max(0, int(min(ys)) - pad)
-            y1 = min(h, int(max(ys)) + pad + 1)
-            if x1 <= x0 or y1 <= y0:
-                continue
-
-            alpha_mask[y0:y1, x0:x1] = 0.0
-            overlay[y0:y1, x0:x1] = frame[y0:y1, x0:x1]
-
-            # 弧线色调: 中速挥拍冰青白 → 暴冲挥拍暖金流光
-            outer_col = _lerp_color((255, 235, 175), (105, 225, 255), _clamp((peak_sn - 0.25) / 0.65, 0.0, 1.0))
-            max_thick = max(2.0, (2.2 + 5.2 * peak_sn) * self.ui_scale * (0.85 + 0.15 * self.intensity))
-            base_alpha = _clamp((0.20 + 0.30 * peak_sn) * win_w * (0.85 + 0.15 * self.intensity), 0.08, 0.52)
-
-            for i in range(1, nc):
-                u = i / float(nc - 1)
-                # 刀光轮廓: 尾部渐入 -> 0.80 处最宽最亮 -> 拍头锋利收尖
-                if u <= 0.82:
-                    profile = (u / 0.82) ** 1.15
-                else:
-                    profile = max(0.18, 1.0 - (u - 0.82) / 0.18 * 0.72)
-                th = max(1, int(round(max_thick * profile)))
-                seg_a = float(base_alpha * profile)
-                p0 = (int(round(curve[i - 1][0])), int(round(curve[i - 1][1])))
-                p1 = (int(round(curve[i][0])), int(round(curve[i][1])))
-                seg_c = _lerp_color(outer_col, (255, 255, 255), 0.45 * profile)
-                cv2.line(overlay, p0, p1, seg_c, th, cv2.LINE_AA)
-                cv2.line(alpha_mask, p0, p1, seg_a, th, cv2.LINE_AA)
-                if u > 0.45 and th >= 3:
-                    cv2.line(overlay, p0, p1, (255, 255, 255), 1, cv2.LINE_AA)
-
-            roi_a = alpha_mask[y0:y1, x0:x1]
-            if (roi_a > 0).any():
-                roi_f = frame[y0:y1, x0:x1]
-                roi_o = overlay[y0:y1, x0:x1]
-                a3 = roi_a[..., np.newaxis]
-                blended = roi_f.astype(np.float32) * (1.0 - a3) + roi_o.astype(np.float32) * a3
-                roi_f[:] = np.clip(blended + 0.5, 0, 255).astype(np.uint8)
+def _circle_overlaps_quad(quad, x, y, radius):
+    """圆/椭圆与球台四边形区域是否重叠: 圆心到四边形的有符号距离 >= -radius。"""
+    if quad is None:
+        return False
+    try:
+        dist = cv2.pointPolygonTest(quad.reshape(-1, 1, 2), (float(x), float(y)), True)
+    except Exception:
+        return False
+    return dist >= -max(0.0, float(radius))
 
 
 class FootDustSystem:
@@ -5266,7 +5139,7 @@ class FootDustSystem:
         self.puffs.clear()
         self._last_emit = {0: -10 ** 9, 1: -10 ** 9}
 
-    def maybe_emit(self, f, frame_players, scale=1.0):
+    def maybe_emit(self, f, frame_players, scale=1.0, table_quad=None):
         if not frame_players:
             return
         for slot in (0, 1):
@@ -5277,24 +5150,32 @@ class FootDustSystem:
             is_stop = bool(p.get("hard_stop", False))
             if (sn < 0.82 and not is_stop) or (f - self._last_emit[slot]) < self.cooldown:
                 continue
-            self._last_emit[slot] = f
             fx, fy = p["foot_xy"][0] * scale, p["foot_xy"][1] * scale
+            # 脚底/扬尘落点与球台四边形重叠时不生成
+            if _circle_overlaps_quad(table_quad, fx, fy, max(5.0, 6.0 * self.ui_scale)):
+                continue
+            self._last_emit[slot] = f
             vxf = float(p.get("vx_foot", 0.0))
             dir_sign = -1.0 if vxf >= 0 else 1.0
             n_puffs = max(4, int(round((5 + 3 * min(1.0, sn)) * self.intensity)))
             for _ in range(n_puffs):
+                r_p = np.random.uniform(2.2, 4.8) * self.ui_scale
+                px = fx + np.random.uniform(-8.0, 8.0) * self.ui_scale
+                py = fy + np.random.uniform(-3.0, 2.0) * self.ui_scale
+                # 单颗尘团也不要压在球台上
+                if _circle_overlaps_quad(table_quad, px, py, max(2.0, r_p * 1.25)):
+                    continue
                 vx_p = (dir_sign * np.random.uniform(1.0, 3.4) + np.random.uniform(-0.7, 0.7)) * self.ui_scale
                 vy_p = np.random.uniform(-1.35, -0.25) * self.ui_scale
                 life = np.random.randint(9, 17)
                 self.puffs.append({
-                    "x": fx + np.random.uniform(-8.0, 8.0) * self.ui_scale,
-                    "y": fy + np.random.uniform(-3.0, 2.0) * self.ui_scale,
+                    "x": px, "y": py,
                     "vx": vx_p, "vy": vy_p,
-                    "r": np.random.uniform(2.2, 4.8) * self.ui_scale,
+                    "r": r_p,
                     "life": life, "maxlife": life,
                 })
 
-    def update_and_draw(self, frame):
+    def update_and_draw(self, frame, table_quad=None):
         if not self.puffs:
             return
         alive = []
@@ -5313,6 +5194,9 @@ class FootDustSystem:
             cx, cy = int(round(pf["x"])), int(round(pf["y"]))
             rx = max(2, int(round(pf["r"] * 1.25)))
             ry = max(1, int(round(pf["r"] * 0.72)))
+            # 尘团漂到球台四边形区域时直接停止渲染
+            if _circle_overlaps_quad(table_quad, cx, cy, max(rx, ry)):
+                continue
             x0, x1 = max(0, cx - rx - 2), min(w, cx + rx + 3)
             y0, y1 = max(0, cy - ry - 2), min(h, cy + ry + 3)
             if x0 < x1 and y0 < y1:
@@ -5417,7 +5301,7 @@ def smooth_trail(points):
 def render(args, segments, rally_starts_by_seg, filled_track, events, table_geo,
            in_w, in_h, fps, total_frames, ball_speed_table, pr_data=None,
            prepend_segments=None, prepend_rally_starts_by_seg=None,
-           black_gap_sec=1.0, cut_frames=None):
+           black_gap_sec=1.0, cut_frames=None, cam_timeline=None):
     out_h = args.output_height or in_h
     out_w = int(round(in_w * out_h / in_h))
     if out_w % 2:
@@ -5426,13 +5310,28 @@ def render(args, segments, rally_starts_by_seg, filled_track, events, table_geo,
         out_h += 1
     scale = out_w / in_w
 
+    def _table_quad_at(fi):
+        """当前帧所属机位的球台四边形 (输入坐标系); 无球台镜头返回 None。"""
+        if cam_timeline and cam_timeline.get("is_multi"):
+            cof = cam_timeline.get("cam_of_frame")
+            geos = cam_timeline.get("cam_geos") or {}
+            if cof is not None and 0 <= fi < len(cof):
+                cid = int(cof[fi])
+                geo = geos.get(cid)
+                if geo is not None and geo.get("quad") is not None:
+                    return geo["quad"]
+            return None
+        return table_geo.get("quad") if table_geo else None
+
     fx_level = args.fx_level
     fx_intensity = {"minimal": 0.72, "max": 1.35}.get(fx_level, 1.0)
     prepend_fx_set = parse_fx_set(getattr(args, "prepend_fx", "all"), default_mode="all")
-    main_fx_set = parse_fx_set(getattr(args, "main_fx", "legacy"), default_mode="legacy")
+    main_fx_set = parse_fx_set(getattr(args, "main_fx", MAIN_DEFAULT_FX_CSV),
+                               default_mode=MAIN_DEFAULT_FX_CSV)
+    if getattr(args, "hit_impact_all", False):
+        log("💥 重板瞬光调试模式: 所有 hit 都渲染, 不按 power 筛选")
 
     players_by_frame = (pr_data or {}).get("players_by_frame") or {}
-    racket_trails = (pr_data or {}).get("racket_trails") or {0: {}, 1: {}}
 
     events_sorted = sorted(events, key=lambda e: e["frame"])
     ev_frames_sorted = [e["frame"] for e in events_sorted]
@@ -5509,10 +5408,8 @@ def render(args, segments, rally_starts_by_seg, filled_track, events, table_geo,
         mini = MiniTable(out_w, out_h)
         rally_badge = RallyCounterBadge(out_w, out_h, fps)
         particles = ParticleSystem(intensity=fx_intensity)
-        hit_impacts = HitImpactRenderer(out_w, out_h, intensity=fx_intensity)
-        racket_arc = RacketArcRenderer(
-            fps, out_w, out_h, events_sorted, racket_trails,
-            scale=scale, intensity=fx_intensity)
+        hit_impacts = HitImpactRenderer(out_w, out_h, intensity=fx_intensity,
+                                        unfiltered=False, fps=fps)
         foot_dust = FootDustSystem(fps, out_w, out_h, intensity=fx_intensity)
         trail_renderer = SpeedTrailRenderer(intensity=fx_intensity)
         # 残影 (球拖尾) 时长: --trail-sec (默认 0.3s); <=0 关闭残影; 下限 4 帧保证可平滑/绘制
@@ -5612,11 +5509,12 @@ def render(args, segments, rally_starts_by_seg, filled_track, events, table_geo,
             return groups
 
         def _render_segment_batch(seg_list, seg_landings_map, seg_rally_id_map,
-                                  seg_rally_starts_map, fx_set):
+                                  seg_rally_starts_map, fx_set,
+                                  hit_impact_unfiltered=False):
+            hit_impacts.unfiltered = bool(hit_impact_unfiltered)
             use_trail = ("trail" in fx_set) and (TRAIL_LEN > 0)
             use_dust = ("dust" in fx_set)
             use_hit_impact = ("hit_impact" in fx_set)
-            use_racket_arc = ("racket_arc" in fx_set)
             use_foot_dust = ("foot_dust" in fx_set)
             use_mini_table = ("mini_table" in fx_set)
             use_mini_radar = ("mini_radar" in fx_set)
@@ -5673,14 +5571,14 @@ def render(args, segments, rally_starts_by_seg, filled_track, events, table_geo,
 
                     # 1) 地面层: 急停救球脚底擦地微尘
                     if use_foot_dust:
-                        foot_dust.maybe_emit(f, frame_players, scale=scale)
-                        foot_dust.update_and_draw(frame)
+                        quad_cur = _table_quad_at(f)
+                        quad_cur_out = (np.asarray(quad_cur, dtype=np.float32) * scale
+                                        if quad_cur is not None else None)
+                        foot_dust.maybe_emit(f, frame_players, scale=scale,
+                                             table_quad=quad_cur_out)
+                        foot_dust.update_and_draw(frame, table_quad=quad_cur_out)
 
-                    # 2) 挥拍动作层: 球拍破风刀光弧线
-                    if use_racket_arc:
-                        racket_arc.draw(frame, f)
-
-                    # 3) 乒乓球彗星残影层
+                    # 2) 乒乓球彗星残影层
                     if use_trail:
                         if f in scaled_track:
                             pt = scaled_track[f]
@@ -5780,7 +5678,8 @@ def render(args, segments, rally_starts_by_seg, filled_track, events, table_geo,
             _render_segment_batch(prepend_segments, prepend_landing_by_seg,
                                   prepend_landing_rally_id,
                                   prepend_rally_starts_by_seg or {},
-                                  prepend_fx_set)
+                                  prepend_fx_set,
+                                  hit_impact_unfiltered=True)
             # 黑幕间隔
             for _ in range(black_frame_count):
                 _write_frame_and_progress(black_img)
@@ -5791,7 +5690,8 @@ def render(args, segments, rally_starts_by_seg, filled_track, events, table_geo,
 
         # — 全局主剪辑 (黑幕后: 使用 main_fx_set, 默认仅保留经典三件套) —
         _render_segment_batch(segments, landing_by_seg, landing_rally_id,
-                              rally_starts_by_seg or {}, main_fx_set)
+                              rally_starts_by_seg or {}, main_fx_set,
+                              hit_impact_unfiltered=bool(getattr(args, "hit_impact_all", False)))
         sys.stdout.write("\n")
         sys.stdout.flush()
         elapsed_total = time.time() - t_start
@@ -6106,7 +6006,8 @@ def main():
            prepend_segments=top_segs or None,
            prepend_rally_starts_by_seg=top_rally_starts,
            black_gap_sec=args.highlight_black_gap,
-           cut_frames=cut_frames_for_render)
+           cut_frames=cut_frames_for_render,
+           cam_timeline=cam_timeline)
     log(f"🎉 完成! 输出: {args.output}")
 
 

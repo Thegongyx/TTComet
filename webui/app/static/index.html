@@ -619,11 +619,13 @@ const T = (k, vars) => window.t(k, vars);
  * 参数定义（文案全部走 i18n 的 p.<key>.label / .up / .dn / .note）
  * ========================================================================= */
 const FX_LEGACY_KEYS = ['trail', 'dust', 'mini_table'];
-const FX_NEW_KEYS = ['racket_arc', 'hit_impact', 'mini_radar', 'foot_dust', 'rally_counter'];
+const FX_NEW_KEYS = ['hit_impact', 'mini_radar', 'foot_dust', 'rally_counter'];
 const FX_ALL_KEYS = [...FX_LEGACY_KEYS, ...FX_NEW_KEYS];
+const FX_MAIN_KEYS = ['trail', 'dust', 'mini_table', 'mini_radar', 'rally_counter'];
 const FX_LEGACY_SET = new Set(FX_LEGACY_KEYS);
 const FX_ALL_CSV = FX_ALL_KEYS.join(',');
 const FX_LEGACY_CSV = FX_LEGACY_KEYS.join(',');
+const FX_MAIN_CSV = FX_MAIN_KEYS.join(',');
 
 function parseFxCsv(val) {
   const s = String(val ?? '').trim().toLowerCase();
@@ -716,7 +718,7 @@ const PARAM_GROUPS = [
       { key: "trail_sec", type: "number", def: 0.3, min: 0, max: 2, step: 0.05 },
       { key: "prepend_fx", type: "fx_set", def: FX_ALL_CSV, wide: true,
         onlyWhenCutItem: true, disabledWhenPrependOff: true },
-      { key: "main_fx", type: "fx_set", def: FX_LEGACY_CSV, wide: true },
+      { key: "main_fx", type: "fx_set", def: FX_MAIN_CSV, wide: true },
   ]},
   { key: "adv", items: [
       { key: "corridor_margin", type: "number", def: 0.5, min: 0, step: 0.05 },

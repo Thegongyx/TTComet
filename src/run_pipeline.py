@@ -363,6 +363,8 @@ def _process_one_video(args, python_cmd, has_ffmpeg, video_index=None, video_tot
         hl_cmd += ["--prepend-fx", args.prepend_fx]
     if args.main_fx is not None:
         hl_cmd += ["--main-fx", args.main_fx]
+    if args.hit_impact_all:
+        hl_cmd += ["--hit-impact-all"]
 
     # 其余未识别参数原样透传给高光脚本, 这样 pingpong_highlight.py 新增参数
     # 不用改本文件也能直接用（拼错参数会由高光脚本报错）
@@ -532,7 +534,10 @@ def main():
     parser.add_argument("--prepend-fx", default=None,
                         help="黑幕前精彩集锦特效配置 (默认 all=全部特效; 可填 legacy/none 或逗号分隔列表)")
     parser.add_argument("--main-fx", default=None,
-                        help="黑幕后全局剪辑特效配置 (默认 legacy=仅经典三件套; 可填 all/none 或逗号分隔列表)")
+                        help="黑幕后全局剪辑特效配置 (默认 trail,dust,mini_table,mini_radar,rally_counter; "
+                             "可填 legacy/all/none 或逗号分隔列表)")
+    parser.add_argument("--hit-impact-all", action="store_true",
+                        help="调试: 正片也全渲染 hit_impact (精彩集锦默认已全渲染)")
 
     # === 流水线控制 ===
     parser.add_argument("--work-dir", default=None,
