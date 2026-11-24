@@ -246,6 +246,65 @@
   .disabled-group summary { cursor:not-allowed; }
   .hint { color:var(--muted); font-size:11px; }
 
+  /* ---------- 特效勾选面板（集锦 vs 全局） ---------- */
+  .fx-set-card {
+    background:rgba(8,14,26,.34);
+    border:1px solid var(--line);
+    border-radius:12px;
+    padding:12px 14px;
+    display:flex; flex-direction:column; gap:8px;
+  }
+  .fx-set-head {
+    display:flex; align-items:center; justify-content:space-between;
+    gap:10px; flex-wrap:wrap;
+  }
+  .fx-set-title {
+    display:flex; align-items:baseline; gap:8px; flex-wrap:wrap;
+    font-size:13px; font-weight:600; color:#dfe8fb;
+  }
+  .fx-set-title .tagmod { color:var(--accent); font-weight:400; font-size:11px; }
+  .fx-quick { display:flex; gap:6px; flex-wrap:wrap; }
+  .fx-quick button.sm { padding:3px 9px; font-size:11.5px; border-radius:8px; }
+  .fx-set-sub { font-size:11.5px; color:var(--muted); line-height:1.45; }
+  .fx-check-grid {
+    display:grid; grid-template-columns:repeat(auto-fill,minmax(230px,1fr));
+    gap:8px 10px; margin-top:2px;
+  }
+  .fx-opt {
+    display:flex; align-items:flex-start; gap:8px;
+    padding:8px 10px; border-radius:10px;
+    background:rgba(255,255,255,.035);
+    border:1px solid rgba(255,255,255,.08);
+    cursor:pointer; user-select:none;
+    transition:border-color .15s ease, background .15s ease;
+  }
+  .fx-opt:hover { border-color:rgba(69,243,255,.35); background:rgba(255,255,255,.06); }
+  .fx-opt.checked {
+    border-color:rgba(114,135,254,.55);
+    background:rgba(114,135,254,.11);
+  }
+  .fx-opt input[type=checkbox] {
+    width:auto; margin:3px 0 0; accent-color:var(--accent); flex:0 0 auto; cursor:pointer;
+  }
+  .fx-opt-body { display:flex; flex-direction:column; gap:2px; min-width:0; flex:1; }
+  .fx-opt-title {
+    display:flex; align-items:center; gap:6px; flex-wrap:wrap;
+    font-size:12.5px; font-weight:600; color:var(--text); line-height:1.35;
+  }
+  .fx-badge {
+    font-style:normal; font-size:10px; font-weight:600; padding:0 6px;
+    border-radius:999px; line-height:1.55; letter-spacing:.2px;
+  }
+  .fx-badge.legacy {
+    color:#a9d6ff; background:rgba(111,215,255,.13); border:1px solid rgba(111,215,255,.28);
+  }
+  .fx-badge.new {
+    color:#45f3ff; background:rgba(69,243,255,.13); border:1px solid rgba(69,243,255,.32);
+  }
+  .fx-opt-desc { font-size:11px; color:var(--muted); line-height:1.4; }
+  .fx-set-card.disabled-item { opacity:.42; }
+  .fx-set-card.disabled-item .fx-opt { cursor:not-allowed; }
+
   /* ---------- 参数预设 ---------- */
   .preset-bar {
     display:flex; align-items:center; gap:8px; flex-wrap:wrap;
@@ -559,6 +618,52 @@ const T = (k, vars) => window.t(k, vars);
 /* =========================================================================
  * 参数定义（文案全部走 i18n 的 p.<key>.label / .up / .dn / .note）
  * ========================================================================= */
+const FX_LEGACY_KEYS = ['trail', 'dust', 'mini_table'];
+const FX_NEW_KEYS = ['racket_arc', 'hit_impact', 'mini_radar', 'foot_dust', 'rally_counter'];
+const FX_ALL_KEYS = [...FX_LEGACY_KEYS, ...FX_NEW_KEYS];
+const FX_LEGACY_SET = new Set(FX_LEGACY_KEYS);
+const FX_ALL_CSV = FX_ALL_KEYS.join(',');
+const FX_LEGACY_CSV = FX_LEGACY_KEYS.join(',');
+
+function parseFxCsv(val) {
+  const s = String(val ?? '').trim().toLowerCase();
+  if (!s || s === 'none' || s === 'off') return new Set();
+  if (s === 'all') return new Set(FX_ALL_KEYS);
+  if (s === 'legacy' || s === 'classic') return new Set(FX_LEGACY_KEYS);
+  const out = new Set();
+  for (const part of s.split(',')) {
+    const k = part.trim();
+    if (k === 'all') FX_ALL_KEYS.forEach((x) => out.add(x));
+    else if (k === 'legacy' || k === 'classic') FX_LEGACY_KEYS.forEach((x) => out.add(x));
+    else if (FX_ALL_KEYS.includes(k)) out.add(k);
+  }
+  return out;
+}
+
+function normalizeFxCsv(val) {
+  const set = parseFxCsv(val);
+  const ordered = FX_ALL_KEYS.filter((k) => set.has(k));
+  return ordered.length ? ordered.join(',') : 'none';
+}
+
+function getFxSetValue(rec) {
+  const ordered = [];
+  for (const cb of (rec.checkboxes || [])) {
+    if (cb.checked) ordered.push(cb.dataset.fx);
+  }
+  return ordered.length ? ordered.join(',') : 'none';
+}
+
+function setFxSetValue(rec, val) {
+  const set = parseFxCsv(val);
+  for (const cb of (rec.checkboxes || [])) {
+    const on = set.has(cb.dataset.fx);
+    cb.checked = on;
+    const card = cb.closest('.fx-opt');
+    if (card) card.classList.toggle('checked', on);
+  }
+}
+
 const PARAM_GROUPS = [
   { key: "model", items: [
       { key: "model", type: "select", def: "m960", options: ["m960", "s960"], optKey: "model." },
@@ -575,6 +680,7 @@ const PARAM_GROUPS = [
       { key: "conf_table", type: "number", def: "", min: 0.01, max: 1, step: 0.01 },
       { key: "conf_net", type: "number", def: "", min: 0.01, max: 1, step: 0.01 },
       { key: "conf_player", type: "number", def: "", min: 0.01, max: 1, step: 0.01 },
+      { key: "conf_racket", type: "number", def: "", min: 0.01, max: 1, step: 0.01 },
       { key: "iou", type: "number", def: 0.45, min: 0.1, max: 0.95, step: 0.05 },
   ]},
   { key: "track", items: [
@@ -608,7 +714,9 @@ const PARAM_GROUPS = [
       { key: "fx_level", type: "select", def: "normal",
         options: ["minimal", "normal", "max"], optKey: "opt.fx." },
       { key: "trail_sec", type: "number", def: 0.3, min: 0, max: 2, step: 0.05 },
-      { key: "no_player_fx", type: "checkbox", def: false },
+      { key: "prepend_fx", type: "fx_set", def: FX_ALL_CSV, wide: true,
+        onlyWhenCutItem: true, disabledWhenPrependOff: true },
+      { key: "main_fx", type: "fx_set", def: FX_LEGACY_CSV, wide: true },
   ]},
   { key: "adv", items: [
       { key: "corridor_margin", type: "number", def: 0.5, min: 0, step: 0.05 },
@@ -622,7 +730,7 @@ const PARAM_GROUPS = [
   ]},
 ];
 
-const paramInputs = {};   // key -> { el, def, type, onlyWhenCut, disabledWhenPrependOff }
+const paramInputs = {};   // key -> { el, wrap, def, type, disabled, onlyWhenCut, disabledWhenPrependOff, ... }
 const groupRefs = [];     // { el, refs, onlyWhenCut }
 
 /** 仅当当前语言字典里存在该 key 时才返回文案（用于可选的上/下调说明） */
@@ -635,6 +743,9 @@ function tipText(key, suffix) {
 function buildParams() {
   const root = $('params');
   root.innerHTML = '';
+  groupRefs.length = 0;
+  for (const k of Object.keys(paramInputs)) delete paramInputs[k];
+
   for (const g of PARAM_GROUPS) {
     const d = document.createElement('details');
     const s = document.createElement('summary');
@@ -656,6 +767,97 @@ function buildParams() {
       const wrap = document.createElement('div');
       let el, labelEl;
       const labelText = T(`p.${it.key}.label`);
+
+      if (it.type === 'fx_set') {
+        wrap.className = 'pitem wide fx-set-card';
+        const head = document.createElement('div');
+        head.className = 'fx-set-head';
+        const titleBox = document.createElement('div');
+        titleBox.className = 'fx-set-title';
+        const tSpan = document.createElement('span');
+        tSpan.textContent = labelText;
+        const inactiveTag = document.createElement('span');
+        inactiveTag.className = 'tagmod hidden';
+        titleBox.append(tSpan, inactiveTag);
+
+        const quick = document.createElement('div');
+        quick.className = 'fx-quick';
+        const quickBtns = [];
+        const checkboxes = [];
+        const rec = {
+          el: wrap, wrap, def: it.def, type: 'fx_set', disabled: false,
+          checkboxes, quickBtns, inactiveTag,
+          onlyWhenCut: !!(g.onlyWhenCut || it.onlyWhenCutItem),
+          disabledWhenPrependOff: !!it.disabledWhenPrependOff,
+        };
+
+        for (const [qKey, presetVal] of [
+          ['fx.selectAll', FX_ALL_CSV],
+          ['fx.selectLegacy', FX_LEGACY_CSV],
+          ['fx.selectNone', 'none'],
+        ]) {
+          const qb = document.createElement('button');
+          qb.type = 'button';
+          qb.className = 'ghost sm';
+          qb.textContent = T(qKey);
+          qb.onclick = () => {
+            setFxSetValue(rec, presetVal);
+            updateChangeHint();
+            refreshAvailability();
+          };
+          quick.appendChild(qb);
+          quickBtns.push(qb);
+        }
+        head.append(titleBox, quick);
+        wrap.appendChild(head);
+
+        const note = tipText(it.key, 'note');
+        if (note) {
+          const sub = document.createElement('div');
+          sub.className = 'fx-set-sub';
+          sub.textContent = note;
+          wrap.appendChild(sub);
+        }
+
+        const cgrid = document.createElement('div');
+        cgrid.className = 'fx-check-grid';
+        for (const fk of FX_ALL_KEYS) {
+          const opt = document.createElement('label');
+          opt.className = 'fx-opt';
+          const cb = document.createElement('input');
+          cb.type = 'checkbox';
+          cb.dataset.fx = fk;
+          cb.addEventListener('change', () => {
+            opt.classList.toggle('checked', cb.checked);
+            updateChangeHint();
+            refreshAvailability();
+          });
+          const body = document.createElement('div');
+          body.className = 'fx-opt-body';
+          const oTitle = document.createElement('div');
+          oTitle.className = 'fx-opt-title';
+          const nameSpan = document.createElement('span');
+          nameSpan.textContent = T(`fx.item.${fk}`);
+          const badge = document.createElement('i');
+          const isLeg = FX_LEGACY_SET.has(fk);
+          badge.className = 'fx-badge ' + (isLeg ? 'legacy' : 'new');
+          badge.textContent = T(isLeg ? 'fx.badge.legacy' : 'fx.badge.new');
+          oTitle.append(nameSpan, badge);
+          const oDesc = document.createElement('div');
+          oDesc.className = 'fx-opt-desc';
+          oDesc.textContent = T(`fx.item.${fk}.desc`);
+          body.append(oTitle, oDesc);
+          opt.append(cb, body);
+          cgrid.appendChild(opt);
+          checkboxes.push(cb);
+        }
+        wrap.appendChild(cgrid);
+        setFxSetValue(rec, it.def);
+        paramInputs[it.key] = rec;
+        refs.push(rec);
+        grid.appendChild(wrap);
+        continue;
+      }
 
       if (it.type === 'checkbox') {
         wrap.className = 'pitem chk' + (it.wide ? ' wide' : '');
@@ -718,8 +920,8 @@ function buildParams() {
       el.dataset.key = it.key;
       el.addEventListener('input', updateChangeHint);
       el.addEventListener('change', () => { updateChangeHint(); refreshAvailability(); });
-      const rec = { el, def: it.def, type: it.type,
-                    onlyWhenCut: !!g.onlyWhenCut,
+      const rec = { el, wrap, def: it.def, type: it.type, disabled: false,
+                    onlyWhenCut: !!(g.onlyWhenCut || it.onlyWhenCutItem),
                     disabledWhenPrependOff: !!it.disabledWhenPrependOff };
       paramInputs[it.key] = rec;
       refs.push(rec);
@@ -741,7 +943,19 @@ function refreshAvailability() {
     const cutOff = g.onlyWhenCut && !cutOn;
     g.el.classList.toggle('disabled-group', cutOff);
     for (const r of g.refs) {
-      r.el.disabled = cutOff || (r.disabledWhenPrependOff && !prependOn);
+      const itemDisabled = cutOff || (r.onlyWhenCut && !cutOn) || (r.disabledWhenPrependOff && !prependOn);
+      r.disabled = itemDisabled;
+      if (r.type === 'fx_set') {
+        r.wrap.classList.toggle('disabled-item', itemDisabled);
+        r.checkboxes.forEach((cb) => { cb.disabled = itemDisabled; });
+        r.quickBtns.forEach((b) => { b.disabled = itemDisabled; });
+        if (r.inactiveTag) {
+          r.inactiveTag.textContent = T('params.inactive');
+          r.inactiveTag.classList.toggle('hidden', !itemDisabled);
+        }
+      } else {
+        r.el.disabled = itemDisabled;
+      }
     }
     const mod = g.el.querySelector('[data-role="mod"]');
     if (!mod) continue;
@@ -749,7 +963,7 @@ function refreshAvailability() {
       mod.textContent = T('params.inactive');
       mod.classList.remove('hidden');
     } else {
-      const n = g.refs.filter(isDirty).length;
+      const n = g.refs.filter((r) => !r.disabled && isDirty(r)).length;
       if (n > 0) { mod.textContent = T('params.changedShort', { n }); mod.classList.remove('hidden'); }
       else mod.classList.add('hidden');
     }
@@ -758,6 +972,7 @@ function refreshAvailability() {
 }
 
 function isDirty(r) {
+  if (r.type === 'fx_set') return getFxSetValue(r) !== normalizeFxCsv(r.def);
   if (r.type === 'checkbox') return r.el.checked !== !!r.def;
   if (r.type === 'select') return r.el.value !== r.def;
   return r.el.value.trim() !== String(r.def);
@@ -766,7 +981,8 @@ function isDirty(r) {
 function collectParams() {
   const p = {};
   for (const [key, r] of Object.entries(paramInputs)) {
-    if (r.el.disabled) continue;
+    if (r.disabled) continue;
+    if (r.type === 'fx_set') { p[key] = getFxSetValue(r); continue; }
     if (r.type === 'checkbox') { p[key] = r.el.checked; continue; }
     if (r.type === 'select') { p[key] = r.el.value; continue; }
     const v = r.el.value.trim();
@@ -780,7 +996,8 @@ function collectParams() {
 function snapshotParams() {
   const out = {};
   for (const [k, r] of Object.entries(paramInputs)) {
-    out[k] = (r.type === 'checkbox') ? r.el.checked : r.el.value;
+    if (r.type === 'fx_set') out[k] = getFxSetValue(r);
+    else out[k] = (r.type === 'checkbox') ? r.el.checked : r.el.value;
   }
   return out;
 }
@@ -789,7 +1006,8 @@ function restoreParams(snap) {
   for (const [k, v] of Object.entries(snap || {})) {
     const r = paramInputs[k];
     if (!r) continue;
-    if (r.type === 'checkbox') r.el.checked = !!v;
+    if (r.type === 'fx_set') setFxSetValue(r, v);
+    else if (r.type === 'checkbox') r.el.checked = !!v;
     else r.el.value = v;
   }
   refreshAvailability();
@@ -798,7 +1016,7 @@ function restoreParams(snap) {
 function updateChangeHint() {
   let n = 0;
   for (const r of Object.values(paramInputs)) {
-    if (r.el.disabled) continue;
+    if (r.disabled) continue;
     if (isDirty(r)) n++;
   }
   $('changeHint').textContent = T('params.changed', { n });
@@ -1054,14 +1272,16 @@ function syncPresetButtons() {
 
 function applyParams(p) {
   for (const r of Object.values(paramInputs)) {
-    if (r.type === 'checkbox') r.el.checked = !!r.def;
+    if (r.type === 'fx_set') setFxSetValue(r, r.def);
+    else if (r.type === 'checkbox') r.el.checked = !!r.def;
     else if (r.type === 'select') r.el.value = r.def;
     else r.el.value = r.def === '' ? '' : r.def;
   }
   for (const [k, v] of Object.entries(p || {})) {
     const r = paramInputs[k];
     if (!r) continue;
-    if (r.type === 'checkbox') r.el.checked = !!v;
+    if (r.type === 'fx_set') setFxSetValue(r, v);
+    else if (r.type === 'checkbox') r.el.checked = !!v;
     else if (r.type === 'select') r.el.value = String(v);
     else r.el.value = (v === null || v === undefined) ? '' : v;
   }
@@ -1514,7 +1734,8 @@ $('btnCancel').onclick = async () => {
 
 $('btnReset').onclick = () => {
   for (const r of Object.values(paramInputs)) {
-    if (r.type === 'checkbox') r.el.checked = !!r.def;
+    if (r.type === 'fx_set') setFxSetValue(r, r.def);
+    else if (r.type === 'checkbox') r.el.checked = !!r.def;
     else if (r.type === 'select') r.el.value = r.def;
     else r.el.value = r.def === '' ? '' : r.def;
   }

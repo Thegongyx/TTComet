@@ -1,8 +1,24 @@
 #!/usr/bin/env python3
 """
-pingpong_highlight.py  (优化版 v4.19 - 回合起点过网兜底 | 多机位分段几何自适应)
+pingpong_highlight.py  (优化版 v4.20 - 球拍与主球员实战特效系统 | 集锦/正片特效独立勾选)
 =====================================================================
 乒乓球比赛 → 自动特效精华集锦
+
+v4.20 在 v4.19 基础上的改动:
+  ★ 特效系统重构与球拍/主球员坐标深度联动:
+    - 移除冗余干扰特效与死代码: 彻底删除全屏红橙闪屏 (SpeedFlash)、街机英文飘字 (FloatingLabel)、
+      无差别脚底呼吸圈 (PlayerFX) 以及未挂载的 ShockwaveSystem / BounceMarker;
+    - 读取并利用球拍 (racket) 与对阵双方主球员 (player) 坐标: 基于球台几何与邻台隔离锁定 2 名对阵主球员
+      (自动过滤裁判、观众与隔壁台球友), 执行时序关联、EMA 平滑与球拍归属绑定;
+    - 精准修正击球事件 (hit): 融合「球拍-乒乓球接触距离」与球速折返联合判定击球帧, 提取挥拍速度与出球合成方向;
+    - 新增 5 项实战视觉特效 (加上保留的 3 项经典特效共 8 项):
+        经典老特效: trail(球轨迹残影) / dust(触球与落台灰尘) / mini_table(迷你球台落点连线)
+        升级新特效: racket_arc(挥拍破风弧线) / hit_impact(拍面定向爆尘与重板瞬光) /
+                   mini_radar(迷你球台球员站位雷达与击球线路) / foot_dust(急停救球擦地微尘) /
+                   rally_counter(回合连击板数与峰值球速面板)
+    - 前置集锦选片升级: 综合球速、主球员跑动总跨度、挥拍峰值速度与相持板数排序, 兼顾暴冲快球与中远台神仙救球;
+    - 支持黑幕前集锦与黑幕后全局正片独立勾选特效: 新增 --prepend-fx (默认 all 全特效) 与
+      --main-fx (默认 legacy 仅经典三件套), WebUI 同步支持逐项勾选。
 
 v4.19 在 v4.18 基础上的改动:
   ★ 回合起点判定新增「过网 + 活跃球」兜底 (--rally-start auto, 默认 auto; 旧行为用 --rally-start bounce):
@@ -168,7 +184,40 @@ _SUBPROC_FLAGS = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000) if _IS_WIND
 _CPU = os.cpu_count() or 8
 
 _SMOOTH_KERNEL = np.array([0.25, 0.5, 0.25], dtype=np.float64)
-_PLAYER_CLASS_NAMES = ("person", "player", "people", "human", "athlete")
+_PLAYER_CLASS_NAMES = ("person", "player", "players", "people", "human", "athlete", "球员")
+_RACKET_CLASS_NAMES = ("racket", "paddle", "paddel", "pingpang paddel", "bat", "球拍")
+_BALL_CLASS_ALIASES = ("pingpangball", "pingpongball", "ppball", "乒乓球")
+
+# 特效键定义: 经典三件套 (legacy) + 升级五件套 (new)
+LEGACY_FX_KEYS = ("trail", "dust", "mini_table")
+NEW_FX_KEYS = ("racket_arc", "hit_impact", "mini_radar", "foot_dust", "rally_counter")
+ALL_FX_KEYS = LEGACY_FX_KEYS + NEW_FX_KEYS
+
+
+def parse_fx_set(spec, default_mode="legacy"):
+    """解析特效集合配置字符串 (支持 all / legacy / none 或逗号分隔特效名)。"""
+    raw = default_mode if spec is None else str(spec).strip().lower()
+    if not raw or raw in ("none", "off", "0", "false"):
+        return set()
+    if raw == "all":
+        return set(ALL_FX_KEYS)
+    if raw in ("legacy", "classic", "default"):
+        return set(LEGACY_FX_KEYS)
+    out = set()
+    valid = set(ALL_FX_KEYS)
+    for tok in raw.split(","):
+        k = tok.strip().lower()
+        if not k or k in ("none", "off"):
+            continue
+        if k == "all":
+            out.update(ALL_FX_KEYS)
+        elif k in ("legacy", "classic"):
+            out.update(LEGACY_FX_KEYS)
+        elif k in valid:
+            out.add(k)
+        else:
+            print(f"  ⚠️ 忽略未知特效名: '{tok}' (可选: {', '.join(ALL_FX_KEYS)})", flush=True)
+    return out
 
 # 编码器探测缓存 (进程内只探测一次)
 _ENC_CACHE = {}
@@ -238,11 +287,18 @@ def parse_args():
     p.add_argument("--match-algo", default="auto", choices=["auto", "hungarian", "greedy"],
                    help="track↔detection 关联算法")
     p.add_argument("--fx-level", default="normal", choices=["minimal", "normal", "max"],
-                   help="特效强度")
+                   help="特效强度 (调节已启用特效的粒子量、流光粗细与浓淡)")
     p.add_argument("--trail-sec", type=float, default=0.3,
                    help="球残影 (拖尾/彗尾) 停留时长 (秒, 默认 0.3); <=0 关闭残影; "
                         "帧数=round(fps*值), 下限 4 帧")
-    p.add_argument("--no-player-fx", action="store_true", help="关闭选手移动特效 (脚下光环)")
+    p.add_argument("--prepend-fx", default="all",
+                   help="黑幕前「前置精彩集锦」启用的特效: all(默认, 全部特效) / legacy(仅经典老特效) / "
+                        "none(无特效) 或逗号分隔列表 (" + ",".join(ALL_FX_KEYS) + ")")
+    p.add_argument("--main-fx", default="legacy",
+                   help="黑幕后「全局剪辑正片」启用的特效: legacy(默认, 仅保留 trail,dust,mini_table) / "
+                        "all(全部特效) / none(无特效) 或逗号分隔列表")
+    # 兼容旧版预设/命令行遗留参数, 静默忽略不报错
+    p.add_argument("--no-player-fx", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--highlight-top-n", type=int, default=7,
                    help="前置精彩回合数量 (按平均球速降序取前 N 个, 默认 7)")
     p.add_argument("--highlight-min-duration", type=float, default=6.0,
@@ -393,7 +449,11 @@ def _open_text_maybe_gz(path):
 
 def load_detections(path):
     frames = {}
-    keep_classes = {"pingpangball", "table", "net"} | set(_PLAYER_CLASS_NAMES)
+    ball_set = {c.lower() for c in _BALL_CLASS_ALIASES}
+    player_set = {c.lower() for c in _PLAYER_CLASS_NAMES}
+    racket_set = {c.lower() for c in _RACKET_CLASS_NAMES}
+    table_set = {"table", "pingpang table", "pingpong table", "球桌"}
+    net_set = {"net", "pingpang net", "pingpong net", "球网"}
     with _open_text_maybe_gz(path) as f:
         for line in f:
             line = line.strip()
@@ -409,15 +469,34 @@ def load_detections(path):
             raw_dets = obj.get("detections") or []
             slim_dets = []
             for d in raw_dets:
-                cls_name = str(d.get("class", ""))
-                if cls_name not in keep_classes and cls_name.lower() not in _PLAYER_CLASS_NAMES:
+                cls_low = str(d.get("class", "")).strip().lower()
+                if cls_low in ball_set:
+                    canon_cls = "pingpangball"
+                elif cls_low in table_set:
+                    canon_cls = "table"
+                elif cls_low in net_set:
+                    canon_cls = "net"
+                elif cls_low in player_set:
+                    canon_cls = "player"
+                elif cls_low in racket_set:
+                    canon_cls = "racket"
+                else:
+                    continue
+                b = d.get("bbox")
+                if not (isinstance(b, (list, tuple)) and len(b) == 4):
+                    continue
+                try:
+                    bx1, by1, bx2, by2 = float(b[0]), float(b[1]), float(b[2]), float(b[3])
+                except (TypeError, ValueError):
+                    continue
+                if bx2 <= bx1 or by2 <= by1:
                     continue
                 item = {
-                    "class": cls_name,
+                    "class": canon_cls,
                     "confidence": float(d.get("confidence", 0.0)),
-                    "bbox": d.get("bbox"),
+                    "bbox": [bx1, by1, bx2, by2],
                 }
-                if cls_name in ("table", "net") and d.get("polygon"):
+                if canon_cls in ("table", "net") and d.get("polygon"):
                     item["polygon"] = d["polygon"]
                 slim_dets.append(item)
             frames[int(fidx)] = {"frame": int(fidx), "detections": slim_dets}
@@ -1558,7 +1637,7 @@ def detect_camera_timeline(frames, total_frames, img_hw, fps, args):
     }
 
 
-def run_multi_camera_track_and_events(cam_timeline, ball_cands, fps, in_w, in_h, args):
+def run_multi_camera_track_and_events(cam_timeline, ball_cands, fps, in_w, in_h, args, pr_data=None):
     """多机位模式下按机位去静止球、按镜头隔离追踪/抛物线净化/平滑补帧/落点检测与跨焦段球速归一化。"""
     shots = cam_timeline["shots"]
     cam_geos = cam_timeline["cam_geos"]
@@ -1633,7 +1712,9 @@ def run_multi_camera_track_and_events(cam_timeline, ball_cands, fps, in_w, in_h,
         filled_all.update(sh_filled)
 
         sh_evs, sh_bh = detect_bounce_events(
-            sh_filled, geo, fps, table_edge_tol=args.table_edge_tol)
+            sh_filled, geo, fps, table_edge_tol=args.table_edge_tol,
+            racket_by_frame=(pr_data or {}).get("racket_by_frame"),
+            players_by_frame=(pr_data or {}).get("players_by_frame"))
         events_all.extend(sh_evs)
         bounce_halves_all.update(sh_bh)
 
@@ -1708,34 +1789,521 @@ def gather_ball_candidates(frames, fps, conf_min=0.35):
     return out
 
 
-def gather_player_boxes(frames, debug=False):
-    class_hits = defaultdict(int)
+def gather_player_and_racket_raw(frames, player_conf=0.35, racket_conf=0.25):
+    """从帧检测列表中提取原始球员框与球拍框字典 (便于立即释放全量 frames)。"""
+    raw_players = {}
+    raw_rackets = {}
     for fr in frames:
+        fidx = int(fr["frame"])
+        plist, rlist = [], []
         for det in fr.get("detections", []):
-            c = str(det.get("class", "")).lower()
-            if c in _PLAYER_CLASS_NAMES:
-                class_hits[c] += 1
-    if not class_hits:
-        if debug:
-            log("  选手特效: 检测日志无 person/player 类, 跳过选手特效")
-        return {}, None
-    detected_class = max(class_hits, key=lambda k: class_hits[k])
-    boxes = {}
-    for fr in frames:
-        bs = []
-        for det in fr.get("detections", []):
-            if str(det.get("class", "")).lower() != detected_class:
-                continue
-            if det.get("confidence", 0) < 0.35:
-                continue
+            cls = det.get("class")
+            conf = float(det.get("confidence", 0.0))
             b = det.get("bbox")
-            if b and len(b) == 4:
-                bs.append(tuple(float(v) for v in b))
-        if bs:
-            boxes[fr["frame"]] = bs
+            if not b:
+                continue
+            if cls == "player" and conf >= player_conf:
+                plist.append((float(b[0]), float(b[1]), float(b[2]), float(b[3]), conf))
+            elif cls == "racket" and conf >= racket_conf:
+                rlist.append((float(b[0]), float(b[1]), float(b[2]), float(b[3]), conf))
+        if plist:
+            raw_players[fidx] = plist
+        if rlist:
+            raw_rackets[fidx] = rlist
+    return raw_players, raw_rackets
+
+
+def _estimate_table_px_per_m(table_geo, diag):
+    if table_geo is not None and table_geo.get("near_left") is not None:
+        if table_geo.get("s_px_m"):
+            return float(table_geo["s_px_m"])
+        fl = np.asarray(table_geo["far_left"], dtype=np.float64)
+        fr = np.asarray(table_geo["far_right"], dtype=np.float64)
+        nl = np.asarray(table_geo["near_left"], dtype=np.float64)
+        nr = np.asarray(table_geo["near_right"], dtype=np.float64)
+        ew = 0.5 * ((nr - nl) + (fr - fl))
+        el = 0.5 * ((nl - fl) + (nr - fr))
+        s_horiz = math.hypot(float(ew[0]) / TABLE_WID_M, float(el[0]) / TABLE_LEN_M)
+        s_edge = max(float(np.linalg.norm(ew)) / TABLE_WID_M,
+                     float(np.linalg.norm(el)) / TABLE_LEN_M)
+        return _clamp(max(s_horiz, s_edge), diag * 0.05, diag * 0.65)
+    return diag * 0.16
+
+
+def _point_to_seg_dist(px, py, ax, ay, bx, by):
+    vx, vy = bx - ax, by - ay
+    l2 = vx * vx + vy * vy
+    if l2 <= 1e-8:
+        return math.hypot(px - ax, py - ay)
+    t = _clamp(((px - ax) * vx + (py - ay) * vy) / l2, 0.0, 1.0)
+    return math.hypot(px - (ax + t * vx), py - (ay + t * vy))
+
+
+def _track_shot_players_and_rackets(s_f, e_f, shot_id, raw_players, raw_rackets,
+                                    geo, fps, in_w, in_h, speed_scale=1.0,
+                                    out_players=None, out_rackets=None,
+                                    out_racket_trails=None, out_step_px=None,
+                                    out_racket_spd=None):
+    """单镜头内部锁定对阵双主球员 (屏蔽裁判/观众/隔壁台) + 球拍归属追踪与速度估计。"""
+    diag = math.hypot(in_w, in_h)
+    s_px_m = _estimate_table_px_per_m(geo, diag)
+    has_geo = (geo is not None and geo.get("near_left") is not None)
+
+    if has_geo:
+        fl = np.asarray(geo["far_left"], dtype=np.float64)
+        fr = np.asarray(geo["far_right"], dtype=np.float64)
+        nl = np.asarray(geo["near_left"], dtype=np.float64)
+        nr = np.asarray(geo["near_right"], dtype=np.float64)
+        far_mid = 0.5 * (fl + fr)
+        near_mid = 0.5 * (nl + nr)
+        t_center = 0.5 * (far_mid + near_mid)
+        long_vec = near_mid - far_mid
+        t_len = max(20.0, float(np.linalg.norm(long_vec)))
+        u_long = long_vec / t_len
+        short_vec = 0.5 * ((nr - nl) + (fr - fl))
+        t_wid = max(15.0, float(np.linalg.norm(short_vec)))
+        u_lat = short_vec / t_wid
+        t_span = max(t_len, t_wid, diag * 0.12)
+        anchor_0 = far_mid - 0.22 * long_vec
+        anchor_1 = near_mid + 0.22 * long_vec
+        quad = geo.get("quad")
+        neighbor_zones = geo.get("neighbor_zones") or []
+        H = geo.get("homography")
+        denom_c = (float(H[2, 0] * t_center[0] + H[2, 1] * t_center[1] + H[2, 2])
+                   if H is not None else 1.0)
+    else:
+        fl = fr = nl = nr = None
+        far_mid = np.array([in_w * 0.32, in_h * 0.52], dtype=np.float64)
+        near_mid = np.array([in_w * 0.68, in_h * 0.52], dtype=np.float64)
+        t_center = np.array([in_w * 0.50, in_h * 0.52], dtype=np.float64)
+        u_long = np.array([1.0, 0.0], dtype=np.float64)
+        u_lat = np.array([0.0, 1.0], dtype=np.float64)
+        t_len, t_wid = in_w * 0.36, in_h * 0.25
+        t_span = diag * 0.30
+        anchor_0 = far_mid.copy()
+        anchor_1 = near_mid.copy()
+        quad = None
+        neighbor_zones = []
+        H = None
+        denom_c = 1.0
+
+    def _project_player_to_court(px, py):
+        if not has_geo:
+            return None
+        pt_arr = np.array([px, py], dtype=np.float64)
+        u_rel = float(np.dot(pt_arr - far_mid, u_long)) / t_len
+        u_c = _clamp(u_rel, 0.0, 1.0)
+        l_pt = fl + u_c * (nl - fl)
+        r_pt = fr + u_c * (nr - fr)
+        ev = r_pt - l_pt
+        ev_l2 = float(np.dot(ev, ev)) + 1e-6
+        v_rel = float(np.dot(pt_arr - l_pt, ev)) / ev_l2
+        x_aff = v_rel * (TABLE_WID_M * 1000.0)
+        y_aff = u_rel * (TABLE_LEN_M * 1000.0)
+        tx_mm, ty_mm = x_aff, y_aff
+        if H is not None:
+            denom = float(H[2, 0] * px + H[2, 1] * py + H[2, 2])
+            if denom * denom_c > 0 and abs(denom / (denom_c + 1e-9)) > 0.28:
+                th_xy = img_to_table(geo, (px, py))
+                if th_xy is not None:
+                    tx_h, ty_h = th_xy
+                    if -1600.0 <= tx_h <= 3125.0 and -2400.0 <= ty_h <= 5140.0:
+                        out_d = max(0.0, -ty_h, ty_h - 2740.0, -tx_h, tx_h - 1525.0) / 1800.0
+                        w_aff = _clamp(out_d * 0.45, 0.0, 0.65)
+                        tx_mm = (1.0 - w_aff) * tx_h + w_aff * x_aff
+                        ty_mm = (1.0 - w_aff) * ty_h + w_aff * y_aff
+        return (_clamp(tx_mm, -430.0, 1955.0), _clamp(ty_mm, -920.0, 3660.0))
+
+    fps_eff = max(float(fps), 1.0)
+    alpha_box = 1.0 - (1.0 - 0.42) ** (30.0 / fps_eff)
+    alpha_txy = 1.0 - (1.0 - 0.32) ** (30.0 / fps_eff)
+    max_p_gap = max(6, int(round(fps_eff * 0.50)))
+    max_r_gap = max(4, int(round(fps_eff * 0.25)))
+
+    slot_state = {
+        0: {"last_f": -10 ** 9, "box": None, "txy": None},
+        1: {"last_f": -10 ** 9, "box": None, "txy": None},
+    }
+    slot_boxes_seq = {0: {}, 1: {}}
+    slot_txy_seq = {0: {}, 1: {}}
+    slot_rackets_raw = {0: {}, 1: {}}
+    last_racket_state = {
+        0: {"last_f": -10 ** 9, "cx": 0.0, "cy": 0.0},
+        1: {"last_f": -10 ** 9, "cx": 0.0, "cy": 0.0},
+    }
+
+    for f in range(s_f, e_f + 1):
+        p_raw = raw_players.get(f)
+        r_raw = raw_rackets.get(f)
+        if not p_raw and not r_raw:
+            continue
+
+        # 1) 过滤邻台/噪点球拍
+        r_clean = []
+        if r_raw:
+            for rx1, ry1, rx2, ry2, rconf in r_raw:
+                rw, rh = rx2 - rx1, ry2 - ry1
+                if rw < 3.0 or rh < 3.0 or rw > in_w * 0.22 or rh > in_h * 0.28:
+                    continue
+                rcx, rcy = 0.5 * (rx1 + rx2), 0.5 * (ry1 + ry2)
+                if _point_in_neighbor_zones(rcx, rcy, neighbor_zones, quad):
+                    continue
+                r_clean.append((rx1, ry1, rx2, ry2, rcx, rcy, math.hypot(rw, rh), rconf))
+
+        # 2) 过滤并评分对阵主球员候选
+        p_cands = []
+        if p_raw:
+            for bx1, by1, bx2, by2, pconf in p_raw:
+                bw, bh = bx2 - bx1, by2 - by1
+                if bh < in_h * 0.065 or bw < in_w * 0.018:
+                    continue
+                cx, cy = 0.5 * (bx1 + bx2), 0.5 * (by1 + by2)
+                if _point_in_neighbor_zones(cx, cy, neighbor_zones, quad):
+                    continue
+                d_seg = _point_to_seg_dist(cx, cy, float(far_mid[0]), float(far_mid[1]),
+                                           float(near_mid[0]), float(near_mid[1]))
+                if d_seg > 1.75 * t_span:
+                    continue
+                rel = np.array([cx - t_center[0], cy - t_center[1]], dtype=np.float64)
+                s_long = float(np.dot(rel, u_long))
+                s_lat = float(np.dot(rel, u_lat))
+                has_r = any((bx1 - 0.38 * bw) <= rc[4] <= (bx2 + 0.38 * bw)
+                            and (by1 - 0.22 * bh) <= rc[5] <= (by2 + 0.08 * bh)
+                            for rc in r_clean)
+                # 压制球网延长线旁静坐的裁判/场外人员
+                if (not has_r) and abs(s_long) < 0.16 * t_len and abs(s_lat) > 0.78 * t_wid:
+                    continue
+                p_cands.append({
+                    "box": (bx1, by1, bx2, by2), "cx": cx, "cy": cy,
+                    "bw": bw, "bh": bh, "conf": pconf,
+                    "s_long": s_long, "has_r": has_r,
+                })
+
+        if p_cands:
+            def _slot_score(slot, cd):
+                s_l = cd["s_long"]
+                if slot == 0 and s_l > 0.28 * t_len:
+                    return -1e9
+                if slot == 1 and s_l < -0.28 * t_len:
+                    return -1e9
+                anc = anchor_0 if slot == 0 else anchor_1
+                d_anc = math.hypot(cd["cx"] - float(anc[0]), cd["cy"] - float(anc[1]))
+                sc = 1.6 - (d_anc / (t_span + 1e-6))
+                if (slot == 0 and s_l <= 0) or (slot == 1 and s_l >= 0):
+                    sc += 0.45
+                if cd["has_r"]:
+                    sc += 0.55
+                sc += 0.25 * cd["conf"] + min(0.35, (cd["bw"] * cd["bh"]) / (in_w * in_h * 0.12 + 1e-6))
+                st = slot_state[slot]
+                if st["box"] is not None and (f - st["last_f"]) <= max_p_gap:
+                    pb = st["box"]
+                    pcx, pcy = 0.5 * (pb[0] + pb[2]), 0.5 * (pb[1] + pb[3])
+                    jump = math.hypot(cd["cx"] - pcx, cd["cy"] - pcy)
+                    if jump > diag * 0.18:
+                        sc -= 1.2
+                    else:
+                        iou = _bbox_iou_xyxy(cd["box"], pb)
+                        sc += 1.35 * iou + max(0.0, 0.85 * (1.0 - jump / (diag * 0.14 + 1e-6)))
+                return sc
+
+            opts_0 = [(i, _slot_score(0, c)) for i, c in enumerate(p_cands)]
+            opts_1 = [(i, _slot_score(1, c)) for i, c in enumerate(p_cands)]
+            opts_0 = [(i, s) for i, s in opts_0 if s > 0.0] + [(None, 0.0)]
+            opts_1 = [(i, s) for i, s in opts_1 if s > 0.0] + [(None, 0.0)]
+            best_pair, best_tot = (None, None), -1.0
+            for i0, s0 in opts_0:
+                for i1, s1 in opts_1:
+                    if i0 is not None and i0 == i1:
+                        continue
+                    if s0 + s1 > best_tot:
+                        best_tot = s0 + s1
+                        best_pair = (i0, i1)
+
+            for slot, chosen_i in enumerate(best_pair):
+                if chosen_i is None:
+                    continue
+                cd = p_cands[chosen_i]
+                raw_b = np.asarray(cd["box"], dtype=np.float64)
+                st = slot_state[slot]
+                if st["box"] is not None and (f - st["last_f"]) <= max_p_gap:
+                    sm_b = st["box"] * (1.0 - alpha_box) + raw_b * alpha_box
+                else:
+                    sm_b = raw_b
+                st["box"] = sm_b
+                st["last_f"] = f
+                b_tup = (float(sm_b[0]), float(sm_b[1]), float(sm_b[2]), float(sm_b[3]))
+                slot_boxes_seq[slot][f] = b_tup
+
+                # 腰胯高度 (抵消 76cm 台高透视差) 投影至俯视球场坐标
+                bh_s = sm_b[3] - sm_b[1]
+                waist_x = 0.5 * (sm_b[0] + sm_b[2])
+                waist_y = float(sm_b[3] - 0.46 * bh_s)
+                txy_raw = _project_player_to_court(waist_x, waist_y)
+                if txy_raw is not None:
+                    txy_arr = np.asarray(txy_raw, dtype=np.float64)
+                    if st["txy"] is not None and (f - st["last_f"]) <= max_p_gap:
+                        sm_t = st["txy"] * (1.0 - alpha_txy) + txy_arr * alpha_txy
+                    else:
+                        sm_t = txy_arr
+                    st["txy"] = sm_t
+                    slot_txy_seq[slot][f] = (float(sm_t[0]), float(sm_t[1]))
+
+        # 3) 绑定球拍到主球员槽位 (0 / 1)
+        if r_clean:
+            used_r = set()
+            for slot in (0, 1):
+                best_ri, best_rsc = None, -1e9
+                st_p = slot_state[slot]
+                p_active = (st_p["box"] is not None and (f - st_p["last_f"]) <= max(3, int(round(fps_eff * 0.15))))
+                st_r = last_racket_state[slot]
+                r_active = ((f - st_r["last_f"]) <= max_r_gap)
+                for ri, rc in enumerate(r_clean):
+                    if ri in used_r:
+                        continue
+                    rx1, ry1, rx2, ry2, rcx, rcy, rdiag, rconf = rc
+                    sc_r = -1e9
+                    if p_active:
+                        pb = st_p["box"]
+                        pw, ph = pb[2] - pb[0], pb[3] - pb[1]
+                        if ((pb[0] - 0.42 * pw) <= rcx <= (pb[2] + 0.42 * pw)
+                                and (pb[1] - 0.25 * ph) <= rcy <= (pb[3] + 0.12 * ph)):
+                            pcx = 0.5 * (pb[0] + pb[2])
+                            pcy = pb[1] + 0.42 * ph
+                            sc_r = 2.0 - math.hypot(rcx - pcx, rcy - pcy) / (pw + ph + 1e-6) + 0.3 * rconf
+                    else:
+                        d_tc = math.hypot(rcx - float(t_center[0]), rcy - float(t_center[1]))
+                        if d_tc <= 1.35 * t_span:
+                            s_l = float(np.dot(np.array([rcx - t_center[0], rcy - t_center[1]]), u_long))
+                            if (slot == 0 and s_l <= 0.12 * t_len) or (slot == 1 and s_l >= -0.12 * t_len):
+                                sc_r = 0.8 - d_tc / (1.5 * t_span + 1e-6) + 0.3 * rconf
+                    if sc_r > -1e8 and r_active:
+                        rj = math.hypot(rcx - st_r["cx"], rcy - st_r["cy"])
+                        if rj <= diag * 0.12:
+                            sc_r += 0.75 * (1.0 - rj / (diag * 0.12 + 1e-6))
+                    if sc_r > best_rsc:
+                        best_rsc, best_ri = sc_r, ri
+                if best_ri is not None and best_rsc > 0.0:
+                    used_r.add(best_ri)
+                    rc = r_clean[best_ri]
+                    slot_rackets_raw[slot][f] = rc
+                    last_racket_state[slot] = {"last_f": f, "cx": rc[4], "cy": rc[5]}
+
+    # 4) 后处理主球员脚步速度、急停变向与朝向
+    foot_win = max(2, int(round(fps_eff * 0.10)))
+    stop_lookback = max(2, int(round(fps_eff * 0.12)))
+    dash_ref = max(s_px_m * 2.7, diag * 0.155)
+    for slot in (0, 1):
+        f_keys = sorted(slot_boxes_seq[slot].keys())
+        if not f_keys:
+            continue
+        runs, cur_r = [], [f_keys[0]]
+        for k in f_keys[1:]:
+            if k - cur_r[-1] <= max_p_gap:
+                cur_r.append(k)
+            else:
+                runs.append(cur_r)
+                cur_r = [k]
+        runs.append(cur_r)
+
+        for r_frames in runs:
+            m = len(r_frames)
+            fxs = np.array([0.5 * (slot_boxes_seq[slot][k][0] + slot_boxes_seq[slot][k][2])
+                            for k in r_frames], dtype=np.float64)
+            fys = np.array([slot_boxes_seq[slot][k][3] for k in r_frames], dtype=np.float64)
+            if m >= 3:
+                fxs_s = np.convolve(fxs, _SMOOTH_KERNEL, mode="same")
+                fys_s = np.convolve(fys, _SMOOTH_KERNEL, mode="same")
+                fxs_s[0], fys_s[0] = fxs[0], fys[0]
+                fxs_s[-1], fys_s[-1] = fxs[-1], fys[-1]
+            else:
+                fxs_s, fys_s = fxs, fys
+
+            vxs = np.zeros(m, dtype=np.float64)
+            vys = np.zeros(m, dtype=np.float64)
+            snorms = np.zeros(m, dtype=np.float64)
+            for idx_k in range(m):
+                k_cur = r_frames[idx_k]
+                if idx_k >= 1:
+                    df_step = k_cur - r_frames[idx_k - 1]
+                    if 0 < df_step <= max_p_gap:
+                        step_d = math.hypot(float(fxs_s[idx_k] - fxs_s[idx_k - 1]),
+                                            float(fys_s[idx_k] - fys_s[idx_k - 1])) * speed_scale
+                        out_step_px[k_cur] = out_step_px.get(k_cur, 0.0) + step_d
+                j0 = idx_k
+                while j0 > 0 and (k_cur - r_frames[j0]) < foot_win:
+                    j0 -= 1
+                df_v = k_cur - r_frames[j0]
+                if df_v > 0:
+                    dt_v = df_v / fps_eff
+                    vx = float(fxs_s[idx_k] - fxs_s[j0]) / dt_v * speed_scale
+                    vy = float(fys_s[idx_k] - fys_s[j0]) / dt_v * speed_scale
+                    vxs[idx_k], vys[idx_k] = vx, vy
+                    snorms[idx_k] = _clamp(math.hypot(vx, vy) / (dash_ref + 1e-6), 0.0, 1.5)
+
+            for idx_k, k_cur in enumerate(r_frames):
+                hard_stop = False
+                jb = idx_k
+                while jb > 0 and (k_cur - r_frames[jb]) < stop_lookback:
+                    jb -= 1
+                if jb < idx_k and snorms[jb] >= 0.72:
+                    if (vxs[idx_k] * vxs[jb] < 0 and abs(vxs[jb]) > dash_ref * 0.55) or (
+                            snorms[idx_k] <= 0.42 * snorms[jb]):
+                        hard_stop = True
+
+                txy = slot_txy_seq[slot].get(k_cur)
+                if txy is not None:
+                    facing_deg = math.degrees(math.atan2(1370.0 - txy[1], 762.5 - txy[0]))
+                else:
+                    facing_deg = 90.0 if slot == 0 else -90.0
+
+                out_players.setdefault(k_cur, {})[slot] = {
+                    "bbox": slot_boxes_seq[slot][k_cur],
+                    "foot_xy": (float(fxs_s[idx_k]), float(fys_s[idx_k])),
+                    "vx_foot": float(vxs[idx_k]),
+                    "vy_foot": float(vys[idx_k]),
+                    "foot_snorm": float(snorms[idx_k]),
+                    "hard_stop": hard_stop,
+                    "table_xy": txy,
+                    "facing_deg": facing_deg,
+                }
+
+    # 5) 后处理球拍轨迹: 1~2 帧短缺口桥接 + 轻度平滑 + 瞬时挥拍速度
+    bridge_max = max(2, int(round(fps_eff * 0.07)))
+    swing_ref = max(s_px_m * 9.0, diag * 0.52)
+    r_kern = np.array([0.2, 0.6, 0.2], dtype=np.float64)
+    for slot in (0, 1):
+        r_map = slot_rackets_raw[slot]
+        if not r_map:
+            continue
+        r_keys = sorted(r_map.keys())
+        # 桥接极短漏检 (保持高速挥拍弧线不断裂)
+        bridged = dict(r_map)
+        for a, b in zip(r_keys, r_keys[1:]):
+            df = b - a
+            if 1 < df <= bridge_max + 1:
+                ra, rb = r_map[a], r_map[b]
+                if math.hypot(rb[4] - ra[4], rb[5] - ra[5]) <= diag * 0.085:
+                    for fk in range(a + 1, b):
+                        u = (fk - a) / float(df)
+                        bridged[fk] = (
+                            _lerp(ra[0], rb[0], u), _lerp(ra[1], rb[1], u),
+                            _lerp(ra[2], rb[2], u), _lerp(ra[3], rb[3], u),
+                            _lerp(ra[4], rb[4], u), _lerp(ra[5], rb[5], u),
+                            _lerp(ra[6], rb[6], u), min(ra[7], rb[7]) * 0.9,
+                        )
+        b_keys = sorted(bridged.keys())
+        runs, cur_r = [], [b_keys[0]]
+        for k in b_keys[1:]:
+            if k - cur_r[-1] == 1:
+                cur_r.append(k)
+            else:
+                runs.append(cur_r)
+                cur_r = [k]
+        runs.append(cur_r)
+
+        for r_frames in runs:
+            m = len(r_frames)
+            cxs = np.array([bridged[k][4] for k in r_frames], dtype=np.float64)
+            cys = np.array([bridged[k][5] for k in r_frames], dtype=np.float64)
+            if m >= 3:
+                cxs_s = np.convolve(cxs, r_kern, mode="same")
+                cys_s = np.convolve(cys, r_kern, mode="same")
+                cxs_s[0], cys_s[0] = cxs[0], cys[0]
+                cxs_s[-1], cys_s[-1] = cxs[-1], cys[-1]
+            else:
+                cxs_s, cys_s = cxs, cys
+
+            for idx_k, k_cur in enumerate(r_frames):
+                if m == 1:
+                    rvx = rvy = 0.0
+                elif idx_k == 0:
+                    dt = (r_frames[1] - k_cur) / fps_eff
+                    rvx = float(cxs_s[1] - cxs_s[0]) / dt * speed_scale
+                    rvy = float(cys_s[1] - cys_s[0]) / dt * speed_scale
+                elif idx_k == m - 1:
+                    dt = (k_cur - r_frames[-2]) / fps_eff
+                    rvx = float(cxs_s[-1] - cxs_s[-2]) / dt * speed_scale
+                    rvy = float(cys_s[-1] - cys_s[-2]) / dt * speed_scale
+                else:
+                    dt = (r_frames[idx_k + 1] - r_frames[idx_k - 1]) / fps_eff
+                    rvx = float(cxs_s[idx_k + 1] - cxs_s[idx_k - 1]) / dt * speed_scale
+                    rvy = float(cys_s[idx_k + 1] - cys_s[idx_k - 1]) / dt * speed_scale
+
+                rspd = math.hypot(rvx, rvy)
+                rsnorm = _clamp(rspd / (swing_ref + 1e-6), 0.0, 1.0)
+                rc = bridged[k_cur]
+                out_racket_trails[slot][k_cur] = (float(cxs_s[idx_k]), float(cys_s[idx_k]),
+                                                  float(rsnorm), int(shot_id))
+                out_rackets.setdefault(k_cur, []).append({
+                    "slot": slot,
+                    "cx": float(cxs_s[idx_k]),
+                    "cy": float(cys_s[idx_k]),
+                    "bbox": (rc[0], rc[1], rc[2], rc[3]),
+                    "diag": float(rc[6]),
+                    "vx": float(rvx),
+                    "vy": float(rvy),
+                    "speed": float(rspd),
+                    "snorm": float(rsnorm),
+                })
+                if rspd > out_racket_spd.get(k_cur, 0.0):
+                    out_racket_spd[k_cur] = float(rspd)
+
+
+def build_player_and_racket_tracks(raw_players, raw_rackets, fps, in_w, in_h,
+                                   table_geo=None, cam_timeline=None, debug=False):
+    """构建全片对阵双主球员与球拍运动轨迹 (兼容单机位与多机位分段几何)。"""
+    players_by_frame = {}
+    racket_by_frame = {}
+    racket_trails = {0: {}, 1: {}}
+    player_step_px = {}
+    racket_speed_px = {}
+
+    if not raw_players and not raw_rackets:
+        return {
+            "players_by_frame": players_by_frame,
+            "racket_by_frame": racket_by_frame,
+            "racket_trails": racket_trails,
+            "player_step_px": player_step_px,
+            "racket_speed_px": racket_speed_px,
+        }
+
+    is_multi = bool(cam_timeline and cam_timeline.get("is_multi"))
+    if is_multi:
+        cam_geos = cam_timeline["cam_geos"]
+        cam_scales = cam_timeline["cam_scales"]
+        ref_scale = max(1.0, float(cam_timeline["ref_scale"]))
+        for sh in cam_timeline["shots"]:
+            cid = sh["cam_id"]
+            if cid is None or cid not in cam_geos:
+                continue
+            scale_factor = ref_scale / max(1.0, float(cam_scales.get(cid, ref_scale)))
+            _track_shot_players_and_rackets(
+                sh["start_frame"], sh["end_frame"], sh["shot_id"],
+                raw_players, raw_rackets, cam_geos[cid], fps, in_w, in_h,
+                speed_scale=scale_factor,
+                out_players=players_by_frame, out_rackets=racket_by_frame,
+                out_racket_trails=racket_trails, out_step_px=player_step_px,
+                out_racket_spd=racket_speed_px)
+    else:
+        max_f = max(max(raw_players.keys(), default=0), max(raw_rackets.keys(), default=0))
+        _track_shot_players_and_rackets(
+            0, max_f, 0, raw_players, raw_rackets, table_geo, fps, in_w, in_h,
+            speed_scale=1.0,
+            out_players=players_by_frame, out_rackets=racket_by_frame,
+            out_racket_trails=racket_trails, out_step_px=player_step_px,
+            out_racket_spd=racket_speed_px)
+
     if debug:
-        log(f"  选手特效: 识别类名='{detected_class}', 覆盖 {len(boxes)} 帧")
-    return boxes, detected_class
+        log(f"  🏃 主球员/球拍追踪: 对阵球员覆盖 {len(players_by_frame)} 帧, "
+            f"球拍轨迹覆盖 {len(racket_by_frame)} 帧 "
+            f"(远端拍={len(racket_trails[0])}, 近端拍={len(racket_trails[1])})")
+    return {
+        "players_by_frame": players_by_frame,
+        "racket_by_frame": racket_by_frame,
+        "racket_trails": racket_trails,
+        "player_step_px": player_step_px,
+        "racket_speed_px": racket_speed_px,
+    }
 
 
 def filter_static_ball_candidates(ball_cands, fps, frame_w, frame_h,
@@ -3215,25 +3783,21 @@ def _estimate_slow_speed_threshold(ball_lookup, fps):
     return max(min(p5 * 0.3, p50 * 0.1), 80.0)
 
 
-def detect_bounce_events(filled_track, table_geo, fps, table_edge_tol=30.0):
-    """统一落点/击球检测 (合并原 compute_bounce_halves + detect_events)。
+def detect_bounce_events(filled_track, table_geo, fps, table_edge_tol=30.0,
+                         racket_by_frame=None, players_by_frame=None):
+    """统一落点/击球检测 (融合球拍触球定位与出球向量估计)。
 
-    落点 (bounce) 两级采纳 (保留原①语义):
-      strict: 图像在 quad 内 且 投影落在台面 ±_SURFACE_TOL 内;
+    落点 (bounce) 两级采纳:
+      strict: 图像在 quad 内;
       edge:   投影在长边延长带 (纵向 ±_EDGE_EXTEND, 横向 ±_SURFACE_TOL)
               且与前一个已采纳落点在 _ALT_WINDOW_SEC 秒内且半台相反(交替)。
-    击球 (hit): 当前帧未采纳为 bounce 时, vx 变号(|Δ|>2px) + 台面内
-                (保留原②语义, 且不受 bounce cooldown 限制)。
-    半台: 落点直接判定并携带 ('FAR'/'NEAR'); 无台面几何时 half=None。
-
-    几何缺失 (table_geo=None) 退化行为 (保留原②语义):
-      quad/台面判定恒真 → 候选门 + cooldown 通过即收 bounce, vx 变号即收 hit;
-      speed_kmh/table_xy/half/adopted 均为 None。
+    击球 (hit): 当前帧未采纳为 bounce 时, 由「vx 显著折返」或「球与球拍紧密接触 + 速度突变/高速挥拍」
+                联合判定, 提取合成击球方向 (dir_x, dir_y) 与挥拍强度 racket_snorm。
 
     返回 (events, bounce_halves):
       events: [{frame, x, y, type('bounce'/'hit'), half, adopted,
-                table_xy, speed_kmh}, ...]    # 按帧升序
-      bounce_halves: {frame: 'FAR'/'NEAR'}    # 仅含 half 非空的落点, 供回合逻辑
+                table_xy, speed_kmh, ...}, ...]    # 按帧升序
+      bounce_halves: {frame: 'FAR'/'NEAR'}         # 仅含 half 非空的落点, 供回合逻辑
     """
     events = []
     if not filled_track or fps <= 0:
@@ -3294,11 +3858,39 @@ def detect_bounce_events(filled_track, table_geo, fps, table_edge_tol=30.0):
 
     bounce_halves = {}
     last_bounce_frame = -10 ** 9
+    last_hit_frame = -10 ** 9
+    last_hit_ev = None
     # 物理上乒乓球不可能在 <0.12s 内于台面弹跳两次; 避免弹跳峰值轻微平顶在 2 帧内重复计点误触 three_same_half
     bounce_cooldown_frames = max(3, int(round(fps * 0.12)))
+    hit_cooldown_frames = max(4, int(round(fps * 0.16)))
     max_adj_gap = max(2, int(round(fps * 0.08)))
     last_ok_frame = None    # 最近一次已采纳落点帧号 (严格或宽松)
     last_ok_half = None     # 其半台
+
+    def _find_nearby_racket(f_q, bx, by):
+        if not racket_by_frame:
+            return None
+        best = None
+        for df in (0, -1, 1, -2, 2):
+            rlist = racket_by_frame.get(f_q + df)
+            if not rlist:
+                continue
+            for r in rlist:
+                d = math.hypot(bx - r["cx"], by - r["cy"]) + abs(df) * 4.0
+                lim = max(18.0, 1.50 * r["diag"])
+                if d <= lim and (best is None or d < best[0]):
+                    best = (d, r)
+        return best
+
+    def _lookup_player_txy(f_q, slot):
+        if not players_by_frame or slot is None:
+            return None
+        for df in (0, -1, 1, -2, 2, -3, 3):
+            pm = players_by_frame.get(f_q + df)
+            if pm and slot in pm and pm[slot].get("table_xy") is not None:
+                return pm[slot]["table_xy"]
+        return None
+
     for i in range(1, n - 1):
         f, x, y, is_interp = pts[i]
         f_p, x_p, y_p, _ = pts[i - 1]
@@ -3338,21 +3930,71 @@ def detect_bounce_events(filled_track, table_geo, fps, table_edge_tol=30.0):
                     last_ok_frame = f
                     last_ok_half = half
                     spd = speed_kmh(f_p, f_n, pts[i - 1], pts[i + 1])
+                    hitter_txy = None
+                    if last_hit_ev is not None and 0 < (f - last_hit_frame) <= int(round(fps * 0.95)):
+                        hitter_txy = last_hit_ev.get("player_table_xy")
+                    if hitter_txy is None and half in ("FAR", "NEAR"):
+                        opp_slot = 1 if half == "FAR" else 0
+                        hitter_txy = _lookup_player_txy(max(0, f - int(round(fps * 0.22))), opp_slot)
                     events.append({"frame": f, "x": x, "y": y, "type": ev_type,
                                    "half": half, "adopted": adopted,
-                                   "table_xy": txy, "speed_kmh": spd})
+                                   "table_xy": txy, "speed_kmh": spd,
+                                   "hitter_table_xy": hitter_txy})
                     if half is not None:
                         bounce_halves[f] = half
-        if ev_type is None:
+        if ev_type is None and (f - last_bounce_frame) >= 2 and (f - last_hit_frame) >= hit_cooldown_frames:
             vx_prev, vx_next = x - x_p, x_n - x
-            if vx_prev * vx_next < 0 and abs(vx_prev) > 2.0 and abs(vx_next) > 2.0:
-                if _in_hit_zone(x, y):
-                    ev_type = "hit"
-                    spd = speed_kmh(f_p, f_n, pts[i - 1], pts[i + 1])
-                    txy = img_to_table(table_geo, (x, y)) if has_geo else None
-                    events.append({"frame": f, "x": x, "y": y, "type": ev_type,
-                                   "half": None, "adopted": None,
-                                   "table_xy": txy, "speed_kmh": spd})
+            is_vx_flip = (vx_prev * vx_next < 0 and abs(vx_prev) > 2.0 and abs(vx_next) > 2.0)
+            r_match = _find_nearby_racket(f, x, y)
+            is_racket_hit = False
+            if r_match is not None:
+                r_dist, r_rec = r_match
+                dv = math.hypot(vx_next - vx_prev, vy_next - vy_prev)
+                if r_dist <= max(14.0, 0.85 * r_rec["diag"]) and (dv > 2.6 or r_rec["snorm"] >= 0.42):
+                    is_racket_hit = True
+            if (is_vx_flip or is_racket_hit) and _in_hit_zone(x, y):
+                ev_type = "hit"
+                last_hit_frame = f
+                spd = speed_kmh(f_p, f_n, pts[i - 1], pts[i + 1])
+                txy = img_to_table(table_geo, (x, y)) if has_geo else None
+                out_norm = math.hypot(vx_next, vy_next)
+                if out_norm > 1e-3:
+                    dx_u, dy_u = vx_next / out_norm, vy_next / out_norm
+                else:
+                    in_norm = max(1e-3, math.hypot(vx_prev, vy_prev))
+                    dx_u, dy_u = -vx_prev / in_norm, -vy_prev / in_norm
+                r_snorm = 0.0
+                h_slot = None
+                hit_x, hit_y = x, y
+                if r_match is not None:
+                    r_dist, r_rec = r_match
+                    r_snorm = float(r_rec["snorm"])
+                    h_slot = r_rec["slot"]
+                    # 触球点向拍面中心轻度吸附, 使灰尘/瞬光精准贴合球拍
+                    if r_dist <= max(20.0, 1.1 * r_rec["diag"]):
+                        hit_x = 0.65 * x + 0.35 * r_rec["cx"]
+                        hit_y = 0.65 * y + 0.35 * r_rec["cy"]
+                    if r_rec["speed"] > 20.0:
+                        rux = r_rec["vx"] / r_rec["speed"]
+                        ruy = r_rec["vy"] / r_rec["speed"]
+                        if (dx_u * rux + dy_u * ruy) >= -0.30:
+                            bx_u = 0.65 * dx_u + 0.35 * rux
+                            by_u = 0.65 * dy_u + 0.35 * ruy
+                            bn = math.hypot(bx_u, by_u)
+                            if bn > 1e-4:
+                                dx_u, dy_u = bx_u / bn, by_u / bn
+                if h_slot is None and txy is not None:
+                    h_slot = 0 if txy[1] < _TY_HALF else 1
+                p_txy = _lookup_player_txy(f, h_slot)
+                last_hit_ev = {
+                    "frame": f, "x": hit_x, "y": hit_y, "type": ev_type,
+                    "half": None, "adopted": None,
+                    "table_xy": txy, "speed_kmh": spd,
+                    "dir_x": float(dx_u), "dir_y": float(dy_u),
+                    "racket_snorm": r_snorm, "slot": h_slot,
+                    "player_table_xy": p_txy,
+                }
+                events.append(last_hit_ev)
     return events, bounce_halves
 
 
@@ -3882,18 +4524,66 @@ def build_segments(rallies, fps, total_frames, args, bounce_halves=None,
     return segments, rally_starts_by_seg
 
 
+def build_rally_shots_in_window(events_sorted, ev_frames, lo_f, hi_f, fps):
+    """统计 [lo_f, hi_f) 区间内的逻辑回合击球板序 [(trigger_frame, shot_kmh), ...]。
+
+    规则:
+      - hit 计为一板起点; 紧随其后 0.90s 内的落台 bounce 归入同一板 (发球首板允许吸收两半台连续两跳);
+      - 若某板球拍被遮挡漏检 hit, 则独立的台面 bounce 自动补计为一板。
+    """
+    if not events_sorted or hi_f <= lo_f:
+        return []
+    i0 = bisect.bisect_left(ev_frames, lo_f)
+    i1 = bisect.bisect_left(ev_frames, hi_f)
+    if i0 >= i1:
+        return []
+    pair_win = max(2, int(round(fps * 0.90)))
+    serve_b2_win = max(2, int(round(fps * 0.70)))
+    shots = []
+    pending_hit_idx = None
+    pending_hit_f = -10 ** 9
+    serve_b1_f = None
+    for k in range(i0, i1):
+        ev = events_sorted[k]
+        ef = ev["frame"]
+        spd = float(ev.get("speed_kmh") or 0.0)
+        if ev["type"] == "hit":
+            shots.append([ef, spd])
+            pending_hit_idx = len(shots) - 1
+            pending_hit_f = ef
+        elif ev["type"] == "bounce":
+            if pending_hit_idx is not None and (ef - pending_hit_f) <= pair_win:
+                if spd > shots[pending_hit_idx][1]:
+                    shots[pending_hit_idx][1] = spd
+                if len(shots) == 1 and serve_b1_f is None:
+                    serve_b1_f = ef
+                else:
+                    pending_hit_idx = None
+            elif len(shots) == 1 and serve_b1_f is not None and (ef - serve_b1_f) <= serve_b2_win:
+                if spd > shots[0][1]:
+                    shots[0][1] = spd
+                serve_b1_f = None
+                pending_hit_idx = None
+            else:
+                shots.append([ef, spd])
+                if len(shots) == 1:
+                    serve_b1_f = ef
+                pending_hit_idx = None
+    return shots
+
+
 def _pick_top_speed_segments(rallies, ball_speed_table, fps, total_frames,
                               top_n=7, min_duration=10.0,
                               pre_buffer=0.5, post_buffer=1.5,
-                              bounce_halves=None, min_bounce_count=0):
-    """筛选候选回合: 合并前时长 >= min_duration 或 落点数较少半台的落点数 > min_bounce_count
-    (两条件取或, 满足任一即可), 按平均球速降序取 top_n, 返回片段列表 + rally_starts_by_seg。
-
-    效率优化: 将 ball_speed_table 预展平为 numpy 数组 (按帧号索引),
-    每个回合用切片 + 布尔掩码一次性求均值, 避免逐帧 dict.get + 字段访问的 Python 循环开销。
-    落点计数: 两半台落点帧号预先排序, 用 bisect 在 O(log n) 内统计回合区间内落点数。
+                              bounce_halves=None, min_bounce_count=0,
+                              pr_data=None, events=None):
+    """筛选并综合排序前置精彩回合:
+    候选门槛: 合并前时长 >= min_duration 或 落点数较少半台的落点数 > min_bounce_count。
+    综合高光打分: 融合平均球速 + 对阵双方跑动总跨度 + 挥拍峰值速度 + 相持板数,
+    既保留暴冲快球, 也能选出中远台大范围跑动救球/放高球攻防的神仙回合。
     """
-    # 落点半台索引: 两半台各自的落点帧号升序列表
+    if top_n <= 0 or not rallies:
+        return [], {}
     bounce_far = []
     bounce_near = []
     if bounce_halves:
@@ -3905,24 +4595,83 @@ def _pick_top_speed_segments(rallies, ball_speed_table, fps, total_frames,
     if not valid:
         return [], {}
 
-    # 平均球速 (px/s, 非零帧) 降序 — 复用模块级实现
-    rally_speeds = _rally_avg_speeds_px(valid, ball_speed_table)
-    top = rally_speeds[:top_n]
+    sp_map = {id(r): sp for sp, r in _rally_avg_speeds_px(valid, ball_speed_table)}
+    step_px_dict = (pr_data or {}).get("player_step_px") or {}
+    rspd_dict = (pr_data or {}).get("racket_speed_px") or {}
+
+    max_f_needed = max((r["end_frame"] for r in valid), default=0) + 2
+    if step_px_dict:
+        step_prefix = np.zeros(max_f_needed + 1, dtype=np.float64)
+        for fk, sv in step_px_dict.items():
+            if 0 <= fk < max_f_needed:
+                step_prefix[fk + 1] = sv
+        np.cumsum(step_prefix, out=step_prefix)
+    else:
+        step_prefix = None
+
+    if rspd_dict:
+        rspd_arr = np.zeros(max_f_needed, dtype=np.float64)
+        for fk, rv in rspd_dict.items():
+            if 0 <= fk < max_f_needed:
+                rspd_arr[fk] = rv
+    else:
+        rspd_arr = None
+
+    events_sorted = sorted(events, key=lambda e: e["frame"]) if events else []
+    ev_frames = [e["frame"] for e in events_sorted]
+
+    metrics = []
+    for r in valid:
+        s, e = int(r["start_frame"]), int(r["end_frame"])
+        sp_v = sp_map.get(id(r), 0.0)
+        mv_v = float(step_prefix[min(e + 1, max_f_needed)] - step_prefix[min(s, max_f_needed)]) if step_prefix is not None else 0.0
+        sw_v = 0.0
+        if rspd_arr is not None and e >= s and s < max_f_needed:
+            sl = rspd_arr[s:min(e + 1, max_f_needed)]
+            nz = sl[sl > 0]
+            if nz.size > 0:
+                top_k = np.sort(nz)[-min(3, nz.size):]
+                sw_v = float(top_k.mean())
+        sh_cnt = len(build_rally_shots_in_window(events_sorted, ev_frames, s, e + 1, fps))
+        metrics.append((r, sp_v, mv_v, sw_v, sh_cnt))
+
+    max_sp = max((m[1] for m in metrics), default=0.0)
+    max_mv = max((m[2] for m in metrics), default=0.0)
+    max_sw = max((m[3] for m in metrics), default=0.0)
+    has_pr = (max_mv > 1.0 or max_sw > 1.0)
+
+    scored = []
+    for r, sp_v, mv_v, sw_v, sh_cnt in metrics:
+        n_sp = sp_v / (max_sp + 1e-6) if max_sp > 0 else 0.0
+        n_mv = mv_v / (max_mv + 1e-6) if max_mv > 0 else 0.0
+        n_sw = sw_v / (max_sw + 1e-6) if max_sw > 0 else 0.0
+        n_sh = min(1.0, sh_cnt / 14.0)
+        if has_pr:
+            total_sc = 0.45 * n_sp + 0.25 * n_mv + 0.15 * n_sw + 0.15 * n_sh
+        else:
+            total_sc = 0.85 * n_sp + 0.15 * n_sh
+        scored.append((total_sc, sp_v, sh_cnt, r))
+
+    scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
+    top = scored[:top_n]
     pre = int(pre_buffer * fps)
     post = int(post_buffer * fps)
     segments = []
     rally_starts_by_seg = {}
-    for si, (sp, r) in enumerate(top):
+    for si, (_sc, _sp, _sh, r) in enumerate(top):
         bs = max(0, r["start_frame"] - pre)
         be = min(total_frames - 1, r["end_frame"] + post)
         segments.append((int(bs), int(be)))
         rally_starts_by_seg[si] = [r["start_frame"]]
-    n_above = len(valid)
-    avg_top = [sp for sp, _ in top]
-    if avg_top:
-        log(f"🎯 前置精彩回合: {len(rallies)}回合中{n_above}个通过筛选 "
+
+    if top:
+        sp_vals = [x[1] for x in top]
+        sh_vals = [x[2] for x in top]
+        rank_mode = "球速+跑动+挥拍+板数" if has_pr else "球速+板数"
+        log(f"🎯 前置精彩回合: {len(rallies)}回合中{len(valid)}个通过筛选 "
             f"(时长>={min_duration}s 或 少落点半台落点>{min_bounce_count}), "
-            f"球速排序取top{len(top)}, 速度{min(avg_top):.0f}~{max(avg_top):.0f} px/s")
+            f"按[{rank_mode}]综合排序取top{len(top)}, "
+            f"球速{min(sp_vals):.0f}~{max(sp_vals):.0f}px/s, 板数{min(sh_vals)}~{max(sh_vals)}")
     return segments, rally_starts_by_seg
 
 
@@ -3930,85 +4679,319 @@ def _pick_top_speed_segments(rallies, ball_speed_table, fps, total_frames,
 #  7) 渲染 — 特效系统
 # =====================================================================
 class MiniTable:
+    """右上角迷你球台: 支持经典落点连线模式与外扩球员站位战术雷达模式。"""
     def __init__(self, frame_w, frame_h):
-        self.h = int(frame_h * 0.30)
-        self.w = int(self.h / TABLE_RATIO)
-        self.margin = int(frame_w * 0.015)
+        self.frame_w = frame_w
+        self.frame_h = frame_h
+        self.ui_scale = _clamp(frame_h / 1080.0, 0.60, 2.2)
+        self.margin = max(8, int(frame_w * 0.015))
+        self._x_max = TABLE_WID_M * 1000.0
+        self._y_max = TABLE_LEN_M * 1000.0
+
+        # 1) 经典紧凑球台布局 (show_radar=False)
+        self.h = max(60, int(frame_h * 0.30))
+        self.w = max(34, int(self.h / TABLE_RATIO))
         self.x0 = frame_w - self.w - self.margin
         self.y0 = self.margin
-        self.sx = self.w / (TABLE_WID_M * 1000)
-        self.sy = self.h / (TABLE_LEN_M * 1000)
-        self._bg = np.full((self.h, self.w, 3), (60, 90, 60), dtype=np.uint8)
-        self._x_max = TABLE_WID_M * 1000
-        self._y_max = TABLE_LEN_M * 1000
+        self.sx = self.w / self._x_max
+        self.sy = self.h / self._y_max
+        self._bg_classic = np.full((self.h, self.w, 3), (60, 90, 60), dtype=np.uint8)
 
-    def table_to_mini(self, txy):
+        # 2) 战术雷达外扩沙盘布局 (show_radar=True: 上下左右留出球员跑动区)
+        self.rad_h = max(84, int(frame_h * 0.35))
+        self.rad_pad_y = max(14, int(self.rad_h * 0.17))
+        self.rad_th = max(48, self.rad_h - 2 * self.rad_pad_y)
+        self.rad_tw = max(28, int(round(self.rad_th / TABLE_RATIO)))
+        self.rad_pad_x = max(12, int(round(self.rad_tw * 0.30)))
+        self.rad_w = self.rad_tw + 2 * self.rad_pad_x
+        self.rad_x0 = max(2, frame_w - self.rad_w - self.margin)
+        self.rad_y0 = self.margin
+        self.rad_tx0 = self.rad_x0 + self.rad_pad_x
+        self.rad_ty0 = self.rad_y0 + self.rad_pad_y
+        self.rad_sx = self.rad_tw / self._x_max
+        self.rad_sy = self.rad_th / self._y_max
+        self._bg_apron = np.full((self.rad_h, self.rad_w, 3), (34, 44, 56), dtype=np.uint8)
+        self._bg_rad_tbl = np.full((self.rad_th, self.rad_tw, 3), (62, 96, 64), dtype=np.uint8)
+
+        self._breadcrumbs = {0: deque(maxlen=18), 1: deque(maxlen=18)}
+
+    def reset_breadcrumbs(self):
+        self._breadcrumbs[0].clear()
+        self._breadcrumbs[1].clear()
+
+    def _map_table_pt(self, txy, radar=False, clamp_to_table=True):
         if txy is None:
             return None
-        X, Y = txy
-        _tol = 50
-        if not (-_tol <= X <= self._x_max + _tol and -_tol <= Y <= self._y_max + _tol):
-            return None
-        X = _clamp(X, 0.0, self._x_max)
-        Y = _clamp(Y, 0.0, self._y_max)
-        return int(self.x0 + X * self.sx), int(self.y0 + Y * self.sy)
+        X, Y = float(txy[0]), float(txy[1])
+        if clamp_to_table:
+            _tol = 50.0
+            if not (-_tol <= X <= self._x_max + _tol and -_tol <= Y <= self._y_max + _tol):
+                return None
+            X = _clamp(X, 0.0, self._x_max)
+            Y = _clamp(Y, 0.0, self._y_max)
+        if radar:
+            px = int(round(self.rad_tx0 + X * self.rad_sx))
+            py = int(round(self.rad_ty0 + Y * self.rad_sy))
+            pad = 6
+            px = int(_clamp(px, self.rad_x0 + pad, self.rad_x0 + self.rad_w - pad))
+            py = int(_clamp(py, self.rad_y0 + pad, self.rad_y0 + self.rad_h - pad))
+            return px, py
+        return int(round(self.x0 + X * self.sx)), int(round(self.y0 + Y * self.sy))
 
-    def draw(self, frame, current_rally_points):
-        roi = frame[self.y0:self.y0 + self.h, self.x0:self.x0 + self.w]
-        cv2.addWeighted(self._bg, 0.55, roi, 0.45, 0, roi)
-        cv2.rectangle(frame, (self.x0, self.y0),
-                      (self.x0 + self.w, self.y0 + self.h), (255, 255, 255), 2)
-        midy = self.y0 + self.h // 2
-        cv2.line(frame, (self.x0, midy), (self.x0 + self.w, midy), (255, 255, 255), 2)
-        dash_len = max(4, self.w // 12)
-        for dx in range(0, self.w, dash_len * 2):
-            x_start = self.x0 + dx
-            x_end = min(self.x0 + dx + dash_len, self.x0 + self.w)
-            cv2.line(frame, (x_start, midy), (x_end, midy), (180, 220, 255), 1)
-        cv2.putText(frame, "NET", (self.x0 + self.w + 3, midy + 4),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.3, (180, 220, 255), 1)
-        midx = self.x0 + self.w // 2
-        cv2.line(frame, (midx, self.y0), (midx, self.y0 + self.h), (200, 200, 200), 1)
-        cv2.putText(frame, "FAR", (self.x0 + 2, self.y0 + 12),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.3, (200, 200, 200), 1)
-        cv2.putText(frame, "NEAR", (self.x0 + 2, self.y0 + self.h - 4),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.3, (200, 200, 200), 1)
+    def draw(self, frame, current_rally_points, show_landings=True,
+             show_radar=False, frame_players=None):
+        """绘制迷你球台/雷达面板, 返回面板最底部像素 Y 坐标 (供下方连击面板排版对齐)。"""
+        us = self.ui_scale
+        if not show_radar:
+            x0, y0, tw, th = self.x0, self.y0, self.w, self.h
+            roi = frame[y0:y0 + th, x0:x0 + tw]
+            cv2.addWeighted(self._bg_classic, 0.55, roi, 0.45, 0, roi)
+            box_bottom = y0 + th
+            box_x0, box_w = x0, tw
+            header_txt = "TABLE"
+        else:
+            px0, py0, pw, ph = self.rad_x0, self.rad_y0, self.rad_w, self.rad_h
+            roi_ap = frame[py0:py0 + ph, px0:px0 + pw]
+            cv2.addWeighted(self._bg_apron, 0.58, roi_ap, 0.42, 0, roi_ap)
+            cv2.rectangle(frame, (px0, py0), (px0 + pw, py0 + ph), (130, 155, 185), 1, cv2.LINE_AA)
+
+            x0, y0, tw, th = self.rad_tx0, self.rad_ty0, self.rad_tw, self.rad_th
+            roi_t = frame[y0:y0 + th, x0:x0 + tw]
+            cv2.addWeighted(self._bg_rad_tbl, 0.65, roi_t, 0.35, 0, roi_t)
+            # 远近台分区辅助淡线
+            mid_ap_y = y0 + th // 2
+            cv2.line(frame, (px0 + 4, mid_ap_y), (x0 - 3, mid_ap_y), (95, 115, 140), 1, cv2.LINE_AA)
+            cv2.line(frame, (x0 + tw + 3, mid_ap_y), (px0 + pw - 4, mid_ap_y), (95, 115, 140), 1, cv2.LINE_AA)
+            box_bottom = py0 + ph
+            box_x0, box_w = px0, pw
+            header_txt = "TACTICAL RADAR"
+
+        # 绘制标准球台边线、中线与球网
+        cv2.rectangle(frame, (x0, y0), (x0 + tw, y0 + th), (245, 245, 245), max(1, int(round(2 * us))))
+        midy = y0 + th // 2
+        cv2.line(frame, (x0, midy), (x0 + tw, midy), (255, 255, 255), max(1, int(round(2 * us))))
+        dash_len = max(4, tw // 12)
+        for dx in range(0, tw, dash_len * 2):
+            xs = x0 + dx
+            xe = min(x0 + dx + dash_len, x0 + tw)
+            cv2.line(frame, (xs, midy), (xe, midy), (180, 220, 255), 1)
+        midx = x0 + tw // 2
+        cv2.line(frame, (midx, y0), (midx, y0 + th), (195, 195, 195), 1)
+
+        f_sm = 0.30 * us
+        cv2.putText(frame, "FAR", (x0 + 3, y0 + int(12 * us)),
+                    cv2.FONT_HERSHEY_SIMPLEX, f_sm, (205, 210, 215), 1, cv2.LINE_AA)
+        cv2.putText(frame, "NEAR", (x0 + 3, y0 + th - max(3, int(4 * us))),
+                    cv2.FONT_HERSHEY_SIMPLEX, f_sm, (205, 210, 215), 1, cv2.LINE_AA)
+        if not show_radar:
+            cv2.putText(frame, "NET", (min(self.frame_w - 24, x0 + tw + 3), midy + 4),
+                        cv2.FONT_HERSHEY_SIMPLEX, f_sm, (180, 220, 255), 1, cv2.LINE_AA)
+
+        # 战术雷达层: 球员跑动尾迹 + 击球至落点战术虚线 + 双方球员站位与朝向弧
         mpts = []
-        for lp in current_rally_points:
-            mp = self.table_to_mini(lp.get("table_xy"))
-            if mp:
-                mpts.append(mp)
-        for i in range(1, len(mpts)):
-            cv2.line(frame, mpts[i - 1], mpts[i], (0, 180, 255), 1, cv2.LINE_AA)
-        for i, mp in enumerate(mpts):
-            if i == len(mpts) - 1:
-                cv2.circle(frame, mp, 7, (0, 255, 255), -1)
-                cv2.circle(frame, mp, 8, (0, 0, 0), 1)
-            else:
-                cv2.circle(frame, mp, 5, (0, 215, 255), -1)
-                cv2.circle(frame, mp, 6, (0, 0, 0), 1)
-        cv2.putText(frame, "TABLE", (self.x0, self.y0 - 6),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
-        if current_rally_points:
+        last_lp = None
+        if show_landings and current_rally_points:
+            for lp in current_rally_points:
+                mp = self._map_table_pt(lp.get("table_xy"), radar=show_radar, clamp_to_table=True)
+                if mp:
+                    mpts.append(mp)
+                    last_lp = lp
+
+        if show_radar:
+            slot_colors = {0: (255, 215, 75), 1: (85, 170, 255)}  # FAR 冰蓝青 / NEAR 暖琥珀
+            cur_radar_pts = {}
+            if frame_players:
+                for slot in (0, 1):
+                    pinfo = frame_players.get(slot)
+                    if pinfo and pinfo.get("table_xy") is not None:
+                        rpt = self._map_table_pt(pinfo["table_xy"], radar=True, clamp_to_table=False)
+                        if rpt is not None:
+                            self._breadcrumbs[slot].append(rpt)
+                            cur_radar_pts[slot] = (rpt, float(pinfo.get("facing_deg", 90.0 if slot == 0 else -90.0)))
+
+            # 绘制双方近期横向/前后跑动轨迹尾迹
+            for slot in (0, 1):
+                bc = list(self._breadcrumbs[slot])
+                if len(bc) >= 2:
+                    base_c = slot_colors[slot]
+                    for bi in range(1, len(bc)):
+                        u_b = bi / len(bc)
+                        c_b = _lerp_color((55, 68, 82), base_c, 0.25 + 0.55 * u_b)
+                        cv2.line(frame, bc[bi - 1], bc[bi], c_b, max(1, int(round(1.5 * us))), cv2.LINE_AA)
+
+            # 最新一板的「击球站位 → 台面落点」战术路线
+            if show_landings and last_lp is not None and mpts:
+                htxy = last_lp.get("hitter_table_xy")
+                if htxy is not None:
+                    hpt = self._map_table_pt(htxy, radar=True, clamp_to_table=False)
+                    if hpt is not None:
+                        cv2.line(frame, hpt, mpts[-1], (150, 245, 255), 1, cv2.LINE_AA)
+
+            # 绘制对阵双主球员圆点与朝向扇弧
+            pr_rad = max(4, int(round(5.0 * us)))
+            arc_rad = pr_rad + max(3, int(round(3.5 * us)))
+            for slot in (0, 1):
+                if slot in cur_radar_pts:
+                    rpt, fdeg = cur_radar_pts[slot]
+                elif self._breadcrumbs[slot]:
+                    rpt = self._breadcrumbs[slot][-1]
+                    fdeg = 90.0 if slot == 0 else -90.0
+                else:
+                    continue
+                col_p = slot_colors[slot]
+                cv2.ellipse(frame, rpt, (arc_rad, arc_rad), 0.0,
+                            fdeg - 42.0, fdeg + 42.0, col_p, max(1, int(round(1.6 * us))), cv2.LINE_AA)
+                cv2.circle(frame, rpt, pr_rad + 1, (20, 24, 30), -1, cv2.LINE_AA)
+                cv2.circle(frame, rpt, pr_rad, col_p, -1, cv2.LINE_AA)
+                cv2.circle(frame, rpt, max(1, pr_rad // 2), (255, 255, 255), -1, cv2.LINE_AA)
+
+        # 绘制落点连线与落点高亮
+        if show_landings and mpts:
+            for i in range(1, len(mpts)):
+                cv2.line(frame, mpts[i - 1], mpts[i], (0, 180, 255), max(1, int(round(1.2 * us))), cv2.LINE_AA)
+            r_old = max(3, int(round(4.8 * us)))
+            r_cur = max(5, int(round(6.8 * us)))
+            for i, mp in enumerate(mpts):
+                if i == len(mpts) - 1:
+                    cv2.circle(frame, mp, r_cur, (0, 255, 255), -1, cv2.LINE_AA)
+                    cv2.circle(frame, mp, r_cur + 1, (0, 0, 0), 1, cv2.LINE_AA)
+                else:
+                    cv2.circle(frame, mp, r_old, (0, 215, 255), -1, cv2.LINE_AA)
+                    cv2.circle(frame, mp, r_old + 1, (0, 0, 0), 1, cv2.LINE_AA)
+
+        hdr_scale = 0.40 * us
+        hdr_y = max(int(12 * us), (self.rad_y0 if show_radar else self.y0) - max(4, int(5 * us)))
+        cv2.putText(frame, header_txt, (box_x0, hdr_y),
+                    cv2.FONT_HERSHEY_SIMPLEX, hdr_scale, (235, 242, 250), 1, cv2.LINE_AA)
+
+        cur_bottom = box_bottom
+        if show_landings and current_rally_points:
             spd = current_rally_points[-1].get("speed_kmh")
             if spd:
                 speed_text = f"{spd:.0f} km/h"
-                (tw, th), _ = cv2.getTextSize(speed_text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)
-                sx = self.x0 + self.w - tw - 4
-                sy = self.y0 + self.h + th + 4
-                cv2.putText(frame, speed_text, (sx, sy),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
+                sp_fs = 0.48 * us
+                sp_th = max(1, int(round(1.8 * us)))
+                (tw_s, th_s), _ = cv2.getTextSize(speed_text, cv2.FONT_HERSHEY_SIMPLEX, sp_fs, sp_th)
+                sx_t = box_x0 + box_w - tw_s - 2
+                sy_t = box_bottom + th_s + max(4, int(5 * us))
+                cv2.putText(frame, speed_text, (sx_t, sy_t),
+                            cv2.FONT_HERSHEY_SIMPLEX, sp_fs, (0, 0, 0), sp_th + 2, cv2.LINE_AA)
+                cv2.putText(frame, speed_text, (sx_t, sy_t),
+                            cv2.FONT_HERSHEY_SIMPLEX, sp_fs, (0, 255, 255), sp_th, cv2.LINE_AA)
+                cur_bottom = sy_t + max(2, int(3 * us))
+        return cur_bottom
+
+
+class RallyCounterBadge:
+    """右上角极简回合连击板数 (SHOTS) 与回合峰值球速 (PEAK km/h) 面板。"""
+    def __init__(self, frame_w, frame_h, fps):
+        self.frame_w = frame_w
+        self.frame_h = frame_h
+        self.ui_scale = _clamp(frame_h / 1080.0, 0.60, 2.2)
+        self.margin = max(8, int(frame_w * 0.015))
+        self.pop_max = max(3, int(round(fps * 0.14)))
+        self._last_count = 0
+        self._pop_t = 0
+
+    def reset(self):
+        self._last_count = 0
+        self._pop_t = 0
+
+    def draw(self, frame, shot_count, peak_kmh=0.0, anchor_y=None):
+        if shot_count < 2:
+            self._last_count = shot_count
+            return
+        if shot_count > self._last_count:
+            self._pop_t = self.pop_max
+        self._last_count = shot_count
+
+        us = self.ui_scale
+        pop_boost = 1.0 + 0.16 * (self._pop_t / max(1, self.pop_max))
+        if self._pop_t > 0:
+            self._pop_t -= 1
+
+        is_long = (shot_count >= 8)
+        num_col = (60, 215, 255) if is_long else (255, 235, 90)
+        lbl_txt = "SHOTS"
+        num_txt = str(int(shot_count))
+        fs_num = 0.62 * us * pop_boost
+        fs_lbl = 0.36 * us
+        th_num = max(1, int(round(2.0 * us)))
+        (nw, nh), _ = cv2.getTextSize(num_txt, cv2.FONT_HERSHEY_SIMPLEX, fs_num, th_num)
+        (lw, lh), _ = cv2.getTextSize(lbl_txt, cv2.FONT_HERSHEY_SIMPLEX, fs_lbl, 1)
+
+        peak_txt = f"PEAK {peak_kmh:.0f} km/h" if (peak_kmh and peak_kmh >= 15.0) else ""
+        fs_pk = 0.34 * us
+        (pw_t, ph_t), _ = (cv2.getTextSize(peak_txt, cv2.FONT_HERSHEY_SIMPLEX, fs_pk, 1)
+                           if peak_txt else ((0, 0), 0))
+
+        pad_x = max(8, int(round(10 * us)))
+        pad_y = max(5, int(round(6 * us)))
+        gap_x = max(6, int(round(7 * us)))
+        row1_w = lw + gap_x + nw
+        box_w = max(row1_w, pw_t) + 2 * pad_x
+        row1_h = max(nh, lh)
+        box_h = row1_h + (ph_t + max(4, int(5 * us)) if peak_txt else 0) + 2 * pad_y
+
+        x1 = self.frame_w - self.margin
+        x0 = max(2, x1 - box_w)
+        y0 = (anchor_y + max(6, int(round(7 * us)))) if anchor_y is not None else self.margin
+        y1 = min(self.frame_h - 2, y0 + box_h)
+        if y1 - y0 < 12 or x1 - x0 < 20:
+            return
+
+        roi = frame[y0:y1, x0:x1]
+        bg = np.full_like(roi, (26, 34, 46))
+        cv2.addWeighted(bg, 0.62, roi, 0.38, 0, roi)
+        b_col = (70, 195, 245) if is_long else (130, 155, 185)
+        cv2.rectangle(frame, (x0, y0), (x1 - 1, y1 - 1), b_col, 1, cv2.LINE_AA)
+
+        base_y1 = y0 + pad_y + row1_h
+        lx = x1 - pad_x - nw - gap_x - lw
+        nx = x1 - pad_x - nw
+        cv2.putText(frame, lbl_txt, (lx, base_y1 - max(1, (row1_h - lh) // 3)),
+                    cv2.FONT_HERSHEY_SIMPLEX, fs_lbl, (195, 210, 230), 1, cv2.LINE_AA)
+        cv2.putText(frame, num_txt, (nx, base_y1),
+                    cv2.FONT_HERSHEY_SIMPLEX, fs_num, num_col, th_num, cv2.LINE_AA)
+
+        if peak_txt:
+            py_pk = y1 - pad_y
+            px_pk = x1 - pad_x - pw_t
+            cv2.putText(frame, peak_txt, (px_pk, py_pk),
+                        cv2.FONT_HERSHEY_SIMPLEX, fs_pk, (175, 225, 245), 1, cv2.LINE_AA)
 
 
 class ParticleSystem:
+    """触球与落台物理灰尘粒子系统: 支持经典全向喷灰及沿挥拍向量的扇形锥角爆尘。"""
     def __init__(self, intensity=1.0):
         self.particles = []
         self.intensity = intensity
 
-    def emit(self, x, y, n=18, kind="bounce", speed_norm=0.3):
-        n = int(n * self.intensity)
+    def emit(self, x, y, n=18, kind="bounce", speed_norm=0.3,
+             dir_vec=None, racket_snorm=0.0):
+        n = int(round(n * self.intensity))
         base_col = speed_to_color(speed_norm)
         spd_scale = 1.0 + speed_norm * 1.6
+        if kind == "hit_directional" and dir_vec is not None:
+            dx, dy = float(dir_vec[0]), float(dir_vec[1])
+            base_ang = math.atan2(dy, dx)
+            boost = 1.15 + 0.45 * racket_snorm
+            for k in range(n):
+                # 80% 粒子集中在出球/挥拍锥角 (±38°) 喷出, 20% 为胶皮切向摩擦碎屑
+                spread = 0.66 if (k % 5 != 0) else 1.28
+                ang = base_ang + np.random.uniform(-spread, spread)
+                spd = np.random.uniform(2.0, 6.8) * spd_scale * boost
+                vx, vy = math.cos(ang) * spd, math.sin(ang) * spd
+                warm_core = _lerp_color((235, 245, 255), base_col, 0.35 + 0.45 * speed_norm)
+                life = np.random.randint(8, 18 + int(speed_norm * 10))
+                self.particles.append({
+                    "x": x, "y": y, "vx": vx, "vy": vy,
+                    "life": life, "maxlife": life,
+                    "size": np.random.uniform(1.1, 3.2 + speed_norm * 1.4),
+                    "color": warm_core,
+                })
+            return
+
         for _ in range(n):
             ang = np.random.uniform(0, 2 * math.pi)
             spd = np.random.uniform(1.5, 6.0) * spd_scale
@@ -4046,144 +5029,300 @@ class ParticleSystem:
         self.particles = alive
 
 
-class ShockwaveSystem:
-    def __init__(self, intensity=1.0):
-        self.waves = []
+class HitImpactRenderer:
+    """重板暴冲/扣杀拍面触球瞬光: 仅持续 5 帧的局部椭圆冲击波纹 + 微星芒 (零文字遮挡)。"""
+    def __init__(self, frame_w, frame_h, intensity=1.0):
+        self.impacts = []
+        self.ui_scale = _clamp(frame_h / 1080.0, 0.60, 2.2)
         self.intensity = intensity
 
-    def emit(self, x, y, kind="hit", speed_norm=0.3):
-        #base_col = speed_to_color(speed_norm)
-        n_rings = 1 + int(round(speed_norm * 2 * self.intensity))
-        life = int(10 + speed_norm * 14)
-        for k in range(max(1, n_rings)):
-            self.waves.append({"x": x, "y": y, "r": 0.01 + k * 0.08,
-                               "vr": (0.05 + speed_norm * 0.15) * (1.0 - 0.15 * k),
-                               "life": life, "maxlife": life,
-                               "color": (255, 255, 255),
-                               "thick": 2 if kind == "hit" else 1})
-
-    def update_and_draw(self, frame):
-        alive = []
-        h, w = frame.shape[:2]
-        for wv in self.waves:
-            wv["r"] += wv["vr"]
-            wv["vr"] *= 0.94
-            wv["life"] -= 1
-            if wv["life"] <= 0:
-                continue
-            a = wv["life"] / wv["maxlife"]
-            xi, yi, rr = int(wv["x"]), int(wv["y"]), int(wv["r"])
-            if rr <= 0 or not (0 <= xi < w and 0 <= yi < h):
-                alive.append(wv)
-                continue
-            #col = tuple(int(c * a) for c in wv["color"])
-            cv2.circle(
-                        frame, (xi, yi), rr,                 # ← col → (255, 255, 255)
-                        (255, 255, 255),                     # ← 固定白色
-                        max(1, int(wv["thick"] * a + 0.5)),  # ← thick 随透明度变细
-                        cv2.LINE_AA
-                        )
-            alive.append(wv)
-        self.waves = alive
-
-
-class FloatingLabel:
-    def __init__(self):
-        self.labels = []
-
-    def emit(self, x, y, text, color=(0, 200, 255), scale=1.0, life=22):
-        self.labels.append({"x": x, "y": y, "text": text, "color": color,
-                            "scale": scale, "life": life, "maxlife": life})
-
-    def update_and_draw(self, frame):
-        alive = []
-        h, w = frame.shape[:2]
-        for lb in self.labels:
-            lb["y"] -= 1.4
-            lb["life"] -= 1
-            if lb["life"] <= 0:
-                continue
-            a = lb["life"] / lb["maxlife"]
-            fs = 0.6 * lb["scale"] * (0.6 + 0.4 * a)
-            col = tuple(int(c * a) for c in lb["color"])
-            (tw, th), _ = cv2.getTextSize(lb["text"], cv2.FONT_HERSHEY_DUPLEX, fs, 2)
-            px = int(_clamp(lb["x"] - tw / 2, 2, w - tw - 2))
-            py = int(_clamp(lb["y"], th + 2, h - 2))
-            cv2.putText(frame, lb["text"], (px, py), cv2.FONT_HERSHEY_DUPLEX, fs, (0, 0, 0), 4, cv2.LINE_AA)
-            cv2.putText(frame, lb["text"], (px, py), cv2.FONT_HERSHEY_DUPLEX, fs, col, 2, cv2.LINE_AA)
-            alive.append(lb)
-        self.labels = alive
-
-
-class SpeedFlash:
-    def __init__(self):
-        self._t = 0
-        self._max = 0
-        self._mask_cache = {}
-
-    def trigger(self, strength_frames=8):
-        self._t = max(self._t, strength_frames)
-        self._max = max(self._max, strength_frames)
-
-    def _get_mask(self, h, w):
-        key = (h, w)
-        if key not in self._mask_cache:
-            yy, xx = np.mgrid[0:h, 0:w]
-            cx, cy = w / 2.0, h / 2.0
-            d = np.sqrt(((xx - cx) / cx) ** 2 + ((yy - cy) / cy) ** 2)
-            m = np.clip((d - 0.55) / 0.6, 0.0, 1.0).astype(np.float32)
-            self._mask_cache[key] = m[..., None]
-        return self._mask_cache[key]
-
-    def update_and_draw(self, frame):
-        if self._t <= 0:
+    def emit(self, x, y, speed_norm=0.5, racket_snorm=0.0, dir_vec=(1.0, 0.0)):
+        power = max(speed_norm, 0.55 * speed_norm + 0.45 * racket_snorm)
+        if power < 0.58:
             return
-        a = self._t / max(1, self._max)
-        h, w = frame.shape[:2]
-        mask = self._get_mask(h, w)
-        tint = np.array([40, 120, 255], dtype=np.float32)
-        strength = 0.5 * a
-        f = frame.astype(np.float32)
-        f = f * (1.0 - mask * strength) + tint * (mask * strength)
-        frame[:] = np.clip(f, 0, 255).astype(np.uint8)
-        self._t -= 1
-
-
-class BounceMarker:
-    """主画面落点脉冲标记: 高透明度白色扩散圈 (半径较小) + 细白十字。"""
-    def __init__(self):
-        self.marks = []
-
-    def emit(self, x, y):
-        self.marks.append({"x": x, "y": y, "life": 16, "maxlife": 16})
+        dx, dy = float(dir_vec[0]), float(dir_vec[1])
+        ang_deg = math.degrees(math.atan2(dy, dx))
+        max_r = max(10, int(round((14 + 14 * power) * self.ui_scale * (0.85 + 0.15 * self.intensity))))
+        self.impacts.append({
+            "x": float(x), "y": float(y),
+            "ang": ang_deg, "power": power,
+            "max_r": max_r, "life": 5, "maxlife": 5,
+        })
 
     def update_and_draw(self, frame):
+        if not self.impacts:
+            return
         alive = []
         h, w = frame.shape[:2]
-        for m in self.marks:
-            m["life"] -= 1
-            if m["life"] <= 0:
+        for imp in self.impacts:
+            age = imp["maxlife"] - imp["life"]
+            imp["life"] -= 1
+            if imp["life"] < 0:
                 continue
-            a = m["life"] / m["maxlife"]
-            xi, yi = int(m["x"]), int(m["y"])
-            r = int((1 - a) * 12 + 2)
-            pad = r + 3
-            y0, y1 = max(0, yi - pad), min(h, yi + pad + 1)
-            x0, x1 = max(0, xi - pad), min(w, xi + pad + 1)
-            if y0 >= y1 or x0 >= x1:
-                alive.append(m)
+            prog = (age + 1) / float(imp["maxlife"])
+            fade = (1.0 - prog * 0.82) ** 1.3
+            cx, cy = int(round(imp["x"])), int(round(imp["y"]))
+            r_cur = max(3, int(round(imp["max_r"] * (0.32 + 0.68 * prog))))
+            pad = r_cur + 6
+            x0, x1 = max(0, cx - pad), min(w, cx + pad + 1)
+            y0, y1 = max(0, cy - pad), min(h, cy + pad + 1)
+            if x1 <= x0 or y1 <= y0:
                 continue
             roi = frame[y0:y1, x0:x1]
             ov = roi.copy()
-            lcx, lcy = xi - x0, yi - y0
-            cv2.circle(ov, (lcx, lcy), max(1, r), (255, 255, 255), 1, cv2.LINE_AA)
-            cl = int(6 * a + 2)
-            cv2.line(ov, (lcx - cl, lcy), (lcx + cl, lcy), (255, 255, 255), 1, cv2.LINE_AA)
-            cv2.line(ov, (lcx, lcy - cl), (lcx, lcy + cl), (255, 255, 255), 1, cv2.LINE_AA)
-            alpha = 0.28 * a
+            lcx, lcy = cx - x0, cy - y0
+            ring_col = _lerp_color((255, 255, 255), (120, 230, 255), 0.5 * imp["power"])
+            # 垂直于出球方向的拍面冲击椭圆环
+            cv2.ellipse(ov, (lcx, lcy), (r_cur, max(2, int(round(r_cur * 0.52)))),
+                        imp["ang"] + 90.0, 0.0, 360.0, ring_col,
+                        max(1, int(round(2.0 * fade))), cv2.LINE_AA)
+            # 前 2 帧触球中心短促十字微星芒
+            if age <= 1:
+                rad = math.radians(imp["ang"])
+                ux, uy = math.cos(rad), math.sin(rad)
+                px, py = -uy, ux
+                arm1 = max(4, int(round(r_cur * 0.85)))
+                arm2 = max(3, int(round(r_cur * 0.50)))
+                cv2.line(ov, (int(round(lcx - px * arm1)), int(round(lcy - py * arm1))),
+                         (int(round(lcx + px * arm1)), int(round(lcy + py * arm1))),
+                         (255, 255, 255), 1, cv2.LINE_AA)
+                cv2.line(ov, (int(round(lcx - ux * arm2)), int(round(lcy - uy * arm2))),
+                         (int(round(lcx + ux * arm2)), int(round(lcy + py * 0 + uy * arm2))),
+                         (230, 250, 255), 1, cv2.LINE_AA)
+            alpha = _clamp(0.46 * fade * self.intensity, 0.05, 0.62)
             cv2.addWeighted(ov, alpha, roi, 1.0 - alpha, 0, roi)
-            alive.append(m)
-        self.marks = alive
+            if imp["life"] > 0:
+                alive.append(imp)
+        self.impacts = alive
+
+
+def _catmull_rom_subdivide(pts, subdiv=4):
+    """对短轨迹点列做 Catmull-Rom 样条细分, 生成圆润连续的挥拍刀光曲线。"""
+    n = len(pts)
+    if n < 3 or subdiv <= 1:
+        return pts
+    out = []
+    for i in range(n - 1):
+        p0 = pts[max(0, i - 1)]
+        p1 = pts[i]
+        p2 = pts[i + 1]
+        p3 = pts[min(n - 1, i + 2)]
+        for s in range(subdiv):
+            t = s / float(subdiv)
+            t2 = t * t
+            t3 = t2 * t
+            x = 0.5 * ((2.0 * p1[0])
+                       + (-p0[0] + p2[0]) * t
+                       + (2.0 * p0[0] - 5.0 * p1[0] + 4.0 * p2[0] - p3[0]) * t2
+                       + (-p0[0] + 3.0 * p1[0] - 3.0 * p2[0] + p3[0]) * t3)
+            y = 0.5 * ((2.0 * p1[1])
+                       + (-p0[1] + p2[1]) * t
+                       + (2.0 * p0[1] - 5.0 * p1[1] + 4.0 * p2[1] - p3[1]) * t2
+                       + (-p0[1] + 3.0 * p1[1] - 3.0 * p2[1] + p3[1]) * t3)
+            out.append((x, y))
+    out.append(pts[-1])
+    return out
+
+
+class RacketArcRenderer:
+    """挥拍破风弧线 (刀光残影): 仅在击球窗口或高速挥拍瞬间沿球拍轨迹绘制渐变流光弧。"""
+    def __init__(self, fps, frame_w, frame_h, events, racket_trails, scale=1.0, intensity=1.0):
+        self.fps = max(float(fps), 1.0)
+        self.arc_frames = max(4, int(round(self.fps * 0.15)))
+        self.ui_scale = _clamp(frame_h / 1080.0, 0.60, 2.2)
+        self.scale = scale
+        self.intensity = intensity
+        self.racket_trails = racket_trails or {0: {}, 1: {}}
+        self._cache = {}
+
+        # 预构建击球前后挥拍激活帧集合 (平时慢速引拍/执拍等待完全不画, 保持画面干净)
+        pre_w = max(3, int(round(self.fps * 0.11)))
+        post_w = max(3, int(round(self.fps * 0.09)))
+        self.active_frames = {0: {}, 1: {}}
+        for ev in (events or []):
+            if ev.get("type") != "hit":
+                continue
+            hf = int(ev["frame"])
+            target_slots = [ev["slot"]] if ev.get("slot") in (0, 1) else [0, 1]
+            for sl in target_slots:
+                amap = self.active_frames[sl]
+                for fk in range(hf - pre_w, hf + post_w + 1):
+                    dist_f = max(0, fk - (hf + post_w - 2))
+                    fade_w = 1.0 if dist_f == 0 else max(0.25, 1.0 - 0.28 * dist_f)
+                    if fade_w > amap.get(fk, 0.0):
+                        amap[fk] = fade_w
+
+    def draw(self, frame, f):
+        h, w = frame.shape[:2]
+        key = (h, w)
+        if key not in self._cache:
+            self._cache[key] = (np.empty((h, w, 3), dtype=np.uint8),
+                                np.zeros((h, w), dtype=np.float32))
+        overlay, alpha_mask = self._cache[key]
+
+        for slot in (0, 1):
+            tmap = self.racket_trails.get(slot)
+            if not tmap:
+                continue
+            cur_rec = tmap.get(f)
+            win_w = self.active_frames[slot].get(f, 0.0)
+            if cur_rec is None and win_w <= 0.0:
+                continue
+            # 若不在已标记 hit 窗口内, 仅当球拍达到极高挥动速度时自发显现破风弧
+            if win_w <= 0.0:
+                if cur_rec[2] < 0.56:
+                    continue
+                win_w = 0.75
+
+            pts_raw = []
+            snorms = []
+            ref_shot = cur_rec[3] if cur_rec is not None else None
+            last_k = None
+            for fk in range(f - self.arc_frames + 1, f + 1):
+                rec = tmap.get(fk)
+                if rec is None:
+                    continue
+                if ref_shot is None:
+                    ref_shot = rec[3]
+                elif rec[3] != ref_shot:
+                    pts_raw.clear()
+                    snorms.clear()
+                    ref_shot = rec[3]
+                if last_k is not None and (fk - last_k) > 2:
+                    pts_raw.clear()
+                    snorms.clear()
+                pts_raw.append((rec[0] * self.scale, rec[1] * self.scale))
+                snorms.append(rec[2])
+                last_k = fk
+
+            if len(pts_raw) < 3:
+                continue
+            peak_sn = max(snorms)
+            if peak_sn < 0.24:
+                continue
+            span_px = math.hypot(pts_raw[-1][0] - pts_raw[0][0], pts_raw[-1][1] - pts_raw[0][1])
+            if span_px < 10.0 * self.ui_scale:
+                continue
+
+            curve = _catmull_rom_subdivide(pts_raw, subdiv=4)
+            nc = len(curve)
+            if nc < 3:
+                continue
+
+            xs = [p[0] for p in curve]
+            ys = [p[1] for p in curve]
+            pad = max(12, int(round(16 * self.ui_scale)))
+            x0 = max(0, int(min(xs)) - pad)
+            x1 = min(w, int(max(xs)) + pad + 1)
+            y0 = max(0, int(min(ys)) - pad)
+            y1 = min(h, int(max(ys)) + pad + 1)
+            if x1 <= x0 or y1 <= y0:
+                continue
+
+            alpha_mask[y0:y1, x0:x1] = 0.0
+            overlay[y0:y1, x0:x1] = frame[y0:y1, x0:x1]
+
+            # 弧线色调: 中速挥拍冰青白 → 暴冲挥拍暖金流光
+            outer_col = _lerp_color((255, 235, 175), (105, 225, 255), _clamp((peak_sn - 0.25) / 0.65, 0.0, 1.0))
+            max_thick = max(2.0, (2.2 + 5.2 * peak_sn) * self.ui_scale * (0.85 + 0.15 * self.intensity))
+            base_alpha = _clamp((0.20 + 0.30 * peak_sn) * win_w * (0.85 + 0.15 * self.intensity), 0.08, 0.52)
+
+            for i in range(1, nc):
+                u = i / float(nc - 1)
+                # 刀光轮廓: 尾部渐入 -> 0.80 处最宽最亮 -> 拍头锋利收尖
+                if u <= 0.82:
+                    profile = (u / 0.82) ** 1.15
+                else:
+                    profile = max(0.18, 1.0 - (u - 0.82) / 0.18 * 0.72)
+                th = max(1, int(round(max_thick * profile)))
+                seg_a = float(base_alpha * profile)
+                p0 = (int(round(curve[i - 1][0])), int(round(curve[i - 1][1])))
+                p1 = (int(round(curve[i][0])), int(round(curve[i][1])))
+                seg_c = _lerp_color(outer_col, (255, 255, 255), 0.45 * profile)
+                cv2.line(overlay, p0, p1, seg_c, th, cv2.LINE_AA)
+                cv2.line(alpha_mask, p0, p1, seg_a, th, cv2.LINE_AA)
+                if u > 0.45 and th >= 3:
+                    cv2.line(overlay, p0, p1, (255, 255, 255), 1, cv2.LINE_AA)
+
+            roi_a = alpha_mask[y0:y1, x0:x1]
+            if (roi_a > 0).any():
+                roi_f = frame[y0:y1, x0:x1]
+                roi_o = overlay[y0:y1, x0:x1]
+                a3 = roi_a[..., np.newaxis]
+                blended = roi_f.astype(np.float32) * (1.0 - a3) + roi_o.astype(np.float32) * a3
+                roi_f[:] = np.clip(blended + 0.5, 0, 255).astype(np.uint8)
+
+
+class FootDustSystem:
+    """急停救球脚底擦地微尘: 仅在主球员高速横向冲刺或急停变向时于脚跟扬起贴地轻尘。"""
+    def __init__(self, fps, frame_w, frame_h, intensity=1.0):
+        self.puffs = []
+        self.ui_scale = _clamp(frame_h / 1080.0, 0.60, 2.2)
+        self.cooldown = max(4, int(round(max(float(fps), 1.0) * 0.15)))
+        self.intensity = intensity
+        self._last_emit = {0: -10 ** 9, 1: -10 ** 9}
+
+    def reset(self):
+        self.puffs.clear()
+        self._last_emit = {0: -10 ** 9, 1: -10 ** 9}
+
+    def maybe_emit(self, f, frame_players, scale=1.0):
+        if not frame_players:
+            return
+        for slot in (0, 1):
+            p = frame_players.get(slot)
+            if not p:
+                continue
+            sn = float(p.get("foot_snorm", 0.0))
+            is_stop = bool(p.get("hard_stop", False))
+            if (sn < 0.82 and not is_stop) or (f - self._last_emit[slot]) < self.cooldown:
+                continue
+            self._last_emit[slot] = f
+            fx, fy = p["foot_xy"][0] * scale, p["foot_xy"][1] * scale
+            vxf = float(p.get("vx_foot", 0.0))
+            dir_sign = -1.0 if vxf >= 0 else 1.0
+            n_puffs = max(4, int(round((5 + 3 * min(1.0, sn)) * self.intensity)))
+            for _ in range(n_puffs):
+                vx_p = (dir_sign * np.random.uniform(1.0, 3.4) + np.random.uniform(-0.7, 0.7)) * self.ui_scale
+                vy_p = np.random.uniform(-1.35, -0.25) * self.ui_scale
+                life = np.random.randint(9, 17)
+                self.puffs.append({
+                    "x": fx + np.random.uniform(-8.0, 8.0) * self.ui_scale,
+                    "y": fy + np.random.uniform(-3.0, 2.0) * self.ui_scale,
+                    "vx": vx_p, "vy": vy_p,
+                    "r": np.random.uniform(2.2, 4.8) * self.ui_scale,
+                    "life": life, "maxlife": life,
+                })
+
+    def update_and_draw(self, frame):
+        if not self.puffs:
+            return
+        alive = []
+        h, w = frame.shape[:2]
+        for pf in self.puffs:
+            pf["x"] += pf["vx"]
+            pf["y"] += pf["vy"]
+            pf["vx"] *= 0.90
+            pf["vy"] = pf["vy"] * 0.92 + 0.04 * self.ui_scale
+            pf["r"] += 0.18 * self.ui_scale
+            pf["life"] -= 1
+            if pf["life"] <= 0:
+                continue
+            a = (pf["life"] / float(pf["maxlife"])) ** 1.25
+            alpha = _clamp(0.30 * a * self.intensity, 0.03, 0.40)
+            cx, cy = int(round(pf["x"])), int(round(pf["y"]))
+            rx = max(2, int(round(pf["r"] * 1.25)))
+            ry = max(1, int(round(pf["r"] * 0.72)))
+            x0, x1 = max(0, cx - rx - 2), min(w, cx + rx + 3)
+            y0, y1 = max(0, cy - ry - 2), min(h, cy + ry + 3)
+            if x0 < x1 and y0 < y1:
+                roi = frame[y0:y1, x0:x1]
+                ov = roi.copy()
+                cv2.ellipse(ov, (cx - x0, cy - y0), (rx, ry), 0.0, 0.0, 360.0,
+                            (222, 228, 235), -1, cv2.LINE_AA)
+                cv2.addWeighted(ov, alpha, roi, 1.0 - alpha, 0, roi)
+            alive.append(pf)
+        self.puffs = alive
 
 
 # 残影 (球拖尾) 整体浓淡/粗细系数
@@ -4251,66 +5390,6 @@ class SpeedTrailRenderer:
                         continue
                     cv2.circle(glow, (lcx, lcy), rr, glow_col, -1, cv2.LINE_AA)
                 cv2.addWeighted(glow, 0.28, frame[gy0:gy1, gx0:gx1], 0.72, 0, frame[gy0:gy1, gx0:gx1])
-        # 残影末端的实心白点 (球头标记), 已注释掉: 低速/残影淡出时会在原地闪一个白点
-        # cv2.circle(frame, (cx, cy), 2, (255, 255, 255), -1, cv2.LINE_AA)
-
-
-class PlayerFX:
-    """选手移动特效: 仅脚下光环 (随移动速度变化), 仅在局部 ROI 混合。"""
-    def __init__(self, fps, frame_w, frame_h, intensity=1.0):
-        self.fps = fps
-        self.diag = math.hypot(frame_w, frame_h)
-        self.intensity = intensity
-        # 按帧率归一化单帧位移阈值, 保证 30fps / 60fps / 120fps 光环响应一致
-        self.fast_thresh = self.diag * 0.012 * (30.0 / max(float(fps), 1.0))
-        self.aura_phase = 0.0
-
-    def draw(self, frame, boxes_prev, boxes_cur):
-        if not boxes_cur:
-            return
-        h, w = frame.shape[:2]
-        self.aura_phase += 0.35
-
-        def speed_of(box):
-            if not boxes_prev:
-                return 0.0
-            cx = (box[0] + box[2]) * 0.5
-            cy = (box[1] + box[3]) * 0.5
-            best, bp = 1e18, None
-            for pb in boxes_prev:
-                pcx = (pb[0] + pb[2]) * 0.5
-                pcy = (pb[1] + pb[3]) * 0.5
-                d = math.hypot(cx - pcx, cy - pcy)
-                if d < best:
-                    best, bp = d, (pcx, pcy)
-            if bp is None or best > self.diag * 0.15:
-                return 0.0
-            return best
-
-        for box in boxes_cur:
-            x1, y1, x2, y2 = [int(v) for v in box]
-            cx = (x1 + x2) // 2
-            snorm = _clamp(speed_of(box) / (self.fast_thresh + 1e-6), 0.0, 1.0)
-            foot_y = y2
-            ring_r = int((x2 - x1) * (0.35 + 0.15 * snorm) * 0.5)
-            if ring_r <= 3:
-                continue
-            pulse = 0.6 + 0.4 * math.sin(self.aura_phase)
-            ring_col = speed_to_color(snorm)
-            ring_h = max(3, ring_r // 3)
-            # ★ 仅在光环外接矩形 ROI 上混合 (避免整帧 copy)
-            ry0 = max(0, foot_y - ring_h - 2)
-            ry1 = min(h, foot_y + ring_h + 3)
-            rx0 = max(0, cx - ring_r - 2)
-            rx1 = min(w, cx + ring_r + 3)
-            if ry0 >= ry1 or rx0 >= rx1:
-                continue
-            roi = frame[ry0:ry1, rx0:rx1]
-            ov = roi.copy()
-            cv2.ellipse(ov, (cx - rx0, foot_y - ry0), (ring_r, ring_h),
-                        0, 0, 360, ring_col, 2, cv2.LINE_AA)
-            blend = 0.35 * (0.5 + 0.5 * pulse) * self.intensity
-            cv2.addWeighted(ov, blend, roi, 1 - blend, 0, roi)
 
 
 _TRAIL_POLISH_KERNEL = np.array([0.15, 0.70, 0.15], dtype=np.float64)
@@ -4336,7 +5415,7 @@ def smooth_trail(points):
 
 
 def render(args, segments, rally_starts_by_seg, filled_track, events, table_geo,
-           in_w, in_h, fps, total_frames, ball_speed_table, player_boxes,
+           in_w, in_h, fps, total_frames, ball_speed_table, pr_data=None,
            prepend_segments=None, prepend_rally_starts_by_seg=None,
            black_gap_sec=1.0, cut_frames=None):
     out_h = args.output_height or in_h
@@ -4348,18 +5427,24 @@ def render(args, segments, rally_starts_by_seg, filled_track, events, table_geo,
     scale = out_w / in_w
 
     fx_level = args.fx_level
-    fx_intensity = {"minimal": 0.7, "max": 1.4}.get(fx_level, 1.0)
-    enable_extra_fx = (fx_level != "minimal")
-    enable_player_fx = (not args.no_player_fx) and bool(player_boxes) and enable_extra_fx
+    fx_intensity = {"minimal": 0.72, "max": 1.35}.get(fx_level, 1.0)
+    prepend_fx_set = parse_fx_set(getattr(args, "prepend_fx", "all"), default_mode="all")
+    main_fx_set = parse_fx_set(getattr(args, "main_fx", "legacy"), default_mode="legacy")
+
+    players_by_frame = (pr_data or {}).get("players_by_frame") or {}
+    racket_trails = (pr_data or {}).get("racket_trails") or {0: {}, 1: {}}
+
+    events_sorted = sorted(events, key=lambda e: e["frame"])
+    ev_frames_sorted = [e["frame"] for e in events_sorted]
 
     ev_by_frame = defaultdict(list)
     landing_all = []
-    for ev in events:
+    for ev in events_sorted:
         ev_by_frame[ev["frame"]].append(ev)
         if ev["type"] == "bounce":
             landing_all.append(ev)
 
-    kmh_vals = [ev["speed_kmh"] for ev in events if ev.get("speed_kmh")]
+    kmh_vals = [ev["speed_kmh"] for ev in events_sorted if ev.get("speed_kmh")]
     kmh_p95 = 1.0
     if kmh_vals:
         kmh_vals_sorted = sorted(kmh_vals)
@@ -4376,9 +5461,14 @@ def render(args, segments, rally_starts_by_seg, filled_track, events, table_geo,
     scaled_ev_by_frame = defaultdict(list)
     for f, evs in ev_by_frame.items():
         for ev in evs:
+            dx = ev.get("dir_x")
+            dy = ev.get("dir_y")
             scaled_ev_by_frame[f].append({
                 "x": ev["x"] * scale, "y": ev["y"] * scale, "type": ev["type"],
-                "snorm": event_speed_norm(ev), "kmh": ev.get("speed_kmh")})
+                "snorm": event_speed_norm(ev), "kmh": ev.get("speed_kmh"),
+                "dir_vec": (dx, dy) if (dx is not None and dy is not None) else None,
+                "racket_snorm": float(ev.get("racket_snorm") or 0.0),
+            })
 
     landing_by_seg, landing_rally_id = build_landing_rally_index(
         segments, rally_starts_by_seg, landing_all,
@@ -4417,11 +5507,14 @@ def render(args, segments, rally_starts_by_seg, filled_track, events, table_geo,
         if not cap.isOpened():
             raise RuntimeError(f"无法打开视频: {args.video}")
         mini = MiniTable(out_w, out_h)
+        rally_badge = RallyCounterBadge(out_w, out_h, fps)
         particles = ParticleSystem(intensity=fx_intensity)
-        labels = FloatingLabel()
-        flash = SpeedFlash()
+        hit_impacts = HitImpactRenderer(out_w, out_h, intensity=fx_intensity)
+        racket_arc = RacketArcRenderer(
+            fps, out_w, out_h, events_sorted, racket_trails,
+            scale=scale, intensity=fx_intensity)
+        foot_dust = FootDustSystem(fps, out_w, out_h, intensity=fx_intensity)
         trail_renderer = SpeedTrailRenderer(intensity=fx_intensity)
-        player_fx = PlayerFX(fps, out_w, out_h, intensity=fx_intensity) if enable_player_fx else None
         # 残影 (球拖尾) 时长: --trail-sec (默认 0.3s); <=0 关闭残影; 下限 4 帧保证可平滑/绘制
         trail_sec = float(getattr(args, "trail_sec", 0.3))
         TRAIL_LEN = 0 if trail_sec <= 0 else max(4, int(round(fps * trail_sec)))
@@ -4444,28 +5537,34 @@ def render(args, segments, rally_starts_by_seg, filled_track, events, table_geo,
                 return
             alpha = 1.0
             if fidx < fade_frames:
-                # ① 开头淡入
                 alpha = fidx / fade_frames
             elif prepend_segments and prepend_frame_count - fade_frames <= fidx < prepend_frame_count:
-                # ② 前置→黑幕 淡出
                 alpha = (prepend_frame_count - fidx) / fade_frames
             elif prepend_segments and main_start <= fidx < main_start + fade_frames:
-                # ③ 黑幕→主视频 淡入
                 alpha = (fidx - main_start) / fade_frames
             elif fidx >= total_render - fade_frames:
-                # ④ 末尾淡出
                 alpha = (total_render - fidx) / fade_frames
             if alpha < 1.0:
                 cv2.addWeighted(frame, alpha, black_img, 1.0 - alpha, 0, dst=frame)
 
+        def _fmt_fx_set(fset):
+            ordered = [k for k in ALL_FX_KEYS if k in fset]
+            return ",".join(ordered) if ordered else "none"
+
         pipe_method = "ffmpeg pipe 直编" if use_pipe else "cv2.VideoWriter"
         log(f"🎬 渲染: {len(segments)} 个片段, 约 {total_render} 帧 @ {out_w}x{out_h} "
-            f"{fps:.2f}fps [{pipe_method} → {enc}]  fx={fx_level}"
-            f"{' +选手光环' if enable_player_fx else ''}")
+            f"{fps:.2f}fps [{pipe_method} → {enc}]  fx={fx_level}")
+        if prepend_segments:
+            log(f"✨ 特效组合: 精彩集锦=[{_fmt_fx_set(prepend_fx_set)}] | "
+                f"全局剪辑=[{_fmt_fx_set(main_fx_set)}]")
+        else:
+            log(f"✨ 特效组合: 全局剪辑=[{_fmt_fx_set(main_fx_set)}]")
+
         written = 0
         t_start = time.time()
         last_progress_time = t_start
         do_resize = (scale != 1.0)
+        badge_linger_frames = max(15, int(round(fps * 1.4)))
 
         def _write_frame_and_progress(frm):
             nonlocal use_pipe, writer, written, last_progress_time
@@ -4503,22 +5602,53 @@ def render(args, segments, rally_starts_by_seg, filled_track, events, table_geo,
                 sys.stdout.flush()
                 last_progress_time = now
 
-        def _render_segment_batch(seg_list, seg_landings_map, seg_rally_id_map):
+        def _build_seg_shot_groups(s_f, e_f, r_starts):
+            bounds = sorted(r_starts) if r_starts else [s_f]
+            groups = []
+            for bi, lo in enumerate(bounds):
+                hi = bounds[bi + 1] if (bi + 1 < len(bounds)) else (e_f + 1)
+                sh_list = build_rally_shots_in_window(events_sorted, ev_frames_sorted, lo, hi, fps)
+                groups.append((lo, hi, sh_list))
+            return groups
+
+        def _render_segment_batch(seg_list, seg_landings_map, seg_rally_id_map,
+                                  seg_rally_starts_map, fx_set):
+            use_trail = ("trail" in fx_set) and (TRAIL_LEN > 0)
+            use_dust = ("dust" in fx_set)
+            use_hit_impact = ("hit_impact" in fx_set)
+            use_racket_arc = ("racket_arc" in fx_set)
+            use_foot_dust = ("foot_dust" in fx_set)
+            use_mini_table = ("mini_table" in fx_set)
+            use_mini_radar = ("mini_radar" in fx_set)
+            use_rally_counter = ("rally_counter" in fx_set)
+
             for idx_seg, (s_f, e_f) in enumerate(seg_list):
                 cap.set(cv2.CAP_PROP_POS_FRAMES, s_f)
-                trail = deque(maxlen=TRAIL_LEN)
+                trail = deque(maxlen=TRAIL_LEN) if use_trail else deque()
                 last_trail_f = None
-                # 切换剪辑片段时清空上一段残留的粒子/文字/闪屏, 防止跨镜头特效串场
+                # 切换剪辑片段时清空上一段残留状态, 防止跨镜头特效串场
                 particles.particles.clear()
-                labels.labels.clear()
-                flash._t = 0
-                flash._max = 0
+                hit_impacts.impacts.clear()
+                foot_dust.reset()
+                mini.reset_breadcrumbs()
+                rally_badge.reset()
+
                 cur_landings_sorted = sorted(seg_landings_map.get(idx_seg, []),
                                              key=lambda lp: lp["frame"])
                 lp_idx = 0
                 cur_lp_so_far = []
                 cur_rally_id = None
-                prev_player_boxes = None
+
+                r_starts_seg = sorted((seg_rally_starts_map or {}).get(idx_seg, []))
+                r_start_set = set(r_starts_seg)
+                shot_groups = (_build_seg_shot_groups(s_f, e_f, r_starts_seg)
+                               if use_rally_counter else [])
+                sg_idx = 0
+                sg_shot_idx = 0
+                cur_shot_count = 0
+                cur_peak_kmh = 0.0
+                last_shot_frame = -10 ** 9
+
                 for f in range(s_f, e_f + 1):
                     ret, frame = cap.read()
                     if not ret:
@@ -4526,61 +5656,79 @@ def render(args, segments, rally_starts_by_seg, filled_track, events, table_geo,
                     if do_resize:
                         frame = cv2.resize(frame, (out_w, out_h), interpolation=cv2.INTER_LINEAR)
 
-                    # 片段内部跨越导播切镜点时, 立即清空上一视角残留的拖尾/选手框/粒子/飘字
+                    # 片段内部跨越导播切镜点时, 立即清空依赖旧视角的空间状态缓存
                     if cut_frames and f in cut_frames and f > s_f:
                         trail.clear()
                         last_trail_f = None
-                        prev_player_boxes = None
                         particles.particles.clear()
-                        labels.labels.clear()
+                        hit_impacts.impacts.clear()
+                        foot_dust.reset()
+                        mini.reset_breadcrumbs()
 
-                    for sev in scaled_ev_by_frame.get(f, []):
-                        snorm = sev["snorm"]
-                        is_bounce = (sev["type"] == "bounce")
-                        particles.emit(sev["x"], sev["y"], n=22 if is_bounce else 16,
-                                       kind=sev["type"], speed_norm=snorm)
-                        if enable_extra_fx and not is_bounce and snorm >= 0.6:
-                            if snorm >= 0.85:
-                                txt, col = "SMASH!", (60, 80, 255)
-                                flash.trigger(int(7 * fx_intensity))
+                    # 新回合起点边界重置小地图面包屑与落点组
+                    if f in r_start_set and f > s_f:
+                        mini.reset_breadcrumbs()
+
+                    frame_players = players_by_frame.get(f)
+
+                    # 1) 地面层: 急停救球脚底擦地微尘
+                    if use_foot_dust:
+                        foot_dust.maybe_emit(f, frame_players, scale=scale)
+                        foot_dust.update_and_draw(frame)
+
+                    # 2) 挥拍动作层: 球拍破风刀光弧线
+                    if use_racket_arc:
+                        racket_arc.draw(frame, f)
+
+                    # 3) 乒乓球彗星残影层
+                    if use_trail:
+                        if f in scaled_track:
+                            pt = scaled_track[f]
+                            if last_trail_f is not None and (
+                                (f - last_trail_f) > 1
+                                or (trail and math.hypot(pt[0] - trail[-1][0],
+                                                         pt[1] - trail[-1][1]) > max_trail_step)
+                            ):
+                                trail.clear()
+                            trail.append(pt)
+                            last_trail_f = f
+                        elif trail:
+                            trail.popleft()
+                            if not trail:
+                                last_trail_f = None
+                        if len(trail) >= 2:
+                            st = ball_speed_table.get(f)
+                            snorm = st["norm"] if st else 0.3
+                            trail_renderer.draw(frame, smooth_trail(list(trail)), speed_norm=snorm)
+
+                    # 4) 触球与落台接触反馈层: 灰尘粒子 + 定向爆尘与重板瞬光
+                    if use_dust or use_hit_impact:
+                        for sev in scaled_ev_by_frame.get(f, []):
+                            snorm = sev["snorm"]
+                            if sev["type"] == "bounce":
+                                if use_dust:
+                                    particles.emit(sev["x"], sev["y"], n=22,
+                                                   kind="bounce", speed_norm=snorm)
                             else:
-                                txt, col = "FAST!", (60, 200, 255)
-                            labels.emit(sev["x"], sev["y"] - 20, txt,
-                                        color=col, scale=1.0 + snorm * 0.5)
+                                if use_hit_impact:
+                                    dvec = sev["dir_vec"]
+                                    particles.emit(
+                                        sev["x"], sev["y"], n=22,
+                                        kind="hit_directional" if dvec else "hit",
+                                        speed_norm=snorm, dir_vec=dvec,
+                                        racket_snorm=sev["racket_snorm"])
+                                    hit_impacts.emit(
+                                        sev["x"], sev["y"], speed_norm=snorm,
+                                        racket_snorm=sev["racket_snorm"],
+                                        dir_vec=dvec or (1.0, 0.0))
+                                elif use_dust:
+                                    particles.emit(sev["x"], sev["y"], n=16,
+                                                   kind="hit", speed_norm=snorm)
+                        particles.update_and_draw(frame)
+                        if use_hit_impact:
+                            hit_impacts.update_and_draw(frame)
 
-                    if player_fx is not None:
-                        cur_boxes = player_boxes.get(f, [])
-                        cur_boxes_scaled = [(b[0] * scale, b[1] * scale, b[2] * scale, b[3] * scale)
-                                            for b in cur_boxes]
-                        player_fx.draw(frame, prev_player_boxes, cur_boxes_scaled)
-                        prev_player_boxes = cur_boxes_scaled
-
-                    if f in scaled_track:
-                        pt = scaled_track[f]
-                        # 跨越未补帧缺口或极端跳变时立即清空旧残影, 防止旧尾点与新位置跨屏连成折线/直线
-                        if last_trail_f is not None and (
-                            (f - last_trail_f) > 1
-                            or (trail and math.hypot(pt[0] - trail[-1][0],
-                                                     pt[1] - trail[-1][1]) > max_trail_step)
-                        ):
-                            trail.clear()
-                        trail.append(pt)
-                        last_trail_f = f
-                    elif trail:
-                        # 彻底排空到 0 (修复旧版 len>1 留 1 个幽灵点导致跨缺口拉直线的问题)
-                        trail.popleft()
-                        if not trail:
-                            last_trail_f = None
-
-                    if len(trail) >= 2:
-                        st = ball_speed_table.get(f)
-                        snorm = st["norm"] if st else 0.3
-                        trail_renderer.draw(frame, smooth_trail(list(trail)), speed_norm=snorm)
-
-                    particles.update_and_draw(frame)
-                    labels.update_and_draw(frame)
-                    flash.update_and_draw(frame)
-
+                    # 5) 右上角战术 HUD 层: 迷你球台 / 球员站位雷达 / 回合连击与峰值球速
                     while lp_idx < len(cur_landings_sorted) and cur_landings_sorted[lp_idx]["frame"] <= f:
                         lp = cur_landings_sorted[lp_idx]
                         rid = seg_rally_id_map.get((idx_seg, lp["frame"]))
@@ -4589,18 +5737,50 @@ def render(args, segments, rally_starts_by_seg, filled_track, events, table_geo,
                         cur_rally_id = rid
                         cur_lp_so_far.append(lp)
                         lp_idx += 1
-                    mini.draw(frame, cur_lp_so_far)
+
+                    hud_bottom_y = None
+                    if use_mini_table or use_mini_radar:
+                        hud_bottom_y = mini.draw(
+                            frame, cur_lp_so_far,
+                            show_landings=use_mini_table,
+                            show_radar=use_mini_radar,
+                            frame_players=frame_players)
+
+                    if use_rally_counter and shot_groups:
+                        while sg_idx + 1 < len(shot_groups) and f >= shot_groups[sg_idx + 1][0]:
+                            sg_idx += 1
+                            sg_shot_idx = 0
+                            cur_shot_count = 0
+                            cur_peak_kmh = 0.0
+                            rally_badge.reset()
+                        _glo, _ghi, sh_list = shot_groups[sg_idx]
+                        while sg_shot_idx < len(sh_list) and sh_list[sg_shot_idx][0] <= f:
+                            cur_shot_count += 1
+                            if sh_list[sg_shot_idx][1] > cur_peak_kmh:
+                                cur_peak_kmh = sh_list[sg_shot_idx][1]
+                            last_shot_frame = sh_list[sg_shot_idx][0]
+                            sg_shot_idx += 1
+                        st_cur = ball_speed_table.get(f)
+                        if st_cur and st_cur.get("kmh") and cur_shot_count >= 1:
+                            if (f - last_shot_frame) <= badge_linger_frames:
+                                cur_peak_kmh = max(cur_peak_kmh, float(st_cur["kmh"]))
+                        if cur_shot_count >= 2 and (f - last_shot_frame) <= badge_linger_frames:
+                            rally_badge.draw(frame, cur_shot_count, peak_kmh=cur_peak_kmh,
+                                             anchor_y=hud_bottom_y)
+
                     _apply_fade(frame, written)
                     _write_frame_and_progress(frame)
 
-        # — 前置精彩回合 (球速最快) —
+        # — 前置精彩回合 (黑幕前: 使用 prepend_fx_set, 默认全特效) —
         if prepend_segments:
             prepend_landing_by_seg, prepend_landing_rally_id = build_landing_rally_index(
                 prepend_segments, prepend_rally_starts_by_seg or {},
                 landing_all, debug=False, cut_frames=cut_frames)
             log(f"🎬 渲染前置精彩回合: {len(prepend_segments)} 段")
             _render_segment_batch(prepend_segments, prepend_landing_by_seg,
-                                  prepend_landing_rally_id)
+                                  prepend_landing_rally_id,
+                                  prepend_rally_starts_by_seg or {},
+                                  prepend_fx_set)
             # 黑幕间隔
             for _ in range(black_frame_count):
                 _write_frame_and_progress(black_img)
@@ -4609,7 +5789,9 @@ def render(args, segments, rally_starts_by_seg, filled_track, events, table_geo,
             log(f"⏯️  前置 {len(prepend_segments)} 段 + 黑幕 {black_gap_sec}s 完成, "
                 f"进入全顺序视频")
 
-        _render_segment_batch(segments, landing_by_seg, landing_rally_id)
+        # — 全局主剪辑 (黑幕后: 使用 main_fx_set, 默认仅保留经典三件套) —
+        _render_segment_batch(segments, landing_by_seg, landing_rally_id,
+                              rally_starts_by_seg or {}, main_fx_set)
         sys.stdout.write("\n")
         sys.stdout.flush()
         elapsed_total = time.time() - t_start
@@ -4755,7 +5937,7 @@ def main():
     if out_parent:
         os.makedirs(out_parent, exist_ok=True)
     log("=" * 60)
-    log("🏓 PingPong Highlight Generator (v4.18 物理抛物线净化 | 多机位切镜自适应)")
+    log("🏓 PingPong Highlight Generator (v4.20 球拍/主球员实战特效 | 集锦/正片特效独立勾选)")
     log("=" * 60)
     cap = cv2.VideoCapture(args.video)
     if not cap.isOpened():
@@ -4776,7 +5958,7 @@ def main():
     is_multi_cam = bool(cam_timeline.get("is_multi"))
 
     if not is_multi_cam:
-        # ==================== 原生单机位管线 (与既有版本 100% 一致) ====================
+        # ==================== 原生单机位管线 ====================
         log("📐 提取球台/球网几何 + 校验自愈 + 长边走廊 ...")
         table_geo = extract_table_geometry(
             frames, (in_h, in_w), debug=args.debug,
@@ -4786,15 +5968,16 @@ def main():
         net_center_x_hint = (_get_net_center_x(frames)
                              if (table_geo is None or table_geo.get("net_line") is None) else None)
 
-        if not args.no_player_fx:
-            player_boxes, _pc = gather_player_boxes(frames, debug=args.debug)
-        else:
-            player_boxes = {}
-
-        log("⚪ 提取主球轨迹 (走廊软过滤 + 多球过滤 + 重力抛物线净化) ...")
+        raw_players, raw_rackets = gather_player_and_racket_raw(frames)
+        log("⚪ 提取主球轨迹 + 对阵主球员/球拍运动状态 ...")
         ball_cands = gather_ball_candidates(frames, fps, conf_min=args.ball_conf)
         # 及时释放全量帧检测字典, 降低长视频渲染阶段常驻内存占用
         del frames
+
+        pr_data = build_player_and_racket_tracks(
+            raw_players, raw_rackets, fps, in_w, in_h,
+            table_geo=table_geo, cam_timeline=None, debug=args.debug)
+        del raw_players, raw_rackets
 
         ball_cands = filter_static_ball_candidates(
             ball_cands, fps, in_w, in_h,
@@ -4826,9 +6009,11 @@ def main():
         if args.debug:
             log(f"   球速基准: p50={p50:.0f}px/s  p95={p95:.0f}px/s  (共 {len(ball_speed_table)} 帧速度)")
 
-        log("🎾 检测回合与落点/击球事件 ...")
-        events, hl_bounce_halves = detect_bounce_events(filled, table_geo, fps,
-                                                        table_edge_tol=args.table_edge_tol)
+        log("🎾 检测回合与落点/击球事件 (融合球拍触球修正) ...")
+        events, hl_bounce_halves = detect_bounce_events(
+            filled, table_geo, fps, table_edge_tol=args.table_edge_tol,
+            racket_by_frame=pr_data["racket_by_frame"],
+            players_by_frame=pr_data["players_by_frame"])
         rallies = detect_rallies(filled, fps, total_frames, args.raw_detections,
                                  table_geo=table_geo, bounce_halves=hl_bounce_halves,
                                  net_center_x_hint=net_center_x_hint,
@@ -4842,17 +6027,20 @@ def main():
         # ==================== 多机位分段几何管线 (导播切视角视频) ====================
         table_geo = cam_timeline.get("primary_geo")
         net_center_x_hint = _get_net_center_x(frames)
-        if not args.no_player_fx:
-            player_boxes, _pc = gather_player_boxes(frames, debug=args.debug)
-        else:
-            player_boxes = {}
+        raw_players, raw_rackets = gather_player_and_racket_raw(frames)
 
-        log("⚪ 按镜头(Shot)提取多视角主球轨迹 + 重力抛物线净化 + 弹道补帧 ...")
+        log("⚪ 按镜头(Shot)提取多视角主球轨迹 + 对阵主球员/球拍追踪 + 弹道补帧 ...")
         ball_cands = gather_ball_candidates(frames, fps, conf_min=args.ball_conf)
         del frames
 
+        pr_data = build_player_and_racket_tracks(
+            raw_players, raw_rackets, fps, in_w, in_h,
+            table_geo=table_geo, cam_timeline=cam_timeline, debug=args.debug)
+        del raw_players, raw_rackets
+
         main_track, filled, ball_speed_table, (p50, p95), events, hl_bounce_halves = (
-            run_multi_camera_track_and_events(cam_timeline, ball_cands, fps, in_w, in_h, args))
+            run_multi_camera_track_and_events(
+                cam_timeline, ball_cands, fps, in_w, in_h, args, pr_data=pr_data))
         log(f"   多机位主轨迹净化后点数: {len(main_track)}, 补帧后点数: {len(filled)}")
         if args.debug:
             log(f"   归一化球速基准: p50={p50:.0f}px/s  p95={p95:.0f}px/s  (共 {len(ball_speed_table)} 帧速度)")
@@ -4897,7 +6085,7 @@ def main():
         for si, (s, e) in enumerate(segments):
             log(f"    片段{si}: [{s}-{e}]  内含回合起始帧={rally_starts_by_seg.get(si)}")
 
-    # 选取球速最快的精彩回合作为前置
+    # 综合球速 + 跑动 + 挥拍 + 相持板数选取精彩回合作为前置
     if args.no_highlight_prepend or not args.cut:
         top_segs, top_rally_starts = [], {}
         if not args.cut:
@@ -4910,10 +6098,11 @@ def main():
             top_n=args.highlight_top_n, min_duration=args.highlight_min_duration,
             pre_buffer=args.pre_buffer, post_buffer=args.post_buffer,
             bounce_halves=hl_bounce_halves,
-            min_bounce_count=args.highlight_min_bounce_count)
+            min_bounce_count=args.highlight_min_bounce_count,
+            pr_data=pr_data, events=events)
 
     render(args, segments, rally_starts_by_seg, filled, events, table_geo,
-           in_w, in_h, fps, total_frames, ball_speed_table, player_boxes,
+           in_w, in_h, fps, total_frames, ball_speed_table, pr_data=pr_data,
            prepend_segments=top_segs or None,
            prepend_rally_starts_by_seg=top_rally_starts,
            black_gap_sec=args.highlight_black_gap,

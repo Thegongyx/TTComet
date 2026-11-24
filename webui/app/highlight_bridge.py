@@ -65,6 +65,8 @@ _PARAM_FLAGS = {
     # 特效
     "fx_level": "--fx-level",
     "trail_sec": "--trail-sec",
+    "prepend_fx": "--prepend-fx",
+    "main_fx": "--main-fx",
     "no_player_fx": "--no-player-fx",
 }
 

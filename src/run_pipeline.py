@@ -355,6 +355,14 @@ def _process_one_video(args, python_cmd, has_ffmpeg, video_index=None, video_tot
         hl_cmd += ["--rally-lost-timeout", str(args.rally_lost_timeout)]
     if args.table_edge_tol is not None:
         hl_cmd += ["--table-edge-tol", str(args.table_edge_tol)]
+    if args.fx_level is not None:
+        hl_cmd += ["--fx-level", args.fx_level]
+    if args.trail_sec is not None:
+        hl_cmd += ["--trail-sec", str(args.trail_sec)]
+    if args.prepend_fx is not None:
+        hl_cmd += ["--prepend-fx", args.prepend_fx]
+    if args.main_fx is not None:
+        hl_cmd += ["--main-fx", args.main_fx]
 
     # 其余未识别参数原样透传给高光脚本, 这样 pingpong_highlight.py 新增参数
     # 不用改本文件也能直接用（拼错参数会由高光脚本报错）
@@ -517,6 +525,14 @@ def main():
                         help="球连续丢失该秒数则以 ball_lost 结束回合 (默认 1.5)")
     parser.add_argument("--table-edge-tol", type=float, default=None,
                         help="球台四边等距带容差 px (默认 30, 排查用)")
+    parser.add_argument("--fx-level", choices=["minimal", "normal", "max"], default=None,
+                        help="特效强度 (默认 normal)")
+    parser.add_argument("--trail-sec", type=float, default=None,
+                        help="球残影停留时长秒数 (默认 0.3, <=0 关闭)")
+    parser.add_argument("--prepend-fx", default=None,
+                        help="黑幕前精彩集锦特效配置 (默认 all=全部特效; 可填 legacy/none 或逗号分隔列表)")
+    parser.add_argument("--main-fx", default=None,
+                        help="黑幕后全局剪辑特效配置 (默认 legacy=仅经典三件套; 可填 all/none 或逗号分隔列表)")
 
     # === 流水线控制 ===
     parser.add_argument("--work-dir", default=None,
