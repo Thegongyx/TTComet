@@ -130,24 +130,25 @@ webui\.venv\Scripts\python.exe webui\run_server.py
 
 ### 后处理：去水印 / 去人声（默认关闭）
 
-高光成片之后可以再走两步可选后处理，**默认都不启用**，在参数区「后处理」组里勾选才执行：
+两个可选项，**默认都不启用**，在参数区「后处理」组里勾选才执行：
 
 ```text
-推理 -> 高光剪辑 -> 去水印（默认方案 / 自动检测）-> 去人声（demucs-onnx / center / mute）-> 最终 mp4
+推理 -> 去水印（可选，在源视频上）-> 高光渲染 -> 去人声（可选，在成片上）-> 最终 mp4
 ```
 
-- **去水印**：复用 `src/remove_watermark.py`，界面上只提供两种方式：
+- **去水印**：复用 `src/remove_watermark.py`，在推理之后、渲染特效之前对源视频执行，
+  因此**不会把迷你球台 / 雷达 / 连击面板等 HUD 一起抹掉**。界面上只提供两种方式：
   - **默认方案**：处理右上角 + 底部的固定叠加区域（内置坐标，按 1920×1080 基准自动缩放），保留比分显示；
   - **自动检测水印位置**：先统计多帧再处理，适合位置不确定的素材。
   两种方式都使用 delogo 算法；需要自定义区域或改用 inpaint 时，请直接运行命令行脚本。
-- **去人声**：复用 `src/remove_narration.py`。WebUI 提供三种方式：
+- **去人声**：复用 `src/remove_narration.py`，在成片之后只处理音频，不影响画面特效。WebUI 提供三种方式：
   - `demucs-onnx`（默认推荐）：HT-Demucs 的 ONNX 版，`onnxruntime` 推理，**不需要 torch**；
     模型缓存在 `webui/models/demucs-onnx-cache/`（约 158 MB，随安装包一起分发，离线可用）。
   - `center`：立体声反相相减，秒出，但音场会变薄。
   - `mute`：直接静音。
 - 成片没有音轨、或参数里勾了「去掉原声」时，自动跳过去人声。
-- 中间结果先写成 `highlight.wm.tmp.mp4` / `highlight.narr.tmp.mp4`，全部成功后才替换
-  `highlight.mp4`；任一步失败会保留原高光成片，并把任务标为失败。
+- 去水印输出 `video_clean.mp4` 再交给渲染；去人声先写 `highlight.narr.tmp.mp4`，成功后替换成片。
+  任一步失败会把任务标为失败，并保留已生成的高光成片。
 - `demucs`（torch 版）不在 WebUI 里提供：打包版没有 torch，源码版 `.venv` 也没装。
   需要它时用命令行流水线 `--narration-method demucs`（`yolo26` 环境）。
 
@@ -157,6 +158,7 @@ webui\.venv\Scripts\python.exe webui\run_server.py
   所以 demucs-onnx 的 `auto` 固定走 CPU，并在分离后检查是否全静音（异常则回退 CPU）。
   本机实测 CPU 分离约 **2 倍实时**。
 - 自动检测只能找「一直亮且不随时间变化」的静态叠加，检不出半透明比分显示、滚动水印。
+- 去水印需要重编码整段源视频（不是只处理几分钟成片），46 分钟素材大约多花几分钟。
 
 ### 参数预设
 

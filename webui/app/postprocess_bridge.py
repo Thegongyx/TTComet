@@ -6,9 +6,12 @@
 `src/remove_watermark.py` / `src/remove_narration.py`，只负责构造 argv、
 把 stdout 转成 WebUI 日志、捕获 SystemExit。
 
-默认两个功能都不启用；用户在参数里勾选后，在高光成片之后依次执行：
+默认两个功能都不启用；用户在参数里勾选后：
 
-    高光成片 -> 去水印（delogo / inpaint）-> 去人声（demucs-onnx / center / mute）
+    推理 -> 去水印（可选，在源视频上执行）-> 高光渲染 -> 去人声（可选，在成片上执行）
+
+去水印必须放在渲染特效之前，否则会把迷你球台 / 雷达 / 连击面板等 HUD 一起抹掉。
+去人声只处理音频，放在成片之后，不影响画面。
 
 去人声的 `demucs`（torch 版）不在这里支持：打包版没有 torch，
 源码版的 .venv 也没有装；需要 torch demucs 时请用命令行流水线。
@@ -222,87 +225,91 @@ def has_audio_stream(video: str) -> bool:
         return True
 
 
-def run_postprocess(video: str, output: str, params: dict, log=None) -> dict:
-    """高光成片之后的可选后处理：去水印 -> 去人声。
+def run_watermark(video: str, output: str, params: dict, log=None) -> dict:
+    """在源视频上去水印（必须在渲染特效之前执行，避免把迷你球台等 HUD 一起抹掉）。
 
-    - 两步都关闭时直接返回 ok（调用方通常也会提前判断）
-    - 中间结果写临时文件，全部成功后才替换 output；
-      任一步失败时 output 保持原样（高光成片不会丢）
+    输出写到临时文件，成功后替换 output；失败时 output 保持原样。
     """
     log = log or (lambda _m: None)
-    do_wm = bool(params.get("remove_watermark"))
-    do_narr = bool(params.get("remove_narration"))
-    result = {"ok": True, "steps": [], "error": None, "duration_sec": 0.0}
-    if not do_wm and not do_narr:
+    result = {"ok": True, "error": None, "duration_sec": 0.0, "output": None}
+    if not params.get("remove_watermark"):
+        return result
+
+    output = os.path.abspath(output)
+    tmp = f"{output}.tmp.mp4"
+    t0 = time.perf_counter()
+    try:
+        mode = str(params.get("watermark_mode") or "default")
+        log(f"去水印（{mode}）: 在源视频上处理，不经过渲染特效")
+        argv = _watermark_argv(video, tmp, params)
+        log("去水印: " + " ".join(argv))
+        code, err = _run_script("remove_watermark.py", _ENV_WATERMARK, argv, log)
+        if code != 0 or not os.path.exists(tmp):
+            result.update(ok=False, error=err or f"去水印失败（返回码 {code}）")
+            log("❌ " + result["error"])
+            return result
+        os.replace(tmp, output)
+        result["output"] = output
+        log(f"✅ 去水印完成: {os.path.basename(output)} "
+            f"({os.path.getsize(output) / 1024 / 1024:.1f} MB)")
+        return result
+    finally:
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+        result["duration_sec"] = round(time.perf_counter() - t0, 1)
+        if result["ok"]:
+            log(f"去水印耗时 {result['duration_sec']}s")
+
+
+def run_narration(video: str, output: str, params: dict, log=None) -> dict:
+    """在成片上执行去人声（音频后处理，不影响画面特效）。"""
+    log = log or (lambda _m: None)
+    result = {"ok": True, "error": None, "duration_sec": 0.0, "output": None}
+    if not params.get("remove_narration"):
+        return result
+    if params.get("no_audio"):
+        log("ℹ️ 已选择“去掉原声”，跳过去人声")
+        return result
+    if not has_audio_stream(video):
+        log("ℹ️ 当前成片没有音轨，跳过去人声")
         return result
 
     # 打包后脚本在 _MEIPASS/安装目录里，未必可写；中间 wav 统一放系统临时目录
-    if do_narr:
-        import tempfile
-        os.environ.setdefault("PPH_NARRATION_TMP",
-                              os.path.join(tempfile.gettempdir(), "TTComet", "narration"))
-        if resolve_onnx_cache_dir():
-            # 模型随包分发，直接走本地缓存，避免每任务联网解析
-            os.environ.setdefault("HF_HUB_OFFLINE", "1")
+    import tempfile
+    os.environ.setdefault("PPH_NARRATION_TMP",
+                          os.path.join(tempfile.gettempdir(), "TTComet", "narration"))
+    onnx_cache = resolve_onnx_cache_dir()
+    if onnx_cache:
+        # 模型随包分发，直接走本地缓存，避免每任务联网解析
+        os.environ.setdefault("HF_HUB_OFFLINE", "1")
 
     output = os.path.abspath(output)
-    base, ext = os.path.splitext(output)
-    tmp_wm = f"{base}.wm.tmp{ext or '.mp4'}"
-    tmp_narr = f"{base}.narr.tmp{ext or '.mp4'}"
-    current = os.path.abspath(video) if video else output
-    onnx_cache = resolve_onnx_cache_dir()
+    tmp = f"{output}.narr.tmp.mp4"
     t0 = time.perf_counter()
-    total = int(do_wm) + int(do_narr)
-    step_no = 0
-
     try:
-        if do_wm:
-            step_no += 1
-            log(f"后处理 {step_no}/{total}: 去水印（{params.get('watermark_method') or 'delogo'}）")
-            argv = _watermark_argv(current, tmp_wm, params)
-            log("去水印: " + " ".join(argv))
-            code, err = _run_script("remove_watermark.py", _ENV_WATERMARK, argv, log)
-            if code != 0 or not os.path.exists(tmp_wm):
-                result.update(ok=False, error=err or f"去水印失败（返回码 {code}）")
-                log("❌ " + result["error"])
-                return result
-            current = tmp_wm
-            result["steps"].append("watermark")
-            log(f"✅ 去水印完成: {os.path.basename(current)} "
-                f"({os.path.getsize(current) / 1024 / 1024:.1f} MB)")
-
-        if do_narr:
-            if params.get("no_audio"):
-                log("ℹ️ 已选择“去掉原声”，跳过去人声")
-            elif not has_audio_stream(current):
-                log("ℹ️ 当前成片没有音轨，跳过去人声")
-            else:
-                step_no += 1
-                method = params.get("narration_method") or "demucs-onnx"
-                log(f"后处理 {step_no}/{total}: 去人声（{method}）")
-                argv = _narration_argv(current, tmp_narr, params, onnx_cache)
-                log("去人声: " + " ".join(argv))
-                code, err = _run_script("remove_narration.py", _ENV_NARRATION, argv, log)
-                if code != 0 or not os.path.exists(tmp_narr):
-                    result.update(ok=False, error=err or f"去人声失败（返回码 {code}）")
-                    log("❌ " + result["error"])
-                    return result
-                current = tmp_narr
-                result["steps"].append("narration")
-                log(f"✅ 去人声完成: {os.path.basename(current)} "
-                    f"({os.path.getsize(current) / 1024 / 1024:.1f} MB)")
-
-        if current != output:
-            os.replace(current, output)
+        method = params.get("narration_method") or "demucs-onnx"
+        log(f"去人声（{method}）")
+        argv = _narration_argv(video, tmp, params, onnx_cache)
+        log("去人声: " + " ".join(argv))
+        code, err = _run_script("remove_narration.py", _ENV_NARRATION, argv, log)
+        if code != 0 or not os.path.exists(tmp):
+            result.update(ok=False, error=err or f"去人声失败（返回码 {code}）")
+            log("❌ " + result["error"])
+            return result
+        os.replace(tmp, output)
         result["output"] = output
+        log(f"✅ 去人声完成: {os.path.basename(output)} "
+            f"({os.path.getsize(output) / 1024 / 1024:.1f} MB)")
         return result
     finally:
-        for p in (tmp_wm, tmp_narr):
-            if p != output and os.path.exists(p):
-                try:
-                    os.remove(p)
-                except OSError:
-                    pass
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
         result["duration_sec"] = round(time.perf_counter() - t0, 1)
         if result["ok"]:
-            log(f"后处理完成（{result['duration_sec']}s）")
+            log(f"去人声耗时 {result['duration_sec']}s")

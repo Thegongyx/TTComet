@@ -174,78 +174,50 @@ def _probe_has_audio(path):
         return True
 
 
-def _postprocess_output(args, python_cmd, output_abs, work_dir, step_offset, step_total, batch_tag=""):
-    """高光成片之后的可选后处理: 去水印 → 去人声。默认都不执行。"""
-    watermark = bool(getattr(args, "remove_watermark", False))
-    narration = bool(getattr(args, "remove_narration", False))
-    if not watermark and not narration:
+def _postprocess_narration(args, python_cmd, output_abs, work_dir, step_no,
+                           step_total, batch_tag=""):
+    """高光成片之后的去人声（音频后处理，不影响画面特效）。默认关闭。"""
+    if not getattr(args, "remove_narration", False):
+        return True
+    if getattr(args, "no_audio", False):
+        print("  ℹ️ --no-audio 已开启, 跳过去人声")
+        return True
+    if not _probe_has_audio(output_abs):
+        print("  ℹ️ 当前视频没有音频流, 跳过去人声")
         return True
 
-    current = output_abs
-    tmp_wm = os.path.join(work_dir, "post_watermark.mp4")
     tmp_narr = os.path.join(work_dir, "post_narration.mp4")
     try:
-        if watermark:
-            wm_cmd = python_cmd + [
-                str(WATERMARK_SCRIPT), "--video", current, "--output", tmp_wm,
-                "--preset", args.watermark_preset, "--method", args.watermark_method,
-            ]
-            for region in (getattr(args, "watermark_region", None) or []):
-                wm_cmd += ["--region", str(region)]
-            if getattr(args, "watermark_detect", False):
-                wm_cmd += ["--detect", "--detect-apply"]
-            if not run_step(wm_cmd, f"Step {step_offset}/{step_total}: 去水印 (remove_watermark.py)"):
-                return False
-            if not os.path.exists(tmp_wm):
-                print(f"  ❌ 去水印未生成输出: {tmp_wm}")
-                return False
-            current = tmp_wm
-            step_offset += 1
-
-        if narration:
-            if getattr(args, "no_audio", False):
-                print("  ℹ️ --no-audio 已开启, 跳过去人声")
-            elif not _probe_has_audio(current):
-                print("  ℹ️ 当前视频没有音频流, 跳过去人声")
-            else:
-                n_cmd = python_cmd + [
-                    str(NARRATION_SCRIPT), "--video", current, "--output", tmp_narr,
-                    "--method", args.narration_method,
-                    "--volume-gain", str(args.narration_volume_gain),
-                ]
-                if args.narration_method == "demucs":
-                    n_cmd += ["--model", args.narration_model,
-                              "--device", args.narration_device,
-                              "--residual", str(args.narration_residual)]
-                elif args.narration_method == "demucs-onnx":
-                    n_cmd += ["--model", args.narration_model,
-                              "--device", args.narration_device,
-                              "--onnx-precision", args.narration_onnx_precision,
-                              "--residual", str(args.narration_residual)]
-                    if args.narration_onnx_cache_dir:
-                        n_cmd += ["--onnx-cache-dir", args.narration_onnx_cache_dir]
-                if not run_step(n_cmd, f"Step {step_offset}/{step_total}: 去人声 (remove_narration.py)"):
-                    return False
-                if not os.path.exists(tmp_narr):
-                    print(f"  ❌ 去人声未生成输出: {tmp_narr}")
-                    return False
-                current = tmp_narr
-
-        if current != output_abs:
-            try:
-                os.replace(current, output_abs)
-            except Exception as e:
-                print(f"  ❌ 后处理替换成片失败: {e}")
-                return False
-        print(f"  ✅ 后处理完成{batch_tag}: {output_abs}")
+        n_cmd = python_cmd + [
+            str(NARRATION_SCRIPT), "--video", output_abs, "--output", tmp_narr,
+            "--method", args.narration_method,
+            "--volume-gain", str(args.narration_volume_gain),
+        ]
+        if args.narration_method == "demucs":
+            n_cmd += ["--model", args.narration_model,
+                      "--device", args.narration_device,
+                      "--residual", str(args.narration_residual)]
+        elif args.narration_method == "demucs-onnx":
+            n_cmd += ["--model", args.narration_model,
+                      "--device", args.narration_device,
+                      "--onnx-precision", args.narration_onnx_precision,
+                      "--residual", str(args.narration_residual)]
+            if args.narration_onnx_cache_dir:
+                n_cmd += ["--onnx-cache-dir", args.narration_onnx_cache_dir]
+        if not run_step(n_cmd, f"Step {step_no}/{step_total}: 去人声 (remove_narration.py)"):
+            return False
+        if not os.path.exists(tmp_narr):
+            print(f"  ❌ 去人声未生成输出: {tmp_narr}")
+            return False
+        os.replace(tmp_narr, output_abs)
+        print(f"  ✅ 去人声完成{batch_tag}: {output_abs}")
         return True
     finally:
-        for p in (tmp_wm, tmp_narr):
-            if p != output_abs and os.path.exists(p):
-                try:
-                    os.remove(p)
-                except Exception:
-                    pass
+        if os.path.exists(tmp_narr):
+            try:
+                os.remove(tmp_narr)
+            except Exception:
+                pass
 
 
 def _process_one_video(args, python_cmd, has_ffmpeg, video_index=None, video_total=None):
@@ -405,7 +377,7 @@ def _process_one_video(args, python_cmd, has_ffmpeg, video_index=None, video_tot
             return False
 
     # ================================================================
-    #  Step 2: 高光特效剪辑
+    #  Step 2: 可选去水印（必须在渲染特效之前）
     # ================================================================
     # 优先使用 CFR 转换后的视频 (时间戳与 JSONL 对齐), 不存在则用原始视频
     cfr_video = os.path.join(work_dir, "video_cfr.mp4")
@@ -415,6 +387,33 @@ def _process_one_video(args, python_cmd, has_ffmpeg, video_index=None, video_tot
     else:
         highlight_video = str(video_path)
 
+    step_no = 2
+    if getattr(args, "remove_watermark", False):
+        clean_video = os.path.join(work_dir, "video_clean.mp4")
+        wm_cmd = python_cmd + [
+            str(WATERMARK_SCRIPT), "--video", highlight_video,
+            "--output", clean_video,
+            "--preset", args.watermark_preset,
+            "--method", args.watermark_method,
+        ]
+        for region in (getattr(args, "watermark_region", None) or []):
+            wm_cmd += ["--region", str(region)]
+        if getattr(args, "watermark_detect", False):
+            wm_cmd += ["--detect", "--detect-apply"]
+        if not run_step(wm_cmd,
+                        f"Step {step_no}/{total_steps}: 去水印 (remove_watermark.py)",
+                        note="在源视频上去水印，之后才渲染特效（不会抹掉迷你球台等 HUD）"):
+            print(f"\n❌{batch_tag} 流水线终止, 中间文件保留在: {work_dir}")
+            return False
+        if not os.path.exists(clean_video):
+            print(f"\n❌{batch_tag} 去水印未生成输出: {clean_video}")
+            return False
+        highlight_video = clean_video
+        step_no += 1
+
+    # ================================================================
+    #  Step: 高光特效剪辑
+    # ================================================================
     hl_cmd = python_cmd + [str(HIGHLIGHT_SCRIPT),
                             "--video", highlight_video,
                             "--raw-detections", raw_detections,
@@ -476,27 +475,28 @@ def _process_one_video(args, python_cmd, has_ffmpeg, video_index=None, video_tot
         print(f"  ℹ️  透传给高光脚本: {' '.join(extra_hl_args)}")
         hl_cmd += extra_hl_args
 
-    if not run_step(hl_cmd, f"Step 2/{total_steps}: 高光特效剪辑 (pingpong_highlight.py)"):
+    if not run_step(hl_cmd, f"Step {step_no}/{total_steps}: 高光特效剪辑 (pingpong_highlight.py)"):
         print(f"\n❌{batch_tag} 流水线终止, 中间文件保留在: {work_dir}")
         return False
+    step_no += 1
 
     if not os.path.exists(output_abs):
         print(f"\n❌{batch_tag} 剪辑完成但未生成输出: {output_abs}")
         return False
 
     # ================================================================
-    #  Step 3+: 可选后处理 (去水印 → 去人声), 默认关闭
+    #  可选后处理: 去人声 (只处理音频), 默认关闭
     # ================================================================
-    if not _postprocess_output(args, python_cmd, output_abs, work_dir,
-                               3, total_steps, batch_tag):
-        print(f"\n❌{batch_tag} 后处理失败, 高光成片已保留: {output_abs}")
+    if not _postprocess_narration(args, python_cmd, output_abs, work_dir,
+                                  step_no, total_steps, batch_tag):
+        print(f"\n❌{batch_tag} 去人声失败, 高光成片已保留: {output_abs}")
         return False
 
     # ================================================================
     #  清理
     # ================================================================
     if args.clean and not args.skip_inference:
-        for fname in ["pingpong_detection.mp4", "video_cfr.mp4"]:
+        for fname in ["pingpong_detection.mp4", "video_cfr.mp4", "video_clean.mp4"]:
             fp = os.path.join(work_dir, fname)
             if os.path.exists(fp):
                 try:

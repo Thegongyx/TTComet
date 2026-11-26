@@ -28,7 +28,7 @@ from pathlib import Path
 import inference_job
 from highlight_bridge import run_highlight
 from onnx_engine import DetectorConfig, OnnxDetector
-from postprocess_bridge import run_postprocess
+from postprocess_bridge import run_narration, run_watermark
 
 VIDEO_EXTS = {".mp4", ".avi", ".mov", ".mkv", ".webm", ".flv",
               ".wmv", ".m4v", ".mpg", ".mpeg", ".ts", ".3gp"}
@@ -567,6 +567,30 @@ class JobManager:
             job.add_log("推理完成，开始高光剪辑")
 
             highlight_video = inf.get("cfr_video") or inf["video"]
+
+            # 去水印必须在渲染特效之前：否则会把迷你球台 / 雷达 / 连击面板一起抹掉
+            if job.params.get("remove_watermark"):
+                job.set_status("running", "watermark")
+                job.update_progress({"stage": "watermark", "percent": 100.0})
+                job.add_log("推理完成，先在源视频上去水印（不经过渲染特效）")
+                clean_video = os.path.join(item.out_dir, "video_clean.mp4")
+                wm = run_watermark(highlight_video, clean_video, job.params,
+                                   log=job.add_log)
+                item.result["watermark"] = {
+                    "ok": wm.get("ok"), "duration_sec": wm.get("duration_sec"),
+                    "error": wm.get("error"),
+                }
+                job.video_changed(item.index)
+                self._persist(job)
+                if not wm.get("ok"):
+                    item.status = "failed"
+                    item.error = "去水印失败: " + (wm.get("error") or "未知错误")
+                    job.add_log(f"❌ {item.name} {item.error}")
+                    job.video_changed(item.index)
+                    self._persist(job)
+                    continue
+                highlight_video = clean_video
+
             output = self._resolve_output_path(job, item)
             params = {k: v for k, v in job.params.items()
                       if k not in ("model", "output_dir", "conf_ball", "iou",
@@ -581,14 +605,14 @@ class JobManager:
             self._compress_jsonl(job, inf["jsonl"])
 
             if hl["ok"]:
-                # 可选后处理：去水印 -> 去人声（默认都关闭，用户勾选才执行）
-                if job.params.get("remove_watermark") or job.params.get("remove_narration"):
+                # 去人声只处理音频，放在成片之后，不影响画面特效
+                if job.params.get("remove_narration"):
                     job.set_status("running", "postprocess")
-                    job.update_progress({"stage": "postprocess"})
-                    job.add_log("高光完成，开始后处理")
-                    pp = run_postprocess(output, output, job.params, log=job.add_log)
+                    job.update_progress({"stage": "postprocess", "percent": 100.0})
+                    job.add_log("高光完成，开始去人声")
+                    pp = run_narration(output, output, job.params, log=job.add_log)
                     item.result["postprocess"] = {
-                        "ok": pp.get("ok"), "steps": pp.get("steps"),
+                        "ok": pp.get("ok"), "steps": ["narration"],
                         "duration_sec": pp.get("duration_sec"),
                         "error": pp.get("error"),
                     }
@@ -596,7 +620,7 @@ class JobManager:
                     self._persist(job)
                     if not pp.get("ok"):
                         item.status = "failed"
-                        item.error = "后处理失败: " + (pp.get("error") or "未知错误")
+                        item.error = "去人声失败: " + (pp.get("error") or "未知错误")
                         job.add_log(f"❌ {item.name} {item.error}（高光成片已保留）")
                         job.video_changed(item.index)
                         self._persist(job)

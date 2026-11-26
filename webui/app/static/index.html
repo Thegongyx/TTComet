@@ -1613,6 +1613,9 @@ function applyProgress(p) {
   else if (p.stage === 'highlight') {
     $('mStage').textContent = T('stage.highlight');
     $('barFill').style.width = '100%';
+  } else if (p.stage === 'watermark') {
+    $('mStage').textContent = T('stage.watermark');
+    $('barFill').style.width = '100%';
   } else if (p.stage === 'postprocess') {
     $('mStage').textContent = T('stage.postprocess');
     $('barFill').style.width = '100%';
@@ -1703,6 +1706,7 @@ function subscribe(jobId) {
     else if (msg.type === 'status') {
       const stageKey = msg.data.stage === 'highlight' ? 'stage.highlight'
         : msg.data.stage === 'inference' ? 'stage.inference'
+        : msg.data.stage === 'watermark' ? 'stage.watermark'
         : msg.data.stage === 'postprocess' ? 'stage.postprocess' : '';
       $('mStage').textContent = statusText(msg.data.status) + (stageKey ? ` · ${T(stageKey)}` : '');
     } else if (msg.type === 'videos') {

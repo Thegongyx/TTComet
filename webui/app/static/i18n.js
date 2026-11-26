@@ -77,6 +77,7 @@
 
       // stage / meta
       'stage.inference': '推理中',
+      'stage.watermark': '去水印中',
       'stage.highlight': '高光剪辑中',
       'stage.postprocess': '后处理中',
       'meta.video': '[{i}/{n}] {name}',
@@ -229,7 +230,7 @@
       'g.fx.title': '视觉效果',
       'g.fx.desc': '可分别为「黑幕前的精彩集锦」与「黑幕后的全局剪辑」独立勾选特效组合',
       'g.post.title': '后处理 · 去水印 / 去人声（默认关闭）',
-      'g.post.desc': '在高光成片之后执行，勾选才会启用。去水印会重编码视频；去人声默认只重编码音频，视频流直接复制',
+      'g.post.desc': '去水印在渲染特效前执行（不影响迷你球台等 HUD），去人声在成片后执行。勾选才会启用；去水印会重编码源视频，去人声只重编码音频',
       'g.adv.title': '高级 · 几何与调试',
       'g.adv.desc': '球台几何、走廊过滤、轨迹关联的精细调节。不确定时请保持默认',
 
@@ -344,7 +345,7 @@
 
       // ---- 后处理（去水印 / 去人声） ----
       'p.remove_watermark.label': '去除静态水印',
-      'p.remove_watermark.note': '只处理成片，默认关闭。默认方案处理右上角与底部的固定叠加区域；位置不确定时改用自动检测',
+      'p.remove_watermark.note': '在渲染特效前处理源视频，迷你球台 / 雷达等 HUD 不受影响；默认关闭。默认方案处理右上角与底部的固定叠加区域；位置不确定时改用自动检测',
       'p.watermark_mode.label': '处理方式',
       'p.watermark_mode.note': '默认方案：使用内置区域（按 1920×1080 基准自动缩放）；自动检测：先统计多帧再处理，适合位置不固定的素材，检不出半透明或滚动水印',
       'p.remove_narration.label': '去除人声',
@@ -453,6 +454,7 @@
       'history.toggleHide': 'Hide',
 
       'stage.inference': 'Detecting',
+      'stage.watermark': 'Removing watermark',
       'stage.highlight': 'Rendering highlight',
       'stage.postprocess': 'Post-processing',
       'meta.video': '[{i}/{n}] {name}',
@@ -596,7 +598,7 @@
       'g.fx.title': 'Visual effects',
       'g.fx.desc': 'Independently choose which effects appear in the intro highlight reel (before black gap) vs. main video (after black gap)',
       'g.post.title': 'Post-processing · watermark / vocals (off by default)',
-      'g.post.desc': 'Runs after the highlight is rendered. Watermark removal re-encodes video; vocal removal only re-encodes audio and copies the video stream',
+      'g.post.desc': 'Watermark removal runs on the source video before effects are rendered (the mini-table HUD is untouched); vocal removal runs after the highlight is rendered. Watermark removal re-encodes the source video; vocal removal only re-encodes audio',
       'g.adv.title': 'Advanced · geometry & debug',
       'g.adv.desc': 'Fine tuning for table geometry, corridor filtering and track association. Keep defaults unless needed.',
 
@@ -704,7 +706,7 @@
 
       // ---- post-processing (watermark / vocals) ----
       'p.remove_watermark.label': 'Remove static watermark',
-      'p.remove_watermark.note': 'Runs on the rendered highlight only, off by default. The default preset handles the fixed top-right and bottom overlays; use auto-detect when the position is unknown',
+      'p.remove_watermark.note': 'Runs on the source video before effects are rendered, so the mini-table HUD is untouched. Off by default. The default preset handles fixed top-right/bottom overlays; use auto-detect when the position is unknown',
       'p.watermark_mode.label': 'Method',
       'p.watermark_mode.note': 'Default: built-in regions (auto-scaled from a 1920×1080 reference); Auto-detect: analyses multiple frames first, suited to moving/unknown positions; cannot detect translucent or scrolling watermarks',
       'p.remove_narration.label': 'Remove vocals',

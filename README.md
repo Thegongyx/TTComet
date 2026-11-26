@@ -38,7 +38,7 @@
 ### 功能
 
 - **自动高光剪辑**：回合检测 + 切片，自带球轨迹彗尾、落点标记、迷你球台、球员光环
-- **成片后处理**：可选去水印（默认方案 / 自动检测）与去人声（AI 分离 / 声道相减 / 静音），默认关闭
+- **可选清理**：去水印（渲染特效前处理源视频，迷你球台等 HUD 不受影响）与去人声（成片后仅处理音频），默认关闭
 - **批量处理**：选文件夹，按文件名顺序跑完，模型只加载一次
 - **中英双语界面**：右上角切换
 - **两档精度**：高精度（准）/ 低精度（快约 2.8 倍），可随时切换
@@ -471,7 +471,7 @@ Data (jobs, presets, outputs) lives in `%LOCALAPPDATA%\TTComet\jobs\`.
 ### Features
 
 - **Automatic highlight editing**: rally detection + cutting, with ball trails, bounce markers, a mini table and player highlights
-- **Optional post-processing**: watermark removal (default preset / auto-detect) and vocal removal (AI separation / center-channel subtraction / mute), both off by default
+- **Optional cleanup**: watermark removal (on the source video before effects are rendered, so the mini-table HUD is untouched) and vocal removal (after rendering, audio only), both off by default
 - **Batch processing**: pick a folder, process videos in filename order, the model is loaded once
 - **Bilingual UI**: 中文 / English in the top-right corner
 - **Two quality levels**: high accuracy / low accuracy (~2.8× faster), switchable at runtime
