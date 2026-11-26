@@ -33,6 +33,8 @@ datas = [
     (os.path.join(APP, "static"), "webui/app/static"),
     (os.path.join(WEBUI, "models"), "webui/models"),
     (os.path.join(ROOT, "src", "pingpong_highlight.py"), "src"),
+    (os.path.join(ROOT, "src", "remove_watermark.py"), "src"),
+    (os.path.join(ROOT, "src", "remove_narration.py"), "src"),
 ]
 
 # ---------------------------------------------------------------- ffmpeg（可选内置）
@@ -72,10 +74,29 @@ hiddenimports = [
     "onnxruntime",
     "onnxruntime.capi",
     "onnxruntime.capi._pybind_state",
+    # 后处理：AI 去人声（ONNX，无需 torch）
+    "demucs_onnx",
+    "demucs_onnx._audio",
+    "demucs_onnx._hub",
+    "demucs_onnx.inference",
+    "demucs_onnx.providers",
+    "soundfile",
+    "soxr",
+    "huggingface_hub",
 ] + collect_submodules("uvicorn")
 
 # onnxruntime 的 DLL（含 DirectML.dll）默认收集不全，显式抓一遍
 binaries = collect_dynamic_libs("onnxruntime")
+
+# soundfile 的 libsndfile DLL 放在 _soundfile_data/ 下，显式随包
+try:
+    import soundfile as _sf
+    _sf_data = os.path.join(os.path.dirname(_sf.__file__), "_soundfile_data")
+    if os.path.isdir(_sf_data):
+        datas.append((_sf_data, "soundfile/_soundfile_data"))
+        print("[spec] 已收集 soundfile/_soundfile_data")
+except Exception as _e:
+    print(f"[spec] 警告: 未能收集 soundfile 运行库: {_e}")
 
 a = Analysis(
     [os.path.join(WEBUI, "run_server.py")],

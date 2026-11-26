@@ -56,6 +56,8 @@ _SUBPROC_FLAGS = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000) if _IS_WIND
 SCRIPT_DIR = Path(__file__).resolve().parent
 INFERENCE_SCRIPT = SCRIPT_DIR / "inference_video.py"
 HIGHLIGHT_SCRIPT = SCRIPT_DIR / "pingpong_highlight.py"
+WATERMARK_SCRIPT = SCRIPT_DIR / "remove_watermark.py"
+NARRATION_SCRIPT = SCRIPT_DIR / "remove_narration.py"
 
 _VIDEO_EXTENSIONS = {
     '.mp4', '.avi', '.mov', '.mkv', '.webm', '.flv',
@@ -148,8 +150,106 @@ def find_video_files(directory):
     return videos
 
 
+def _module_available(python_cmd, module):
+    """用目标解释器探测模块是否可导入（兼容 --conda-env）"""
+    try:
+        proc = subprocess.run(
+            python_cmd + ["-c", f"import {module}"],
+            capture_output=True, timeout=60, creationflags=_SUBPROC_FLAGS)
+        return proc.returncode == 0
+    except Exception:
+        return False
+
+
+def _probe_has_audio(path):
+    """ffprobe 判断视频是否有音频流; 探测失败时保守返回 True。"""
+    try:
+        proc = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "a:0",
+             "-show_entries", "stream=codec_type", "-of", "csv=p=0", str(path)],
+            capture_output=True, text=True, timeout=30,
+            creationflags=_SUBPROC_FLAGS)
+        return proc.returncode == 0 and "audio" in (proc.stdout or "")
+    except Exception:
+        return True
+
+
+def _postprocess_output(args, python_cmd, output_abs, work_dir, step_offset, step_total, batch_tag=""):
+    """高光成片之后的可选后处理: 去水印 → 去人声。默认都不执行。"""
+    watermark = bool(getattr(args, "remove_watermark", False))
+    narration = bool(getattr(args, "remove_narration", False))
+    if not watermark and not narration:
+        return True
+
+    current = output_abs
+    tmp_wm = os.path.join(work_dir, "post_watermark.mp4")
+    tmp_narr = os.path.join(work_dir, "post_narration.mp4")
+    try:
+        if watermark:
+            wm_cmd = python_cmd + [
+                str(WATERMARK_SCRIPT), "--video", current, "--output", tmp_wm,
+                "--preset", args.watermark_preset, "--method", args.watermark_method,
+            ]
+            for region in (getattr(args, "watermark_region", None) or []):
+                wm_cmd += ["--region", str(region)]
+            if getattr(args, "watermark_detect", False):
+                wm_cmd += ["--detect", "--detect-apply"]
+            if not run_step(wm_cmd, f"Step {step_offset}/{step_total}: 去水印 (remove_watermark.py)"):
+                return False
+            if not os.path.exists(tmp_wm):
+                print(f"  ❌ 去水印未生成输出: {tmp_wm}")
+                return False
+            current = tmp_wm
+            step_offset += 1
+
+        if narration:
+            if getattr(args, "no_audio", False):
+                print("  ℹ️ --no-audio 已开启, 跳过去人声")
+            elif not _probe_has_audio(current):
+                print("  ℹ️ 当前视频没有音频流, 跳过去人声")
+            else:
+                n_cmd = python_cmd + [
+                    str(NARRATION_SCRIPT), "--video", current, "--output", tmp_narr,
+                    "--method", args.narration_method,
+                    "--volume-gain", str(args.narration_volume_gain),
+                ]
+                if args.narration_method == "demucs":
+                    n_cmd += ["--model", args.narration_model,
+                              "--device", args.narration_device,
+                              "--residual", str(args.narration_residual)]
+                elif args.narration_method == "demucs-onnx":
+                    n_cmd += ["--model", args.narration_model,
+                              "--device", args.narration_device,
+                              "--onnx-precision", args.narration_onnx_precision,
+                              "--residual", str(args.narration_residual)]
+                    if args.narration_onnx_cache_dir:
+                        n_cmd += ["--onnx-cache-dir", args.narration_onnx_cache_dir]
+                if not run_step(n_cmd, f"Step {step_offset}/{step_total}: 去人声 (remove_narration.py)"):
+                    return False
+                if not os.path.exists(tmp_narr):
+                    print(f"  ❌ 去人声未生成输出: {tmp_narr}")
+                    return False
+                current = tmp_narr
+
+        if current != output_abs:
+            try:
+                os.replace(current, output_abs)
+            except Exception as e:
+                print(f"  ❌ 后处理替换成片失败: {e}")
+                return False
+        print(f"  ✅ 后处理完成{batch_tag}: {output_abs}")
+        return True
+    finally:
+        for p in (tmp_wm, tmp_narr):
+            if p != output_abs and os.path.exists(p):
+                try:
+                    os.remove(p)
+                except Exception:
+                    pass
+
+
 def _process_one_video(args, python_cmd, has_ffmpeg, video_index=None, video_total=None):
-    """对单个视频执行完整流水线 (推理 → 高光剪辑)。
+    """对单个视频执行完整流水线 (推理 → 高光剪辑 → 可选去水印/去人声)。
 
     使用 args.video 作为输入视频路径。args.output 若为 None 则自动生成默认路径。
     不会调用 sys.exit，而是返回 bool 表示成功与否。
@@ -166,6 +266,9 @@ def _process_one_video(args, python_cmd, has_ffmpeg, video_index=None, video_tot
     """
     video_path = Path(args.video)
     batch_tag = f" [{video_index}/{video_total}]" if video_index else ""
+    post_steps = (int(bool(getattr(args, "remove_watermark", False)))
+                  + int(bool(getattr(args, "remove_narration", False))))
+    total_steps = 2 + post_steps
 
     # === 默认 output ===
     if args.output is None:
@@ -292,7 +395,7 @@ def _process_one_video(args, python_cmd, has_ffmpeg, video_index=None, video_tot
             infer_cmd += ["--no-detection-video"]
 
         if not run_step(infer_cmd,
-                         "Step 1/2: YOLO 推理 (inference_video.py)",
+                         f"Step 1/{total_steps}: YOLO 推理 (inference_video.py)",
                          note="首次加载模型约需 30-60 秒 (import torch + ultralytics), 请耐心等待..."):
             print(f"\n❌{batch_tag} 流水线终止, 中间文件保留在: {work_dir}")
             return False
@@ -373,12 +476,20 @@ def _process_one_video(args, python_cmd, has_ffmpeg, video_index=None, video_tot
         print(f"  ℹ️  透传给高光脚本: {' '.join(extra_hl_args)}")
         hl_cmd += extra_hl_args
 
-    if not run_step(hl_cmd, "Step 2/2: 高光特效剪辑 (pingpong_highlight.py)"):
+    if not run_step(hl_cmd, f"Step 2/{total_steps}: 高光特效剪辑 (pingpong_highlight.py)"):
         print(f"\n❌{batch_tag} 流水线终止, 中间文件保留在: {work_dir}")
         return False
 
     if not os.path.exists(output_abs):
         print(f"\n❌{batch_tag} 剪辑完成但未生成输出: {output_abs}")
+        return False
+
+    # ================================================================
+    #  Step 3+: 可选后处理 (去水印 → 去人声), 默认关闭
+    # ================================================================
+    if not _postprocess_output(args, python_cmd, output_abs, work_dir,
+                               3, total_steps, batch_tag):
+        print(f"\n❌{batch_tag} 后处理失败, 高光成片已保留: {output_abs}")
         return False
 
     # ================================================================
@@ -539,6 +650,39 @@ def main():
     parser.add_argument("--hit-impact-all", action="store_true",
                         help="调试: 正片也全渲染 hit_impact (精彩集锦默认已全渲染)")
 
+    # === 后处理 (默认关闭; 高光成片之后执行) ===
+    parser.add_argument("--remove-watermark", action="store_true",
+                        help="高光成片后去除静态台标/赛事条 (默认关闭)")
+    parser.add_argument("--watermark-preset", default="overlay",
+                        choices=["logo", "overlay", "all", "none"],
+                        help="水印预设: overlay=台标+底部赛事条(默认), logo=仅台标, all=连比分牌, none=配合 --region")
+    parser.add_argument("--watermark-method", default="delogo",
+                        choices=["delogo", "inpaint"],
+                        help="去水印算法: delogo(快, 默认) / inpaint(慢, 边缘更自然)")
+    parser.add_argument("--watermark-region", action="append", default=None, metavar="X,Y,W,H",
+                        help="自定义水印区域, 可重复; 与 --preset none 配合使用")
+    parser.add_argument("--watermark-detect", action="store_true",
+                        help="自动检测静态水印位置并应用 (脚本的 --detect --detect-apply)")
+    parser.add_argument("--remove-narration", action="store_true",
+                        help="高光成片后去除解说人声 (默认关闭)")
+    parser.add_argument("--narration-method", default="demucs",
+                        choices=["demucs", "demucs-onnx", "center", "mute"],
+                        help="去人声方式: demucs(默认, torch) / demucs-onnx / center / mute")
+    parser.add_argument("--narration-volume-gain", type=float, default=2.0,
+                        help="去人声后的音量增益 (默认 2.0 = +6dB)")
+    parser.add_argument("--narration-model", default="htdemucs",
+                        help="demucs 模型名 (默认 htdemucs)")
+    parser.add_argument("--narration-device", default="auto",
+                        choices=["auto", "cuda", "cpu", "dml"],
+                        help="demucs / demucs-onnx 设备 (默认 auto; demucs-onnx 的 auto = CPU)")
+    parser.add_argument("--narration-residual", type=float, default=0.0,
+                        help="demucs 反向残留比例 (默认 0)")
+    parser.add_argument("--narration-onnx-precision", default="fp16weights",
+                        choices=["fp16weights", "fp32"],
+                        help="demucs-onnx 权重精度 (默认 fp16weights, 下载更小)")
+    parser.add_argument("--narration-onnx-cache-dir", default=None,
+                        help="demucs-onnx 模型缓存目录 (默认 HuggingFace 缓存)")
+
     # === 流水线控制 ===
     parser.add_argument("--work-dir", default=None,
                         help="中间文件目录 (默认: inference_output/pipeline_<视频名>/)")
@@ -556,13 +700,29 @@ def main():
     args.extra_hl_args = unknown
 
     # === 检查必要脚本 (只需一次) ===
-    for script, name in [(INFERENCE_SCRIPT, "inference_video.py"),
-                          (HIGHLIGHT_SCRIPT, "pingpong_highlight.py")]:
+    required_scripts = [(INFERENCE_SCRIPT, "inference_video.py"),
+                        (HIGHLIGHT_SCRIPT, "pingpong_highlight.py")]
+    if args.remove_watermark:
+        required_scripts.append((WATERMARK_SCRIPT, "remove_watermark.py"))
+    if args.remove_narration:
+        required_scripts.append((NARRATION_SCRIPT, "remove_narration.py"))
+    for script, name in required_scripts:
         if not script.exists():
             print(f"❌ 找不到 {name}: {script}")
             sys.exit(1)
 
     python_cmd = get_python_cmd(args.conda_env)
+
+    # === 去人声后端可用性检查（demucs-onnx 是可选的轻量后端）===
+    if args.remove_narration and args.narration_method == "demucs-onnx":
+        if not _module_available(python_cmd, "demucs_onnx"):
+            print("⚠️  当前 Python 环境未安装 demucs-onnx")
+            if _module_available(python_cmd, "demucs"):
+                print("   已自动改用 torch 版 demucs（质量一致，速度更快）")
+                args.narration_method = "demucs"
+            else:
+                print("   请先 pip install demucs-onnx，或改用 --narration-method center / mute")
+                sys.exit(1)
 
     # === ffmpeg 检测 (只需一次) ===
     has_ffmpeg = True

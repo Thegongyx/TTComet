@@ -9,3 +9,6 @@ build/
 static/__pycache__/
 logs/
 last_url.txt
+
+# ONNX 去人声模型缓存（158 MB，构建安装包时需要本地存在）
+models/demucs-onnx-cache/

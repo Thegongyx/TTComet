@@ -13,7 +13,8 @@
 | `run_video.py` | 推理命令行（薄壳，实现在 `inference_job`） |
 | `video_utils.py` | VFR 检测 / CFR 转换（与 `src/inference_video.py` 逐行对齐） |
 | `highlight_bridge.py` | **以模块方式加载 `src/pingpong_highlight.py` 并调用其 `main()`** |
-| `jobs.py` | 串行任务队列 + 编排（推理 → 高光 → 收尾压缩） |
+| `postprocess_bridge.py` | 后处理：加载 `src/remove_watermark.py` / `src/remove_narration.py`（去水印、去人声，默认关闭） |
+| `jobs.py` | 串行任务队列 + 编排（推理 → 高光 → 后处理 → 收尾压缩） |
 | `server.py` | FastAPI：上传 / SSE 进度 / 结果下载 / 环境自检 |
 | `static/index.html` | 单页界面 |
 | `static/pingpong-scene.js` | three.js 场景：两只小动物打乒乓球（纯程序化建模） |
@@ -127,6 +128,35 @@ webui\.venv\Scripts\python.exe webui\run_server.py
 接口：`GET /api/update?force=1`、`POST /api/update/download`、`GET /api/update/download`、
 `POST /api/update/install`（后两个 POST 需要 `X-TTComet-Request: 1`）。
 
+### 后处理：去水印 / 去人声（默认关闭）
+
+高光成片之后可以再走两步可选后处理，**默认都不启用**，在参数区「后处理」组里勾选才执行：
+
+```text
+推理 -> 高光剪辑 -> 去水印（delogo / inpaint）-> 去人声（demucs-onnx / center / mute）-> 最终 mp4
+```
+
+- **去水印**：复用 `src/remove_watermark.py` 的预设 / 自动检测 / 自定义区域。默认预设
+  `overlay`（右上台标 + 底部赛事条，保留比分牌）；换赛事时建议先勾「自动检测」或用
+  `x,y,w,h;x,y,w,h` 手填区域。delogo 快，inpaint 边缘更自然但慢很多。
+- **去人声**：复用 `src/remove_narration.py`。WebUI 提供三种方式：
+  - `demucs-onnx`（默认推荐）：HT-Demucs 的 ONNX 版，`onnxruntime` 推理，**不需要 torch**；
+    模型缓存在 `webui/models/demucs-onnx-cache/`（约 158 MB，随安装包一起分发，离线可用）。
+  - `center`：立体声反相相减，秒出，但音场会变薄。
+  - `mute`：直接静音。
+- 成片没有音轨、或参数里勾了「去掉原声」时，自动跳过去人声。
+- 中间结果先写成 `highlight.wm.tmp.mp4` / `highlight.narr.tmp.mp4`，全部成功后才替换
+  `highlight.mp4`；任一步失败会保留原高光成片，并把任务标为失败。
+- `demucs`（torch 版）不在 WebUI 里提供：打包版没有 torch，源码版 `.venv` 也没装。
+  需要它时用命令行流水线 `--narration-method demucs`（`yolo26` 环境）。
+
+已知限制：
+
+- DirectML 在部分核显/驱动组合上会直接报错（`DmlFusedNode` 非零状态）**或静默输出全零**，
+  所以 demucs-onnx 的 `auto` 固定走 CPU，并在分离后检查是否全静音（异常则回退 CPU）。
+  本机实测 CPU 分离约 **2 倍实时**。
+- 自动检测只能找「一直亮且不随时间变化」的静态叠加，检不出半透明比分牌、滚动水印。
+
 ### 参数预设
 
 调好一套参数后可以存下来反复用：
@@ -141,7 +171,7 @@ webui\.venv\Scripts\python.exe webui\run_server.py
 接口：`GET/POST /api/presets`、`PUT/DELETE /api/presets/{id}`，
 重名返回 409，不存在返回 404。
 
-### 可调参数（38 项，9 组，默认全部折叠）
+### 可调参数（46 项，10 组，默认全部折叠）
 | 分组 | 业务含义 | 参数 |
 |---|---|---|
 | **剪辑与输出** | 成片形态 | 是否按回合剪辑、输出高度、编码器、去原声 |
@@ -150,7 +180,8 @@ webui\.venv\Scripts\python.exe webui\run_server.py
 | **回合有效性**（仅剪辑） | 哪些回合值得剪进成片 | 最小回合帧数、短回合豁免落点数、球速前 N 豁免 |
 | **片段边界**（仅剪辑） | 回合前后的留白与合并 | 前缓冲、后缓冲、合并间隔 |
 | **前置精彩集锦**（仅剪辑） | 成片开头的集锦 | 关闭开关、取前 N、最小时长、落点条件、黑幕间隔 |
-| **视觉效果** | 轨迹彗尾/迷你球台/光环 | 特效强度、球残影时长、球员光环 |
+| **视觉效果** | 轨迹彗尾/迷你球台/光环 | 特效强度、球残影时长、集锦/正片特效组合 |
+| **后处理**（默认关闭） | 成片后去水印 / 去人声 | 去水印开关、预设、方式、自动检测、自定义区域；去人声开关、方式、音量倍数 |
 | **高级 · 几何与调试** | 球台几何与轨迹关联 | 走廊容差/延伸/剔除上限、中心距离、出台容差、关联算法、调试输出 |
 
 标注"仅剪辑"的三组在关闭"按回合剪辑"后**整组置灰且参数不提交**；
@@ -342,12 +373,33 @@ cd webui
 | 用 onedir 而非 onefile | onefile 每次启动要把 ~300MB 解压到临时目录，冷启动几十秒 |
 | 资源定位 | `paths.bundle_root()`：打包后取 `sys._MEIPASS`，源码运行取项目根 |
 | 高光脚本 | `src/pingpong_highlight.py` 作为 data 打包，由 `highlight_bridge` 动态加载 |
+| 后处理脚本 | `src/remove_watermark.py`、`src/remove_narration.py` 作为 data 打包，由 `postprocess_bridge` 动态加载 |
+| 去人声模型 | `webui/models/demucs-onnx-cache/`（HT-Demucs fp16weights，约 158 MB）随包分发，离线可用 |
 | 静态页/模型 | `webui/app/static`、`webui/models` 一并打进 `_internal/` |
 | ffmpeg | 内置时放到 `_internal/ffbin/`，启动时前置到 PATH |
 | 控制台编码 | 打包后默认 GBK，启动即把 stdout 切 UTF-8（否则日志 emoji 会抛异常） |
 | 单实例 | Windows 命名互斥量 `TTComet_SingleInstance`，重复双击会提示"已在运行" |
 | 工作目录 | `%LOCALAPPDATA%\TTComet\jobs`（不放安装目录，避免无写权限） |
 | 默认浏览起点 | 打包后回落到用户"视频"目录（不是 `_internal`） |
+
+#### 去人声依赖与模型准备（构建机）
+
+```powershell
+# 1. 安装 ONNX 去人声后端（约 50 MB，不需要 torch）
+webui\.venv\Scripts\python.exe -m pip install demucs-onnx==0.3.4
+
+# 2. 装 demucs-onnx 会把 onnxruntime-directml 覆盖成普通 onnxruntime，
+#    必须恢复，否则 WebUI 推理掉到 CPU
+webui\.venv\Scripts\python.exe -m pip uninstall -y onnxruntime
+webui\.venv\Scripts\python.exe -m pip install --force-reinstall --no-deps onnxruntime-directml==1.24.4
+
+# 3. 下载 HT-Demucs fp16 权重到随包目录（约 158 MB，构建机需要本地存在；已 gitignore）
+$env:HF_ENDPOINT="https://hf-mirror.com"   # 国内可加速
+webui\.venv\Scripts\python.exe -c "from demucs_onnx._hub import download_single_model; download_single_model('htdemucs', precision='fp16weights', cache_dir=r'webui/models/demucs-onnx-cache')"
+```
+
+验证：`python -c "import onnxruntime as ort; print(ort.get_available_providers())"` 必须包含
+`DmlExecutionProvider`。
 
 ### 打包实测（本机）
 
@@ -381,7 +433,7 @@ git tag -a v0.x.y -m "乒乓彗星 TTComet v0.x.y"; git push origin refs/tags/v0
 
 ## 已知缺口
 
-1. **取消只对推理阶段生效**。高光渲染是同步调用源脚本，只能等当前帧渲染完。
+1. **取消只对推理阶段生效**。高光渲染/后处理都是同步调用源脚本，只能等当前步骤结束。
 2. **处理记录的日志不落盘**。任务快照存在 `job.json`，但日志正文只在内存，
    重启后历史记录能点开看结果，日志区是空的。
 3. **无鉴权**。服务只监听 127.0.0.1，单机单用户场景可接受；若要局域网共享必须加认证
@@ -390,3 +442,5 @@ git tag -a v0.x.y -m "乒乓彗星 TTComet v0.x.y"; git push origin refs/tags/v0
    有两次大块拷贝，可考虑导出 fp32 输入模型或零拷贝填 tensor。
 5. **jsonl 内存问题未解**。已默认 gzip（体积 1/20）并在任务结束后压缩归档，但
    `pingpong_highlight.load_detections()` 仍是全量读入（491MB → 约 4GB）。长视频要改流式。
+6. **ONNX 去人声目前走 CPU**。本机 DirectML 跑 HT-Demucs 会报 `DmlFusedNode` 错误，
+   脚本已自动回退 CPU（约 2 倍实时，10 分钟成片约 5 分钟）。

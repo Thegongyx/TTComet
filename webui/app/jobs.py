@@ -28,6 +28,7 @@ from pathlib import Path
 import inference_job
 from highlight_bridge import run_highlight
 from onnx_engine import DetectorConfig, OnnxDetector
+from postprocess_bridge import run_postprocess
 
 VIDEO_EXTS = {".mp4", ".avi", ".mov", ".mkv", ".webm", ".flv",
               ".wmv", ".m4v", ".mpg", ".mpeg", ".ts", ".3gp"}
@@ -580,6 +581,26 @@ class JobManager:
             self._compress_jsonl(job, inf["jsonl"])
 
             if hl["ok"]:
+                # 可选后处理：去水印 -> 去人声（默认都关闭，用户勾选才执行）
+                if job.params.get("remove_watermark") or job.params.get("remove_narration"):
+                    job.set_status("running", "postprocess")
+                    job.update_progress({"stage": "postprocess"})
+                    job.add_log("高光完成，开始后处理")
+                    pp = run_postprocess(output, output, job.params, log=job.add_log)
+                    item.result["postprocess"] = {
+                        "ok": pp.get("ok"), "steps": pp.get("steps"),
+                        "duration_sec": pp.get("duration_sec"),
+                        "error": pp.get("error"),
+                    }
+                    job.video_changed(item.index)
+                    self._persist(job)
+                    if not pp.get("ok"):
+                        item.status = "failed"
+                        item.error = "后处理失败: " + (pp.get("error") or "未知错误")
+                        job.add_log(f"❌ {item.name} {item.error}（高光成片已保留）")
+                        job.video_changed(item.index)
+                        self._persist(job)
+                        continue
                 item.status = "done"
                 item.result["output"] = {
                     "path": output,

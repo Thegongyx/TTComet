@@ -720,6 +720,25 @@ const PARAM_GROUPS = [
         onlyWhenCutItem: true, disabledWhenPrependOff: true },
       { key: "main_fx", type: "fx_set", def: FX_MAIN_CSV, wide: true },
   ]},
+  { key: "post", items: [
+      { key: "remove_watermark", type: "checkbox", def: false, wide: true },
+      { key: "watermark_preset", type: "select", def: "overlay",
+        options: ["overlay", "logo", "all", "none"], optKey: "opt.wm_preset.",
+        dependsOn: "remove_watermark" },
+      { key: "watermark_method", type: "select", def: "delogo",
+        options: ["delogo", "inpaint"], optKey: "opt.wm_method.",
+        dependsOn: "remove_watermark" },
+      { key: "watermark_detect", type: "checkbox", def: false,
+        dependsOn: "remove_watermark" },
+      { key: "watermark_region", type: "text", def: "", wide: true,
+        dependsOn: "remove_watermark" },
+      { key: "remove_narration", type: "checkbox", def: false, wide: true },
+      { key: "narration_method", type: "select", def: "demucs-onnx",
+        options: ["demucs-onnx", "center", "mute"], optKey: "opt.narr.",
+        dependsOn: "remove_narration" },
+      { key: "narration_volume_gain", type: "number", def: 2.0, min: 0.1,
+        max: 10, step: 0.1, dependsOn: "remove_narration" },
+  ]},
   { key: "adv", items: [
       { key: "corridor_margin", type: "number", def: 0.5, min: 0, step: 0.05 },
       { key: "corridor_extend", type: "number", def: 5.0, min: 0, step: 0.5 },
@@ -885,6 +904,16 @@ function buildParams() {
           el.appendChild(o);
         }
         wrap.appendChild(labelEl); wrap.appendChild(el);
+      } else if (it.type === 'text') {
+        wrap.className = 'pitem' + (it.wide ? ' wide' : '');
+        labelEl = document.createElement('label');
+        labelEl.textContent = labelText;
+        el = document.createElement('input');
+        el.type = 'text';
+        el.value = it.def || '';
+        el.spellcheck = false;
+        el.placeholder = T(`p.${it.key}.ph`);
+        wrap.appendChild(labelEl); wrap.appendChild(el);
       } else {
         wrap.className = 'pitem' + (it.wide ? ' wide' : '');
         labelEl = document.createElement('label');
@@ -924,7 +953,8 @@ function buildParams() {
       el.addEventListener('change', () => { updateChangeHint(); refreshAvailability(); });
       const rec = { el, wrap, def: it.def, type: it.type, disabled: false,
                     onlyWhenCut: !!(g.onlyWhenCut || it.onlyWhenCutItem),
-                    disabledWhenPrependOff: !!it.disabledWhenPrependOff };
+                    disabledWhenPrependOff: !!it.disabledWhenPrependOff,
+                    dependsOn: it.dependsOn || null };
       paramInputs[it.key] = rec;
       refs.push(rec);
       grid.appendChild(wrap);
@@ -945,7 +975,9 @@ function refreshAvailability() {
     const cutOff = g.onlyWhenCut && !cutOn;
     g.el.classList.toggle('disabled-group', cutOff);
     for (const r of g.refs) {
-      const itemDisabled = cutOff || (r.onlyWhenCut && !cutOn) || (r.disabledWhenPrependOff && !prependOn);
+      const dep = r.dependsOn ? paramInputs[r.dependsOn] : null;
+      const depOff = !!(dep && dep.el && !dep.el.checked);
+      const itemDisabled = cutOff || depOff || (r.onlyWhenCut && !cutOn) || (r.disabledWhenPrependOff && !prependOn);
       r.disabled = itemDisabled;
       if (r.type === 'fx_set') {
         r.wrap.classList.toggle('disabled-item', itemDisabled);
@@ -989,7 +1021,7 @@ function collectParams() {
     if (r.type === 'select') { p[key] = r.el.value; continue; }
     const v = r.el.value.trim();
     if (v === '') continue;
-    p[key] = Number(v);
+    p[key] = (r.type === 'text') ? v : Number(v);
   }
   return p;
 }
@@ -1588,6 +1620,9 @@ function applyProgress(p) {
   else if (p.stage === 'highlight') {
     $('mStage').textContent = T('stage.highlight');
     $('barFill').style.width = '100%';
+  } else if (p.stage === 'postprocess') {
+    $('mStage').textContent = T('stage.postprocess');
+    $('barFill').style.width = '100%';
   }
   if (p.video_name) $('mVideo').textContent = T('meta.video', {
     i: (p.video_index ?? 0) + 1, n: p.video_total ?? 1, name: p.video_name });
@@ -1674,7 +1709,8 @@ function subscribe(jobId) {
     else if (msg.type === 'progress') applyProgress(msg.data);
     else if (msg.type === 'status') {
       const stageKey = msg.data.stage === 'highlight' ? 'stage.highlight'
-        : msg.data.stage === 'inference' ? 'stage.inference' : '';
+        : msg.data.stage === 'inference' ? 'stage.inference'
+        : msg.data.stage === 'postprocess' ? 'stage.postprocess' : '';
       $('mStage').textContent = statusText(msg.data.status) + (stageKey ? ` · ${T(stageKey)}` : '');
     } else if (msg.type === 'videos') {
       if (currentJob) currentJob.videos = msg.data;
