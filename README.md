@@ -8,7 +8,7 @@
 
 | 用法 | 适合谁 | 入口 |
 |---|---|---|
-| **A. 桌面安装包**（推荐） | 只想剪视频，不想碰命令行 | `TTComet-0.3.0-setup.exe` |
+| **A. 桌面安装包**（推荐） | 只想剪视频，不想碰命令行 | `TTComet-0.3.1-setup.exe` |
 | **B. 命令行脚本链** | 要改算法、训模型、批量跑数据 | `src/` 下的脚本 |
 
 > ### 💗 支持项目
@@ -440,7 +440,7 @@ The repository covers the whole workflow: **frame extraction → labeling → tr
 
 | Usage | Who it is for | Entry point |
 |---|---|---|
-| **A. Desktop installer** (recommended) | Just want to cut videos, no command line | `TTComet-0.3.0-setup.exe` |
+| **A. Desktop installer** (recommended) | Just want to cut videos, no command line | `TTComet-0.3.1-setup.exe` |
 | **B. Command-line scripts** | Change algorithms, train models, batch-process data | scripts under `src/` |
 
 > ### 💗 Support the project

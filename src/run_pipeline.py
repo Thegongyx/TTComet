@@ -7,7 +7,11 @@ run_pipeline.py — 一键流水线: YOLO 推理 → 高光特效剪辑
 
 流程:
     Step 1: YOLO 逐帧推理, 生成 raw_detections.jsonl
-    Step 2: 球轨迹分析 + 回合检测 + 彗尾/粒子/迷你球台特效 → 高光集锦
+    Step 2: (可选, --remove-watermark) 在源视频上去水印, 之后才渲染特效
+    Step 3: 球轨迹分析 + 回合检测 + 彗尾/粒子/迷你球台特效 → 高光集锦
+    Step 4: (可选, --remove-narration) 只处理成片的音频, 去人声
+
+    去水印必须在渲染特效之前: 否则默认区域会把迷你球台 / 雷达等 HUD 一起抹掉。
 
 默认输出:
     所有文件放在 ./inference_output/pipeline_<视频名>/
