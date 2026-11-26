@@ -348,7 +348,7 @@
 
       // ---- 后处理（去水印 / 去人声） ----
       'p.remove_watermark.label': '去除静态水印 / 台标',
-      'p.remove_watermark.note': '默认按 WTT 转播预设抹掉右上台标与底部赛事条（保留比分牌）；换赛事建议先勾自动检测或手填区域',
+      'p.remove_watermark.note': '默认按常见转播预设抹掉右上台标与底部赛事信息条（保留比分牌）；换来源建议先勾自动检测或手填区域',
       'p.watermark_preset.label': '水印预设',
       'p.watermark_preset.note': 'overlay=台标+底部赛事条；logo=仅右上台标；all=连比分牌一起去；none=只用自定义区域',
       'p.watermark_method.label': '去水印方式',
@@ -358,7 +358,7 @@
       'p.watermark_region.label': '自定义区域（留空 = 用预设）',
       'p.watermark_region.ph': 'x,y,w,h；多个用分号分隔，如 1588,38,292,74;1170,950,650,78',
       'p.watermark_region.note': '按成片实际像素填写；会叠加在预设区域之上（预设选 none 时只用这里）',
-      'p.remove_narration.label': '去除解说人声',
+      'p.remove_narration.label': '去除人声',
       'p.remove_narration.note': '只处理剪出来的成片；成片没有音轨或上面勾了“去掉原声”时自动跳过',
       'p.narration_method.label': '去人声方式',
       'p.narration_method.note': 'demucs-onnx：AI 分离，保留击球声/环境声（推荐，首次加载内置模型）；center：立体声反相相减，秒出但音场变薄；mute：直接静音',
@@ -610,8 +610,8 @@
       'g.prepend.desc': 'Ranks exciting rallies by ball speed, player movement, swing power & shot count as an intro reel',
       'g.fx.title': 'Visual effects',
       'g.fx.desc': 'Independently choose which effects appear in the intro highlight reel (before black gap) vs. main video (after black gap)',
-      'g.post.title': 'Post-processing · watermark / narration (off by default)',
-      'g.post.desc': 'Runs after the highlight is rendered. Watermark removal re-encodes video; narration removal only re-encodes audio and copies the video stream',
+      'g.post.title': 'Post-processing · watermark / vocals (off by default)',
+      'g.post.desc': 'Runs after the highlight is rendered. Watermark removal re-encodes video; vocal removal only re-encodes audio and copies the video stream',
       'g.adv.title': 'Advanced · geometry & debug',
       'g.adv.desc': 'Fine tuning for table geometry, corridor filtering and track association. Keep defaults unless needed.',
 
@@ -717,9 +717,9 @@
       'p.main_fx.label': 'Global main video effects (after black gap)',
       'p.main_fx.note': 'By default: classic trio + mini-table radar + rally counter (mini-table HUD); customize or click “Classic only” for the basic set',
 
-      // ---- post-processing (watermark / narration) ----
+      // ---- post-processing (watermark / vocals) ----
       'p.remove_watermark.label': 'Remove static watermark / logo',
-      'p.remove_watermark.note': 'Default WTT preset erases the top-right logo and bottom ticker (scoreboard kept). For other events, use auto-detect or custom regions first',
+      'p.remove_watermark.note': 'Default preset erases the top-right logo and bottom event ticker (scoreboard kept). For other sources, use auto-detect or custom regions first',
       'p.watermark_preset.label': 'Watermark preset',
       'p.watermark_preset.note': 'overlay = logo + bottom ticker; logo = top-right logo only; all = also remove scoreboard; none = custom regions only',
       'p.watermark_method.label': 'Removal method',
@@ -729,9 +729,9 @@
       'p.watermark_region.label': 'Custom regions (empty = use preset)',
       'p.watermark_region.ph': 'x,y,w,h; separate with semicolons, e.g. 1588,38,292,74;1170,950,650,78',
       'p.watermark_region.note': 'Coordinates in the output video’s pixels; added on top of the preset (only these are used when preset = none)',
-      'p.remove_narration.label': 'Remove commentary vocals',
+      'p.remove_narration.label': 'Remove vocals',
       'p.remove_narration.note': 'Only runs on the rendered highlight; skipped automatically when the output has no audio or “Drop audio” is checked',
-      'p.narration_method.label': 'Narration removal method',
+      'p.narration_method.label': 'Vocal removal method',
       'p.narration_method.note': 'demucs-onnx: AI separation keeping hits & ambience (recommended, uses the bundled model); center: stereo phase subtraction, instant but thin; mute: silent output',
       'p.narration_volume_gain.label': 'Output volume multiplier',
       'p.narration_volume_gain.note': 'Default 2.0 (+6dB); a limiter prevents clipping after the gain',

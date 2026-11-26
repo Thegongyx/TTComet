@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-去除视频中的解说人声（保留击球声 / 环境声 / 观众声）。
+去除视频中的人声（保留击球声 / 环境声 / 观众声）。
 
 四种后端:
     demucs       AI 人声分离（htdemucs, torch 版），把音轨拆成 vocals + no_vocals
@@ -460,7 +460,7 @@ def do_mute(args, video, output, info):
 
 def build_parser():
     p = ArgumentParser(
-        description="去除视频解说人声, 保留击球声/环境声",
+        description="去除视频人声, 保留击球声/环境声",
         formatter_class=__import__("argparse").RawDescriptionHelpFormatter,
         epilog=__doc__,
     )

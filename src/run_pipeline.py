@@ -664,7 +664,7 @@ def main():
     parser.add_argument("--watermark-detect", action="store_true",
                         help="自动检测静态水印位置并应用 (脚本的 --detect --detect-apply)")
     parser.add_argument("--remove-narration", action="store_true",
-                        help="高光成片后去除解说人声 (默认关闭)")
+                        help="高光成片后去除人声 (默认关闭)")
     parser.add_argument("--narration-method", default="demucs",
                         choices=["demucs", "demucs-onnx", "center", "mute"],
                         help="去人声方式: demucs(默认, torch) / demucs-onnx / center / mute")

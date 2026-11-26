@@ -67,7 +67,7 @@
 │   ├── extract_missing_ball.py           #   漏检帧提取（球跳变帧）
 │   ├── extract_rejected_ball_frames.py   #   错误球帧收集（负样本）
 │   ├── random_sample_frames.py           #   通用随机抽帧（支持无日志）
-│   ├── remove_narration.py               #   去解说人声（demucs / 卡拉OK相减 / 静音）
+│   ├── remove_narration.py               #   去人声（demucs / ONNX / 卡拉OK相减 / 静音）
 │   ├── remove_watermark.py               #   去静态水印台标（delogo / OpenCV inpaint）
 │   ├── train_pingpong_v2.py              #   分割模型训练（bbox→polygon 自动转换）
 │   ├── export_onnx.py                    #   .pt → .onnx 导出（支持 FP16 / NMS）
@@ -123,7 +123,7 @@
 | `extract_missing_ball.py` | 漏检帧提取（球跳变帧） |
 | `extract_rejected_ball_frames.py` | 错误球帧收集（A/B 两类负样本） |
 | `random_sample_frames.py` | 通用随机抽帧（`--ball-only` / `--no-player` / `--no-log`） |
-| `remove_narration.py` | 去解说人声，保留击球声/环境声（`--method demucs` / `center` / `mute`），默认再提音量 1 倍 |
+| `remove_narration.py` | 去人声，保留击球声/环境声（`--method demucs` / `demucs-onnx` / `center` / `mute`），默认再提音量 1 倍 |
 | `remove_watermark.py` | 去静态水印台标（`--method delogo` / `inpaint`；`logo`/`overlay`/`all` 预设默认 `overlay` 保留比分牌；`--ref-size` 分辨率自适应；`--detect` 自动检测位置） |
 | `train_pingpong_v2.py` | 分割模型训练（best_class AP / mAP50 双追踪） |
 | `export_onnx.py` | `.pt` → `.onnx`（`--half` / `--dynamic` / `--simplify` / `--nms`） |
@@ -178,7 +178,7 @@ python src/random_sample_frames.py `
 
 ---
 
-## ✂️ 音视频清理（去水印 / 去解说）
+## ✂️ 音视频清理（去水印 / 去人声）
 
 两个独立的后期处理脚本，和上面的高光流程互不干扰，可以任意组合。
 都只需要 **ffmpeg**；`remove_narration.py` 的 AI 分离额外需要 `demucs`（见「环境要求」）。
@@ -187,12 +187,12 @@ python src/random_sample_frames.py `
 
 针对转播画面里**时间上位置固定**的叠加层（平台台标、赛事条、角标）。
 
-内置预设（坐标基于 1920×1080 的 WTT 转播画面，其他分辨率会**自动等比缩放**）：
+内置预设（坐标基于 1920×1080 的常见转播布局，其他分辨率会**自动等比缩放**）：
 
 | 预设 | 处理内容 | 适用场景 |
 |---|---|---|
-| `logo` | 右上角「咪咕 独播」台标 | 只想去平台水印 |
-| `overlay`（默认） | 台标 + 底部「ISTANBUL \| 百岁山 \| WTT」赛事条 | 保留比赛信息 |
+| `logo` | 右上角台标 | 只想去平台水印 |
+| `overlay`（默认） | 台标 + 底部赛事信息条 | 保留比赛信息 |
 | `all` | 再加左下角比分牌 | 比分也不需要时 |
 | `none` | 不用预设，只处理 `--region` 指定的区域 | 其他来源的水印 |
 
@@ -240,9 +240,9 @@ python src/remove_watermark.py --video in.mp4 --preview 3,900,2100 --dry-run
 > **边界**：只处理矩形区域、只对时间上静止的水印有效。滚动/闪烁/位置漂移的水印、
 > 与背景亮度接近的水印、以及异形 logo（会被多抹一点背景）都不适用。
 
-### 去解说人声 `remove_narration.py`
+### 去人声 `remove_narration.py`
 
-把解说员的声音去掉，保留击球声、观众声和场馆环境音。
+把视频中的人声去掉，保留击球声、观众声和场馆环境音。
 
 | 方法 | 说明 | 速度 | 效果 |
 |---|---|---|---|
@@ -274,7 +274,7 @@ python src/remove_narration.py --video in.mp4 --residual 0.15
 > 首次运行会从 HuggingFace 下载 htdemucs 权重（约 80 MB）。国内网络慢可以设
 > `$env:HF_ENDPOINT = "https://hf-mirror.com"`。
 >
-> **注意**：demucs 会把解说连同部分环境声一起划进 vocals，所以去人声后击球声会变弱。
+> **注意**：demucs 会把人声连同部分环境声一起划进 vocals，所以去人声后击球声会变弱。
 > 觉得太闷就用 `--method center` 对比，或调小 `--volume-gain`。
 
 ### 组合使用
