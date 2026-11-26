@@ -354,10 +354,10 @@ webui\.venv\Scripts\python.exe webui\app\run_video.py `
 ```powershell
 cd webui
 
-# 完整包：内置 ffmpeg/ffprobe，目标机无需安装任何东西（约 736 MB）
+# 完整包：内置 ffmpeg/ffprobe，目标机无需安装任何东西（约 929 MB）
 .\packaging\build.ps1 -WithFFmpeg
 
-# 轻量包：不含 ffmpeg，要求目标机已装 ffmpeg（约 303 MB）
+# 轻量包：不含 ffmpeg，要求目标机已装 ffmpeg（约 495 MB）
 .\packaging\build.ps1
 
 # 强制全量重建
@@ -407,7 +407,7 @@ webui\.venv\Scripts\python.exe -c "from demucs_onnx._hub import download_single_
 | 项目 | 结果 |
 |---|---|
 | 构建耗时 | 约 16 秒（不含 ffmpeg 复制） |
-| 完整包体积 | 736.4 MB / 160 个文件 |
+| 完整包体积 | 928.6 MB / 204 个文件 |
 | 其中 ffmpeg+ffprobe | 433.6 MB（WinGet 的 full build，静态链接） |
 | 冷启动到可访问 | 约 6-8 秒 |
 | 端到端任务 | 703 帧片段 → 推理 63 fps → 高光 307 帧 → 9.2 MB，全流程通过 |
@@ -425,7 +425,7 @@ cd webui; .\packaging\build.ps1 -WithFFmpeg -Installer
 git tag -a v0.x.y -m "乒乓彗星 TTComet v0.x.y"; git push origin refs/tags/v0.x.y
 
 # 5. 两端发 Release
-#    GitHub：整包 243 MB 直接上传
+#    GitHub：整包 373.7 MB 直接上传
 #    Gitee ：单文件上限 100 MB，切 3 卷上传，说明里保留 copy /b 合并命令
 ```
 

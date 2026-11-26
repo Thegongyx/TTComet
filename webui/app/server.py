@@ -111,7 +111,7 @@ def _resolve_models() -> tuple[dict[str, str], list[dict], str]:
 
 MODELS, MODEL_META, DEFAULT_MODEL = _resolve_models()
 
-APP_VERSION = "0.2.2"
+APP_VERSION = "0.3.0"
 PROJECT_URL = "https://github.com/Thegongyx/TTComet"
 SUPPORT_URL = "https://ifdian.net/a/TTComet"
 
