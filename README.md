@@ -68,7 +68,7 @@
 │   ├── extract_rejected_ball_frames.py   #   错误球帧收集（负样本）
 │   ├── random_sample_frames.py           #   通用随机抽帧（支持无日志）
 │   ├── remove_narration.py               #   去人声（demucs / ONNX / 卡拉OK相减 / 静音）
-│   ├── remove_watermark.py               #   去静态水印台标（delogo / OpenCV inpaint）
+│   ├── remove_watermark.py               #   去静态水印（delogo / OpenCV inpaint）
 │   ├── train_pingpong_v2.py              #   分割模型训练（bbox→polygon 自动转换）
 │   ├── export_onnx.py                    #   .pt → .onnx 导出（支持 FP16 / NMS）
 │   ├── split_all1.py / split_all19.py    #   数据集拆分 / 增量合并
@@ -124,7 +124,7 @@
 | `extract_rejected_ball_frames.py` | 错误球帧收集（A/B 两类负样本） |
 | `random_sample_frames.py` | 通用随机抽帧（`--ball-only` / `--no-player` / `--no-log`） |
 | `remove_narration.py` | 去人声，保留击球声/环境声（`--method demucs` / `demucs-onnx` / `center` / `mute`），默认再提音量 1 倍 |
-| `remove_watermark.py` | 去静态水印台标（`--method delogo` / `inpaint`；`logo`/`overlay`/`all` 预设默认 `overlay` 保留比分牌；`--ref-size` 分辨率自适应；`--detect` 自动检测位置） |
+| `remove_watermark.py` | 去静态水印（`--method delogo` / `inpaint`；`logo`/`overlay`/`all` 预设默认 `overlay` 保留比分显示；`--ref-size` 分辨率自适应；`--detect` 自动检测位置） |
 | `train_pingpong_v2.py` | 分割模型训练（best_class AP / mAP50 双追踪） |
 | `export_onnx.py` | `.pt` → `.onnx`（`--half` / `--dynamic` / `--simplify` / `--nms`） |
 | `split_all1.py` | 数据集拆分 train/val |
@@ -185,22 +185,22 @@ python src/random_sample_frames.py `
 
 ### 去静态水印 `remove_watermark.py`
 
-针对转播画面里**时间上位置固定**的叠加层（平台台标、赛事条、角标）。
+针对画面里**时间上位置固定**的叠加层（角标、信息条、文字）。
 
-内置预设（坐标基于 1920×1080 的常见转播布局，其他分辨率会**自动等比缩放**）：
+内置预设（坐标基于 1920×1080 的常见画面布局，其他分辨率会**自动等比缩放**）：
 
 | 预设 | 处理内容 | 适用场景 |
 |---|---|---|
-| `logo` | 右上角台标 | 只想去平台水印 |
-| `overlay`（默认） | 台标 + 底部赛事信息条 | 保留比赛信息 |
-| `all` | 再加左下角比分牌 | 比分也不需要时 |
+| `logo` | 右上角角标 | 只想去角标 |
+| `overlay`（默认） | 角标 + 底部信息条 | 保留比赛信息 |
+| `all` | 再加左下角比分显示 | 比分也不需要时 |
 | `none` | 不用预设，只处理 `--region` 指定的区域 | 其他来源的水印 |
 
 ```powershell
-# 默认：去台标 + 底部赛事条，保留比分牌
+# 默认：去角标 + 底部信息条，保留比分显示
 python src/remove_watermark.py --video Videos/match.mp4
 
-# 只去台标 / 连比分牌一起去
+# 只去角标 / 连比分显示一起去
 python src/remove_watermark.py --video Videos/match.mp4 --preset logo
 python src/remove_watermark.py --video Videos/match.mp4 --preset all
 
@@ -208,7 +208,7 @@ python src/remove_watermark.py --video Videos/match.mp4 --preset all
 python src/remove_watermark.py --video in.mp4 --preset none --region 100,100,200,50
 ```
 
-**自动检测未知水印位置。** 换平台、换赛事的台标位置不一样时，不用手量像素：
+**自动检测未知水印位置。** 换来源、换素材的角标位置不一样时，不用手量像素：
 
 ```powershell
 # 只输出候选框和可疑度，不动视频

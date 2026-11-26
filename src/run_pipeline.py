@@ -652,10 +652,10 @@ def main():
 
     # === 后处理 (默认关闭; 高光成片之后执行) ===
     parser.add_argument("--remove-watermark", action="store_true",
-                        help="高光成片后去除静态台标/赛事条 (默认关闭)")
+                        help="高光成片后去除静态水印 (默认关闭)")
     parser.add_argument("--watermark-preset", default="overlay",
                         choices=["logo", "overlay", "all", "none"],
-                        help="水印预设: overlay=台标+底部赛事条(默认), logo=仅台标, all=连比分牌, none=配合 --region")
+                        help="水印预设: overlay=右上角+底部信息条(默认), logo=仅右上角, all=再加比分显示, none=配合 --region")
     parser.add_argument("--watermark-method", default="delogo",
                         choices=["delogo", "inpaint"],
                         help="去水印算法: delogo(快, 默认) / inpaint(慢, 边缘更自然)")

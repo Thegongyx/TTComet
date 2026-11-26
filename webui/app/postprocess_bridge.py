@@ -156,12 +156,16 @@ def _parse_regions(text: str) -> list[str]:
 
 
 def _watermark_argv(video: str, output: str, params: dict) -> list[str]:
+    # WebUI 只暴露两种方式: default（内置区域） / detect（自动检测）
+    mode = str(params.get("watermark_mode") or "").strip()
+    detect = mode == "detect" or bool(params.get("watermark_detect"))
+    # 保留旧参数兼容（预设 / 自定义区域 / 算法仍可来自 CLI 或旧预设）
     argv = ["remove_watermark.py", "--video", video, "--output", output,
             "--preset", str(params.get("watermark_preset") or "overlay"),
             "--method", str(params.get("watermark_method") or "delogo")]
     for region in _parse_regions(params.get("watermark_region") or ""):
         argv += ["--region", region]
-    if params.get("watermark_detect"):
+    if detect:
         argv += ["--detect", "--detect-apply"]
     return argv
 

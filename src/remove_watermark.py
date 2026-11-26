@@ -1,29 +1,29 @@
 #!/usr/bin/env python3
 """
-去除视频中的静态水印 / 叠加文字（台标、赛事条、比分板）。
+去除视频中的静态水印 / 叠加文字（角标、信息条、比分显示）。
 
 两种算法:
     delogo   ffmpeg delogo 滤镜, 用区域周边像素插值填补, 速度快, 区域呈模糊块
     inpaint  OpenCV 逐帧 TELEA/NS 修复, 边缘过渡更自然, 速度慢
 
-内置预设区域（基于 1920x1080 的常见转播布局, 可直接改 _PRESETS）:
-    logo      右上角台标
-    overlay   logo + 底部赛事信息条（默认）
-    all       overlay + 左下角比分牌（比分是比赛信息, 非必要别动）
+内置预设区域（基于 1920x1080 的常见画面布局, 可直接改 _PRESETS）:
+    logo      右上角角标
+    overlay   logo + 底部信息条（默认）
+    all       overlay + 左下角比分显示（比赛信息, 非必要别动）
     none      不用预设, 只保留 --region 手动指定的区域
 
 用法:
-    # 默认: preset=overlay(右上台标 + 底部赛事条), delogo 算法, 保留比分牌
+    # 默认: preset=overlay(右上角角标 + 底部信息条), delogo 算法, 保留比分显示
     # 预设坐标基于 1920x1080, 换成 720p/4K 会自动等比缩放
     python src/remove_watermark.py --video Videos/fb1080.mp4
 
-    # 只去右上角台标
+    # 只去右上角角标
     python src/remove_watermark.py --video Videos/fb1080.mp4 --preset logo
 
-    # 连比分牌一起去掉(比赛信息会消失)
+    # 连比分显示一起去掉(比赛信息会消失)
     python src/remove_watermark.py --video Videos/fb1080.mp4 --preset all
 
-    # 自动检测水印位置(适合换平台/换赛事的未知水印)
+    # 自动检测水印位置(适合未知或位置不固定的素材)
     # --detect 只输出候选框和可疑度, 不动视频; 确认后加 --detect-apply 才处理
     python src/remove_watermark.py --video in.mp4 --detect
     python src/remove_watermark.py --video in.mp4 --detect --detect-apply
@@ -43,7 +43,7 @@
     --video       源视频路径
     --output      输出视频路径（默认: 源视频同目录 <原名>_nowatermark.mp4）
     --method      delogo / inpaint（默认 delogo）
-    --preset      logo / overlay / all / none（默认 overlay, 保留比分牌）
+    --preset      logo / overlay / all / none（默认 overlay, 保留比分显示）
     --region      额外区域 "x,y,w,h", 可重复
     --ref-size    预设坐标的参考分辨率（默认 1920x1080）, 自动按实际分辨率等比缩放
     --region-in-ref  --region 的坐标也按参考分辨率缩放（默认按实际像素）
@@ -65,8 +65,8 @@
     --list-presets  打印内置预设坐标后退出
 
 自动检测的适用范围:
-    能检出 —— 纯色/不透明的台标、字幕条、角标（时间上位置和亮度都恒定）
-    检不出 —— 半透明叠加（如比分牌）、滚动/闪烁/漂移的水印、与背景同亮度的水印
+    能检出 —— 纯色/不透明的角标、文字条、角点（时间上位置和亮度都恒定）
+    检不出 —— 半透明叠加（如比分显示）、滚动/闪烁/漂移的水印、与背景同亮度的水印
     检不出时用 --region 手动指定, 或放宽 --detect-bright / --detect-std
 """
 
@@ -83,19 +83,19 @@ _TMP_ROOT = Path(__file__).resolve().parent.parent / "tmp"
 
 # 预设区域 (x, y, w, h, 说明), 基于 1920x1080。
 # 若换成别的分辨率, 用 --region 手动指定, 或按比例换算。
-# 注意: 比分牌属于比赛信息, 默认不处理; 需要抹掉时显式用 --preset all
+# 注意: 比分显示属于比赛信息, 默认不处理; 需要抹掉时显式用 --preset all
 _PRESETS = {
     "logo": [
-        (1588, 38, 292, 74, "右上角台标"),
+        (1588, 38, 292, 74, "右上角角标"),
     ],
     "overlay": [
-        (1588, 38, 292, 74, "右上角台标"),
-        (1170, 950, 650, 78, "底部赛事信息条"),
+        (1588, 38, 292, 74, "右上角角标"),
+        (1170, 950, 650, 78, "底部信息条"),
     ],
     "all": [
-        (1588, 38, 292, 74, "右上角台标"),
-        (1170, 950, 650, 78, "底部赛事信息条"),
-        (84, 884, 462, 150, "左下角比分牌（比赛信息, 谨慎去除）"),
+        (1588, 38, 292, 74, "右上角角标"),
+        (1170, 950, 650, 78, "底部信息条"),
+        (84, 884, 462, 150, "左下角比分显示（比赛信息, 谨慎去除）"),
     ],
     "none": [],
 }
@@ -247,13 +247,13 @@ def drop_contained_boxes(boxes):
 
 
 def detect_overlay_regions(video, info, args):
-    """用多帧时序统计自动检测静态不透明叠加区域（台标 / 字幕条）
+    """用多帧时序统计自动检测静态不透明叠加区域（角标 / 文字条）
 
     原理：水印在时间上是恒定的 —— 逐像素对多帧取最小值仍然偏亮（叠加了白色），
     同时时间标准差极低（不随画面变化）。场景里静止的深色物体达不到这个亮度。
     检测在缩小的灰度图上做，最后把坐标换算回原始分辨率。
 
-    局限：半透明叠加（如比分牌）和动态/滚动水印检测不到。
+    局限：半透明叠加（如比分显示）和动态/滚动水印检测不到。
     """
     import cv2
 
