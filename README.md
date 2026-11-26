@@ -1,5 +1,7 @@
 # 🏓 乒乓彗星 TTComet · 乒乓球视频高光工具集
 
+[中文](README.md) | [English](#english)
+
 把一场乒乓球比赛的录像，自动剪成带特效的高光集锦。
 
 全流程覆盖：**抽帧 → 标注 → 训练 → 推理 → 高光剪辑**。仓库里同时提供两种用法：
@@ -25,7 +27,7 @@
 
 ### 下载安装
 
-从 [最新版本](https://github.com/TheGongyx/TTComet/releases/latest) 下载 `TTComet-*-setup.exe`（约 240 MB），
+从 [最新版本](https://github.com/TheGongyx/TTComet/releases/latest) 下载 `TTComet-*-setup.exe`（约 374 MB），
 双击安装即可。安装包已内置 ffmpeg，目标机不需要装 Python 或任何运行环境。
 
 > 这个链接始终指向最新正式版；已安装旧版的话，程序启动时也会自动检查更新，可直接在界面里下载安装。
@@ -36,10 +38,11 @@
 ### 功能
 
 - **自动高光剪辑**：回合检测 + 切片，自带球轨迹彗尾、落点标记、迷你球台、球员光环
+- **成片后处理**：可选去水印（默认方案 / 自动检测）与去人声（AI 分离 / 声道相减 / 静音），默认关闭
 - **批量处理**：选文件夹，按文件名顺序跑完，模型只加载一次
 - **中英双语界面**：右上角切换
 - **两档精度**：高精度（准）/ 低精度（快约 2.8 倍），可随时切换
-- **参数可调**：9 组 38 项，每项标注"调高/调低"的效果；支持保存多套预设并重命名
+- **参数可调**：10 组，每项标注"调高/调低"的效果；支持保存多套预设并重命名
 - **不剪辑模式**：只加特效、保留完整时长
 - **实时反馈**：进度条 + 日志流，结果在线播放
 - **输出目录可选**：留空就用默认目录，也可以指定任意文件夹（同名视频自动加序号，不覆盖）
@@ -106,7 +109,7 @@
 |---|---|
 | Python 3.10+ | 建议用 conda 或 venv 隔离 |
 | PyTorch + ultralytics | 抽帧推理 / 训练 |
-| `demucs` | 可选，只有 `remove_narration.py --method demucs` 才需要（`pip install --no-deps demucs` + `julius einops omegaconf pyyaml tqdm lameenc huggingface-hub safetensors sphn`，用 `--no-deps` 避免替换已有 torch） |
+| `demucs` / `demucs-onnx` | 可选，去人声用。`demucs`（torch）对应 `--method demucs`（安装时用 `--no-deps` 避免替换已有 torch，另需 `julius einops omegaconf pyyaml tqdm lameenc huggingface-hub safetensors sphn`）；`demucs-onnx` 不需要 torch（`pip install demucs-onnx`，首次下载约 158 MB 模型） |
 | `label-studio` | 可选，只有做标注时才需要 |
 | ffmpeg | 抽帧 / 推理 / 剪辑必需（桌面安装包已内置） |
 | GPU | AMD（ROCm）或 NVIDIA（CUDA），框架自动检测；也可纯 CPU 跑 |
@@ -181,7 +184,7 @@ python src/random_sample_frames.py `
 ## ✂️ 音视频清理（去水印 / 去人声）
 
 两个独立的后期处理脚本，和上面的高光流程互不干扰，可以任意组合。
-都只需要 **ffmpeg**；`remove_narration.py` 的 AI 分离额外需要 `demucs`（见「环境要求」）。
+都只需要 **ffmpeg**；AI 人声分离还需要 `demucs`（torch）或 `demucs-onnx`（不需要 torch），见「环境要求」。
 
 ### 去静态水印 `remove_watermark.py`
 
@@ -246,13 +249,17 @@ python src/remove_watermark.py --video in.mp4 --preview 3,900,2100 --dry-run
 
 | 方法 | 说明 | 速度 | 效果 |
 |---|---|---|---|
-| `demucs`（默认） | AI 人声分离（htdemucs），只保留 `no_vocals` 轨 | 慢，需 GPU 更佳 | 最彻底 |
+| `demucs`（CLI 默认） | AI 人声分离（htdemucs，torch），只保留 `no_vocals` 轨 | 慢，需 GPU 更佳 | 最彻底 |
+| `demucs-onnx` | 同一套 HT-Demucs 权重的 ONNX 版，不需要 torch | 中等 | 最彻底 |
 | `center` | 立体声反相相减（人声通常居中） | 秒出 | 人声有残留 |
 | `mute` | 直接删除音轨 | 秒出 | 完全静音 |
 
 ```powershell
 # 默认：demucs 分离 + 音量提升 1 倍
 python src/remove_narration.py --video Videos/match.mp4
+
+# 不需要 torch 的 AI 分离（首次下载约 158 MB 模型）
+python src/remove_narration.py --video Videos/match.mp4 --method demucs-onnx
 
 # 卡拉OK 相减（零依赖，快速试听）
 python src/remove_narration.py --video in.mp4 --method center
@@ -271,8 +278,8 @@ python src/remove_narration.py --video in.mp4 --residual 0.15
 
 实测：46 分钟影片的音频分离约 **2 分 15 秒**（22x 实时），合成 45 秒。
 
-> 首次运行会从 HuggingFace 下载 htdemucs 权重（约 80 MB）。国内网络慢可以设
-> `$env:HF_ENDPOINT = "https://hf-mirror.com"`。
+> 首次运行会从 HuggingFace 下载 htdemucs 权重（torch 版约 80 MB，ONNX 版约 158 MB；桌面安装包已内置 ONNX 模型，无需下载）。
+> 国内网络慢可以设 `$env:HF_ENDPOINT = "https://hf-mirror.com"`。
 >
 > **注意**：demucs 会把人声连同部分环境声一起划进 vocals，所以去人声后击球声会变弱。
 > 觉得太闷就用 `--method center` 对比，或调小 `--volume-gain`。
@@ -418,3 +425,440 @@ print(df[['epoch', 'metrics/mAP50-95(B)', 'metrics/mAP50(B)']].tail(20))
 ## 📚 更多
 
 构建、打包、参数与架构细节见 [`webui/app/README.md`](webui/app/README.md)。
+
+---
+
+<a id="english"></a>
+
+# 🏓 TTComet · Table Tennis Video Highlight Toolkit
+
+[中文](README.md) | [English](#english)
+
+Turn a full table tennis match recording into a highlight reel with effects.
+
+The repository covers the whole workflow: **frame extraction → labeling → training → inference → highlight editing**. There are two ways to use it:
+
+| Usage | Who it is for | Entry point |
+|---|---|---|
+| **A. Desktop installer** (recommended) | Just want to cut videos, no command line | `TTComet-0.3.0-setup.exe` |
+| **B. Command-line scripts** | Change algorithms, train models, batch-process data | scripts under `src/` |
+
+> ### 💗 Support the project
+>
+> **Afdian page: <https://ifdian.net/a/TTComet>**
+>
+> If this tool saves you time, you can buy the author a drink there.
+> No donation needed — bug reports, suggestions and PRs are equally appreciated.
+
+---
+
+## A. Desktop app (TTComet)
+
+A local WebUI: pick a video → automatic inference + highlight editing → play/download in the browser.
+No Python or internet required, **ffmpeg is bundled**.
+
+### Download & install
+
+Download `TTComet-*-setup.exe` (about 374 MB) from the [latest release](https://github.com/TheGongyx/TTComet/releases/latest)
+and double-click it. ffmpeg is bundled, so the target machine needs no Python or runtime.
+
+> The link always points to the latest stable release. Installed copies also check for updates on startup
+> and can download and launch the installer from the UI.
+
+Installation does **not** require administrator rights (defaults to `%LOCALAPPDATA%\Programs\TTComet`).
+Data (jobs, presets, outputs) lives in `%LOCALAPPDATA%\TTComet\jobs\`.
+
+### Features
+
+- **Automatic highlight editing**: rally detection + cutting, with ball trails, bounce markers, a mini table and player highlights
+- **Optional post-processing**: watermark removal (default preset / auto-detect) and vocal removal (AI separation / center-channel subtraction / mute), both off by default
+- **Batch processing**: pick a folder, process videos in filename order, the model is loaded once
+- **Bilingual UI**: 中文 / English in the top-right corner
+- **Two quality levels**: high accuracy / low accuracy (~2.8× faster), switchable at runtime
+- **Tunable parameters**: 10 groups, each with “increase/decrease” hints; save and rename multiple presets
+- **No-cut mode**: keep the full duration and only add effects
+- **Live feedback**: progress bar + log stream, results playable in the browser
+- **Optional output folder**: leave empty for the default folder, or pick any folder (existing files are never overwritten)
+- **Job history**: every job is persisted to `job.json`; refresh the page or restart the app and the history is still there (interrupted jobs are marked as such)
+- **No console window**: double-click starts silently; the tray icon offers “open UI / quit”
+- **Update check**: checks GitHub on startup (silent on failure), can also be triggered manually; one-click download and installer launch
+
+### Known limitations
+
+- **Not code-signed**: Windows may warn about an unknown publisher on first run; click “More info → Run anyway”
+- Logs are written to `%LOCALAPPDATA%\TTComet\logs\app.log` (startup failures show a dialog, the log has details)
+- Only one instance can run at a time (avoids GPU contention)
+- A discrete GPU is recommended (AMD / NVIDIA via DirectML); CPU-only works but is slow
+
+---
+
+## 📁 Project layout
+
+```
+.
+├── src/                                  # command-line scripts
+│   ├── inference_video.py                #   frame-by-frame inference → raw_detections.jsonl
+│   ├── pingpong_highlight.py             #   highlight editing (trail + comet + mini table)
+│   ├── run_pipeline.py                   #   one-command pipeline: inference + highlight (batch folders supported)
+│   ├── extract_missing_ball.py           #   extract missed-ball frames (ball jumps)
+│   ├── extract_rejected_ball_frames.py   #   collect rejected-ball frames (negatives)
+│   ├── random_sample_frames.py           #   generic random frame sampling (works without a log)
+│   ├── remove_narration.py               #   vocal removal (demucs / ONNX / center subtraction / mute)
+│   ├── remove_watermark.py               #   static watermark removal (delogo / OpenCV inpaint)
+│   ├── train_pingpong_v2.py              #   segmentation training (auto bbox→polygon)
+│   ├── export_onnx.py                    #   .pt → .onnx export (FP16 / NMS)
+│   ├── split_all1.py / split_all19.py    #   dataset split / incremental merge
+│   └── convert_yolo_to_labelstudio.py    #   YOLO labels → Label Studio
+│
+├── src_yls/                              # Label Studio ML backend (pre-annotation)
+│
+├── webui/                                # TTComet desktop app
+│   ├── run_server.py                     #   launcher (exe entry point)
+│   ├── app/                              #   ONNX engine + FastAPI + frontend
+│   ├── models/                           #   two ONNX model tiers (high / low accuracy)
+│   ├── design/                           #   icon-generation scripts
+│   ├── packaging/                        #   PyInstaller + Inno Setup packaging
+│   └── bench/                            #   engine benchmarks and result comparisons
+│
+├── models/                               # custom training weights (.pt, not tracked)
+├── train_data/                           # labeled datasets (contents not tracked, see below)
+├── yolo26*-seg.pt                        # pretrained weights (not tracked)
+├── runs/                                 # training outputs
+├── Videos/  transition_videos/           # source videos (not tracked)
+└── tmp/                                  # temporary files
+```
+
+> **About `train_data/`**: the directory structure is tracked but **images and labels are not**
+> (datasets are often tens of GB). Put `images/ + labels/ + data.yaml` locally to train.
+
+---
+
+## 🚀 Requirements
+
+> The commands below assume an activated **Python environment with dependencies installed**
+> (conda or venv), i.e. `python` points to that environment.
+
+| Dependency | Notes |
+|---|---|
+| Python 3.10+ | conda or venv recommended |
+| PyTorch + ultralytics | inference / training |
+| `demucs` / `demucs-onnx` | optional, for vocal removal. `demucs` (torch) is used by `--method demucs` (install with `--no-deps` plus `julius einops omegaconf pyyaml tqdm lameenc huggingface-hub safetensors sphn`); `demucs-onnx` needs no torch (`pip install demucs-onnx`, downloads a ~158 MB model on first use) |
+| `label-studio` | optional, only for labeling |
+| ffmpeg | required for extraction / inference / editing (bundled in the desktop installer) |
+| GPU | AMD (ROCm) or NVIDIA (CUDA), auto-detected; CPU-only works |
+
+---
+
+## 🔧 Scripts
+
+| Script | Purpose |
+|---|---|
+| `inference_video.py` | Frame-by-frame inference → `raw_detections.jsonl` + visualization mp4 |
+| `pingpong_highlight.py` | Highlight editing (needs video + jsonl) |
+| `run_pipeline.py` | One-command pipeline: inference → highlight (single video or folder) |
+| `extract_missing_ball.py` | Extract missed-ball frames (ball jumps) |
+| `extract_rejected_ball_frames.py` | Collect rejected-ball frames (A/B negatives) |
+| `random_sample_frames.py` | Generic random sampling (`--ball-only` / `--no-player` / `--no-log`) |
+| `remove_narration.py` | Vocal removal, keeping hits/ambience (`--method demucs` / `demucs-onnx` / `center` / `mute`), +6 dB by default |
+| `remove_watermark.py` | Static watermark removal (`--method delogo` / `inpaint`; `logo`/`overlay`/`all` presets, `overlay` keeps the score; `--ref-size` auto-scaling; `--detect` auto-locate) |
+| `train_pingpong_v2.py` | Segmentation training (best_class AP / mAP50 tracking) |
+| `export_onnx.py` | `.pt` → `.onnx` (`--half` / `--dynamic` / `--simplify` / `--nms`) |
+| `split_all1.py` | Train/val split |
+| `split_all19.py` | Incremental merge/split (specialized) |
+| `convert_yolo_to_labelstudio.py` | YOLO labels → Label Studio |
+
+---
+
+## 📋 Quick start
+
+> Commands use PowerShell; use `` ` `` for line continuation. Use `python` on Windows and `python3` on Linux/WSL.
+
+### 1️⃣ One-command highlight (most common)
+
+```powershell
+# Single video
+python src/run_pipeline.py --video Videos/match.mp4
+
+# Whole folder
+python src/run_pipeline.py --video Videos/
+```
+
+Output goes to `inference_output/pipeline_<video-name>/` by default.
+
+### 2️⃣ Step by step (when tuning)
+
+```powershell
+# Inference
+python src/inference_video.py `
+    --video Videos/match.mp4 --model models/m960n.pt --output inference_output/
+
+# Editing (re-run without re-running inference)
+python src/pingpong_highlight.py `
+    --video Videos/match.mp4 `
+    --raw-detections inference_output/raw_detections.jsonl `
+    --output highlight.mp4
+```
+
+### 3️⃣ Frame extraction for labeling
+
+```powershell
+# Missed-ball frames (ball present before and after, missing now)
+python src/extract_missing_ball.py `
+    --log inference_output/raw_detections.jsonl --video Videos/match.mp4 --count 50
+
+# Random frames (ball scenes only / direct sampling)
+python src/random_sample_frames.py `
+    --log inference_output/raw_detections.jsonl --video Videos/match.mp4 `
+    --count 50 --ball-only
+```
+
+---
+
+## ✂️ Audio/video cleanup (watermark / vocals)
+
+Two independent post-processing scripts; they do not interfere with the highlight pipeline and can be combined freely.
+Both only need **ffmpeg**; AI vocal separation additionally needs `demucs` (torch) or `demucs-onnx` (no torch), see “Requirements”.
+
+### Static watermark removal `remove_watermark.py`
+
+Targets overlays whose **position is fixed over time** (corner marks, info bars, text).
+
+Built-in presets (coordinates measured on a 1920×1080 layout; other resolutions are **scaled automatically**):
+
+| Preset | What it removes | When to use |
+|---|---|---|
+| `logo` | Top-right corner mark | Only remove the corner mark |
+| `overlay` (default) | Corner mark + bottom info bar | Keep match information |
+| `all` | Also the bottom-left score display | When the score is not needed |
+| `none` | Only `--region` areas | Watermarks from other sources |
+
+```powershell
+# Default: corner mark + bottom info bar, keep score
+python src/remove_watermark.py --video Videos/match.mp4
+
+# Corner mark only / also remove the score
+python src/remove_watermark.py --video Videos/match.mp4 --preset logo
+python src/remove_watermark.py --video Videos/match.mp4 --preset all
+
+# Manual regions (repeatable), x,y,w,h in actual pixels
+python src/remove_watermark.py --video in.mp4 --preset none --region 100,100,200,50
+```
+
+**Auto-detect unknown watermark positions.** No need to measure pixels when the layout changes:
+
+```powershell
+# Report candidates only (video untouched)
+python src/remove_watermark.py --video in.mp4 --detect
+
+# Apply the detected regions
+python src/remove_watermark.py --video in.mp4 --detect --detect-apply
+```
+
+Detection uses per-pixel temporal statistics over multiple frames: a watermark keeps the region’s
+**minimum brightness high** and its **temporal standard deviation very low**, scored with fill ratio and aspect ratio.
+By default it only reports; with `--detect-apply` it processes candidates with
+`score ≥ 50% × best score`, so static bright objects such as white shirts or ad boards are left alone.
+
+**Two algorithms:**
+
+| Method | Speed | Result |
+|---|---|---|
+| `delogo` (default) | Fast | Region is interpolated from surrounding pixels (blurred block; smearing on complex backgrounds) |
+| `inpaint` | Slow | Per-frame OpenCV TELEA; better on flat backgrounds (floor), more smearing on complex ones |
+
+**Preview before encoding** (exports before/after stills only):
+
+```powershell
+python src/remove_watermark.py --video in.mp4 --preview 3,900,2100 --dry-run
+```
+
+Measured: 1920×1080 / 46-minute video, **about 4.8 minutes** (9.75× realtime).
+
+> **Limits**: rectangular regions only; static watermarks only. Scrolling/flashing/drifting watermarks,
+> watermarks close to the background brightness, and irregular logos (extra background gets blurred) are not supported.
+
+### Vocal removal `remove_narration.py`
+
+Removes voice from the video while keeping hits, crowd and venue ambience.
+
+| Method | Notes | Speed | Result |
+|---|---|---|---|
+| `demucs` (CLI default) | AI separation (htdemucs, torch), keeps only the `no_vocals` stem | Slow, GPU helps | Cleanest |
+| `demucs-onnx` | Same HT-Demucs weights in ONNX, no torch required | Medium | Cleanest |
+| `center` | Stereo phase subtraction (voice is usually centered) | Instant | Some voice remains |
+| `mute` | Remove the audio track | Instant | Silent |
+
+```powershell
+# Default: demucs separation + +6 dB
+python src/remove_narration.py --video Videos/match.mp4
+
+# AI separation without torch (downloads a ~158 MB model on first use)
+python src/remove_narration.py --video Videos/match.mp4 --method demucs-onnx
+
+# Karaoke-style subtraction (zero dependencies, quick preview)
+python src/remove_narration.py --video in.mp4 --method center
+
+# Keep original volume / boost 2.5× / reduce separation residue
+python src/remove_narration.py --video in.mp4 --volume-gain 1.0
+python src/remove_narration.py --video in.mp4 --volume-gain 2.5
+python src/remove_narration.py --video in.mp4 --residual 0.15
+```
+
+**Volume**: removing vocals also lowers perceived loudness, so `--volume-gain 2.0` (+6 dB) is the default.
+An `alimiter` after the gain only acts when peaks exceed 0 dBFS, so normal passages are untouched.
+
+**The video stream is copied by default** (`-c:v copy`); only audio is re-encoded, so quality and speed are preserved.
+
+Measured: 46-minute video, audio separation about **2 min 15 s** (22× realtime), muxing 45 s.
+
+> The first run downloads htdemucs weights from HuggingFace (~80 MB for the torch version, ~158 MB for ONNX;
+> the desktop installer already bundles the ONNX model). If HuggingFace is slow, set
+> `$env:HF_ENDPOINT = "https://hf-mirror.com"`.
+>
+> **Note**: demucs may classify part of the ambience as vocals, so hits can become quieter.
+> Compare with `--method center` or lower `--volume-gain` if the result sounds too dull.
+
+### Combining
+
+Remove the watermark first (re-encodes video), then the vocals (video stream copied):
+
+```powershell
+python src/remove_watermark.py --video Videos/match.mp4
+python src/remove_narration.py `
+    --video Videos/match_nowatermark.mp4 --output Videos/match_clean.mp4
+```
+
+---
+
+## 🧠 Models
+
+### Segmentation model (6 classes)
+
+| class_id | 0 | 1 | 2 | 3 | 4 | 5 |
+|---|---|---|---|---|---|---|
+| Class | Table tennis ball | Other ball | Player | Racket | Table | Net |
+
+### Two ONNX tiers used by the desktop app
+
+| Tier | File | Size | Model forward | End-to-end |
+|---|---|---|---|---|
+| High accuracy | `m960n_fp16_nonms.onnx` | 45 MB | 20.5 ms/frame | ~40 fps |
+| Low accuracy | `s960n_fp16_nonms.onnx` | 20 MB | 7.4 ms/frame | ~65 fps |
+
+Export:
+
+```powershell
+python src/export_onnx.py `
+    --model models/m960n.pt --output webui/models/m960n_fp16_nonms.onnx `
+    --imgsz 960 --simplify --half --opset 17 --device 0
+```
+
+> Do not add `--nms`: an embedded NMS bakes the 0.25 threshold into the model and breaks low-confidence
+> ball recall with `--conf-ball 0.10`.
+
+---
+
+## 🏋️ Training
+
+```powershell
+# 1. Split train/val (required)
+python src/split_all1.py `
+    --src train_data/all22 --dst train_data/all22_split
+
+# 2. Train
+python src/train_pingpong_v2.py `
+    --data train_data/all22_split/data.yaml `
+    --pretrained yolo26x-seg.pt `
+    --name my_run --epochs 100 --batch 4
+```
+
+| Argument | Notes |
+|---|---|
+| `--data` | Path to `data.yaml` (required) |
+| `--pretrained` | Pretrained weights, default `yolo26x-seg.pt`; use `models/m960n.pt` for custom weights |
+| `--name` | Outputs to `runs/train_<name>/` |
+| `--epochs` / `--batch` | Epochs and batch size (lower batch on OOM) |
+
+---
+
+## 🔖 Label Studio
+
+```powershell
+# Labeling server (native Windows)
+label-studio start --port 8080   # http://localhost:8080
+
+# ML backend (pre-annotation)
+python src_yls/_wsgi.py --port 9090 --host 0.0.0.0
+```
+
+Export labels in YOLO format into `train_data/<name>/` (`images/ + labels/ + data.yaml`).
+You can also convert existing YOLO labels with `convert_yolo_to_labelstudio.py` and keep labeling.
+
+---
+
+## 📊 Reading training results
+
+| Metric | Notes | Good value |
+|---|---|---|
+| `mAP@50` | Mean average precision at IoU=0.5 | >0.85 |
+| `mAP@50-95` | Mean AP over IoU 0.5–0.95 (stricter) | >0.60 |
+| `Precision` | Share of predicted positives that are correct | >0.80 |
+| `Recall` | Share of true positives that were found | >0.75 |
+
+```
+runs/train_<name>/
+├── results.csv              ← per-epoch metrics
+├── confusion_matrix.png     ← confusion matrix
+├── labels.jpg               ← label distribution
+└── weights/
+    ├── best.pt              ← best model (deploy this)
+    ├── last.pt
+    └── best_class_*_ap.pt   ← models tracked by per-class AP
+```
+
+---
+
+## 💡 Tips
+
+**Dataset size**
+
+| Images | Scenario | Recommended epochs |
+|---|---|---|
+| <50 | Quick validation | 50-100 |
+| 50-200 | Small fine-tune | 100-200 |
+| >200 | Production | 200-500 |
+
+**Out of memory (OOM)**: lower `--batch` (default 4; try 2 or 1).
+
+**Inspect training curves**:
+
+```python
+import pandas as pd
+df = pd.read_csv('runs/train_my_run/results.csv')
+print(df[['epoch', 'metrics/mAP50-95(B)', 'metrics/mAP50(B)']].tail(20))
+```
+
+---
+
+## ⚠️ Notes
+
+1. **Activate the environment with dependencies first**, then run `python src/<script>.py` (conda: `conda activate <env>`)
+2. **Do not continuously monitor training**: confirm it started, then leave it alone
+3. **Label format**: YOLO txt (`class_id x_center y_center width height`, normalized); polygons (9+ values) are also accepted and converted automatically
+4. **`data.yaml` `path` must point to the parent of `images/` and `labels/`**, and data must be split into train/val first, otherwise training fails silently
+5. **Put temporary files in `tmp/`**
+6. **`train_data/` contents are not tracked**: only the directory structure is kept; prepare datasets locally
+
+---
+
+## 📄 License
+
+This repository currently declares **no open-source license** (all rights reserved by default).
+Contact the repository owner before citing or redistributing.
+
+Third-party components keep their own licenses: Ultralytics (AGPL-3.0), ONNX Runtime (MIT), three.js (MIT).
+
+## 📚 More
+
+Build, packaging, parameters and architecture details: [`webui/app/README.md`](webui/app/README.md).
+
